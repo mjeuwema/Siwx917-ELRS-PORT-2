@@ -176,6 +176,17 @@ static void normalize_config_fields(elrs_config_t* config)
     return;
   }
 
+  if (config->serial_protocol > ELRS_SERIAL_GPS) {
+    config->serial_protocol = ELRS_SERIAL_CRSF;
+  }
+  if (config->failsafe_mode > ELRS_FAILSAFE_SET) {
+    config->failsafe_mode = ELRS_FAILSAFE_NO_PULSES;
+  }
+  if (config->model_id > 63 && config->model_id != 255) {
+    config->model_id = 255;
+  }
+  config->force_tlm = config->force_tlm ? 1 : 0;
+
   /* These fields were promoted from reserved bytes without changing the
    * structure size, so older valid configs may still contain zero defaults.
    */

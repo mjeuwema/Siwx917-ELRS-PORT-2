@@ -6,7 +6,7 @@
  * for the SiW917 platform with LR1121 radio.
  *
  * Key differences from upstream:
- * - No CRSF serial output (handled separately)
+ * - CRSF serial output uses the SiW917 platform UART driver
  * - No device management (LEDs, buttons handled separately)
  * - Simplified for single LR1121 radio (no Gemini/dual radio)
  */
@@ -22,6 +22,9 @@
 #include "LowPassFilter.h"
 #include "OTA.h"
 #include "PFD.h"
+#include "CRSFRouter.h"
+#include "RXOTAConnector.h"
+#include "SiW917RXEndpoint.h"
 #include "common.h"
 #include "crc.h"
 #include "crsf_protocol.h"
@@ -34,6 +37,7 @@
 #include "msptypes.h"
 
 // Standard includes
+#include <new>
 #include <stdio.h>
 #include <string.h>
 
@@ -69,20 +73,28 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL 1
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 1
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
-#define ELRS_DIAG_RX_LUA_UL 1
+#define ELRS_DIAG_TX_TURNAROUND 1
+#define ELRS_DIAG_PERIODIC_STATS 0
+#define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
+#define ELRS_DIAG_PRINT_AFTER_LOSS 1
+#define ELRS_DIAG_RX_LUA_UL 0
 #define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
 #define ELRS_DIAG_RX_LUA_UL_PRINT_EVERY 128
-#define ELRS_PFD_FREQ_LOCK_MAX_US 500
-#define ELRS_PFD_FREQ_LOCK_DX_MAX_US 100
-#define ELRS_PFD_FREQ_LOCK_MIN_LQ 50
-#define ELRS_PFD_PHASE_LOCK_MAX_US 500
-#define ELRS_PFD_PHASE_LOCK_DX_MAX_US 100
-#define ELRS_PFD_PHASE_SHIFT_MAX_US 100
+#define ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT 0
+#define ELRS_DIAG_RX_LUA_LOAD_DELAY_MS 1500U
+#define ELRS_DIAG_RX_LUA_LOAD_COOLDOWN_MS 5000U
+#define ELRS_DIAG_RX_LUA_BIND_POST_DELAY_MS 250U
+#define ELRS_DIAG_CRSF_OTA_VERBOSE 0
+#define ELRS_DIAG_LUA_DISCOVERY 0
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
 static uint8_t modelMatchId = 0xFF;
+
+extern "C" void siw917_rx_set_model_match_id(uint8_t modelId) {
+  modelMatchId = modelId;
+}
 
 // Link statistics (for external API)
 static elrs_link_stats_t currentLinkStats = {};
@@ -104,6 +116,7 @@ connectionState_e connectionState = disconnected;
 uint8_t UID[UID_LEN] = {0};
 bool connectionHasModelMatch = false;
 bool teamraceHasModelMatch = true; // Always true for basic RX
+static bool lastConnectionHadModelMatch = false;
 bool InBindingMode = false;
 bool InWiFiMode = false; // WiFi configuration mode
 uint8_t ExpressLRS_currTlmDenom = 1;
@@ -177,6 +190,9 @@ enum DisconnectReason : uint8_t {
 };
 
 static volatile DisconnectReason lastDisconnectReason = DISC_NONE;
+#if ELRS_DIAG_PRINT_AFTER_LOSS
+static volatile bool diagPrintAfterLossPending = false;
+#endif
 
 // Cycle interval for rate scanning
 uint32_t cycleInterval = 0;
@@ -188,6 +204,9 @@ StubbornSender TelemetrySender;
 StubbornReceiver DataUlReceiver;
 static uint8_t TelemetryBuffer[ELRS_DATA_UL_BUFFER];
 static uint8_t DataUlBuffer[ELRS_DATA_UL_BUFFER];
+CRSFRouter crsfRouter;
+static RXOTAConnector otaConnector;
+static SiW917RXEndpoint crsfReceiver;
 static uint8_t NextTelemetryType = PACKET_TYPE_LINKSTATS;
 static uint8_t telemetryBurstCount = 0;
 static uint8_t telemetryBurstMax = 1;
@@ -195,9 +214,41 @@ static bool telemBurstValid = false;
 static bool alreadyTLMresp = false;
 static volatile uint32_t telemetryTxCount = 0;
 static volatile uint32_t telemetrySuppressedCount = 0;
+static volatile uint32_t telemetryDataUlAckCount = 0;
+static volatile bool telemetryLastDataUlAck = false;
+#if ELRS_DIAG_TX_TURNAROUND
+static volatile uint32_t telemetryTxStartUs = 0;
+static volatile uint32_t telemetryTxDoneUs = 0;
+static volatile uint32_t telemetryRxnbDoneUs = 0;
+static volatile uint32_t telemetryTxToDoneUs = 0;
+static volatile uint32_t telemetryDoneToRxnbDoneUs = 0;
+static volatile uint32_t telemetryTxToRxnbDoneUs = 0;
+static volatile uint32_t telemetryRxnbToRxOkUs = 0;
+static volatile uint32_t telemetryMissedAfterTx = 0;
+static volatile uint32_t telemetryTxBeforeRx = 0;
+static volatile uint32_t telemetryRxAfterTx = 0;
+static volatile uint8_t telemetryAwaitingRx = 0;
+static volatile uint8_t telemetryTxNonce = 0;
+static volatile uint8_t telemetryTxFhss = 0;
+static volatile uint8_t telemetryRxNonce = 0;
+static volatile uint8_t telemetryRxFhss = 0;
+#endif
 static volatile bool dataUlReady = false;
 static volatile bool uidSavePending = false;
+static volatile bool uidRefreshPending = false;
+static volatile bool bindCompletePending = false;
 static uint8_t pendingUid[UID_LEN] = {0};
+
+#if ELRS_DIAG_LUA_DISCOVERY
+static bool luaDiscoveryActive = false;
+static uint8_t luaDiscoveryType = 0;
+static uint8_t luaDiscoveryLen = 0;
+static uint8_t luaDiscoveryPrintCount = 0;
+static uint32_t luaDiscoveryStartMs = 0;
+static uint32_t luaDiscoveryLastPrintMs = 0;
+static uint32_t luaDiscoveryStartTxCount = 0;
+static volatile uint32_t luaDiscoveryPingCount = 0;
+#endif
 
 // SNR accumulator for telemetry (simplified - just use last value)
 static int8_t lastSnrRaw = 0;
@@ -255,13 +306,116 @@ static volatile uint32_t rxLuaCrsfHandledCount = 0;
 static volatile uint32_t rxLuaCrsfRejectCount = 0;
 static volatile uint32_t rxLuaCrsfIgnoredCount = 0;
 static volatile uint8_t rxLuaLastUlPackageIndex = 0;
+static volatile uint32_t rxLuaQueueDropCount = 0;
 
 #define RX_LUA_QUEUE_DEPTH 4
+#define RX_LUA_PENDING_ACTION_DELAY_MS 200U
+#define RX_LUA_CONFIG_SAVE_DELAY_MS 500U
 static uint8_t rxLuaQueue[RX_LUA_QUEUE_DEPTH][CRSF_FRAME_SIZE_MAX];
 static uint8_t rxLuaQueueLen[RX_LUA_QUEUE_DEPTH] = {};
 static uint8_t rxLuaQueueHead = 0;
 static uint8_t rxLuaQueueTail = 0;
 static uint8_t rxLuaQueueCount = 0;
+static bool rxLuaConfigSavePending = false;
+static bool rxLuaSerialApplyPending = false;
+static uint32_t rxLuaConfigSaveAtMs = 0;
+
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+static bool rxLuaDiagSnapshotPending = false;
+static uint8_t rxLuaDiagSnapshotTrigger = 0;
+static uint8_t rxLuaDiagSnapshotParam = 0xFF;
+static uint8_t rxLuaDiagSnapshotAux = 0;
+static uint32_t rxLuaDiagSnapshotStartMs = 0;
+static uint32_t rxLuaDiagSnapshotAtMs = 0;
+static uint32_t rxLuaDiagLastSnapshotMs = 0;
+static uint32_t rxLuaDiagStartUlChunkCount = 0;
+static uint32_t rxLuaDiagStartUlCompleteCount = 0;
+static uint32_t rxLuaDiagStartCrsfHandledCount = 0;
+static uint32_t rxLuaDiagStartCrsfRejectCount = 0;
+static uint32_t rxLuaDiagStartCrsfIgnoredCount = 0;
+static uint32_t rxLuaDiagStartQueueDropCount = 0;
+static uint32_t rxLuaDiagStartTelemetryTxCount = 0;
+static uint32_t rxLuaDiagStartTelemetrySuppressedCount = 0;
+static uint32_t rxLuaDiagStartTelemetryDataUlAckCount = 0;
+#if ELRS_DIAG_TX_TURNAROUND
+static uint32_t rxLuaDiagStartTelemetryRxAfterTx = 0;
+static uint32_t rxLuaDiagStartTelemetryMissedAfterTx = 0;
+static uint32_t rxLuaDiagStartTelemetryTxBeforeRx = 0;
+#endif
+
+static bool rxLuaBindPostDiagPending = false;
+static uint8_t rxLuaBindPostDiagChunk = 0;
+static uint32_t rxLuaBindPostDiagStartMs = 0;
+static uint32_t rxLuaBindPostDiagAtMs = 0;
+static uint32_t rxLuaBindPostDiagStartUlChunkCount = 0;
+static uint32_t rxLuaBindPostDiagStartUlCompleteCount = 0;
+static uint32_t rxLuaBindPostDiagStartCrsfHandledCount = 0;
+static uint32_t rxLuaBindPostDiagStartQueueDropCount = 0;
+static uint32_t rxLuaBindPostDiagStartTelemetryTxCount = 0;
+static uint32_t rxLuaBindPostDiagStartTelemetrySuppressedCount = 0;
+static uint32_t rxLuaBindPostDiagStartTelemetryDataUlAckCount = 0;
+#if ELRS_DIAG_TX_TURNAROUND
+static uint32_t rxLuaBindPostDiagStartTelemetryRxAfterTx = 0;
+static uint32_t rxLuaBindPostDiagStartTelemetryMissedAfterTx = 0;
+static uint32_t rxLuaBindPostDiagStartTelemetryTxBeforeRx = 0;
+#endif
+
+static void rxLuaArmLoadSnapshot(uint8_t frameType, uint8_t parameterIndex,
+                                 uint8_t aux, bool force) {
+  const uint32_t nowMs = millis();
+
+  if (!force &&
+      (rxLuaDiagSnapshotPending ||
+      (rxLuaDiagLastSnapshotMs != 0 &&
+       (uint32_t)(nowMs - rxLuaDiagLastSnapshotMs) <
+           ELRS_DIAG_RX_LUA_LOAD_COOLDOWN_MS))) {
+    return;
+  }
+
+  rxLuaDiagSnapshotPending = true;
+  rxLuaDiagSnapshotTrigger = frameType;
+  rxLuaDiagSnapshotParam = parameterIndex;
+  rxLuaDiagSnapshotAux = aux;
+  rxLuaDiagSnapshotStartMs = nowMs;
+  rxLuaDiagSnapshotAtMs =
+      nowMs + (force ? 0U : ELRS_DIAG_RX_LUA_LOAD_DELAY_MS);
+  rxLuaDiagStartUlChunkCount = rxLuaUlChunkCount;
+  rxLuaDiagStartUlCompleteCount = rxLuaUlCompleteCount;
+  rxLuaDiagStartCrsfHandledCount = rxLuaCrsfHandledCount;
+  rxLuaDiagStartCrsfRejectCount = rxLuaCrsfRejectCount;
+  rxLuaDiagStartCrsfIgnoredCount = rxLuaCrsfIgnoredCount;
+  rxLuaDiagStartQueueDropCount = rxLuaQueueDropCount;
+  rxLuaDiagStartTelemetryTxCount = telemetryTxCount;
+  rxLuaDiagStartTelemetrySuppressedCount = telemetrySuppressedCount;
+  rxLuaDiagStartTelemetryDataUlAckCount = telemetryDataUlAckCount;
+#if ELRS_DIAG_TX_TURNAROUND
+  rxLuaDiagStartTelemetryRxAfterTx = telemetryRxAfterTx;
+  rxLuaDiagStartTelemetryMissedAfterTx = telemetryMissedAfterTx;
+  rxLuaDiagStartTelemetryTxBeforeRx = telemetryTxBeforeRx;
+#endif
+}
+
+static void rxLuaArmBindPostSnapshot(uint8_t fieldChunk) {
+  const uint32_t nowMs = millis();
+
+  rxLuaBindPostDiagPending = true;
+  rxLuaBindPostDiagChunk = fieldChunk;
+  rxLuaBindPostDiagStartMs = nowMs;
+  rxLuaBindPostDiagAtMs = nowMs + ELRS_DIAG_RX_LUA_BIND_POST_DELAY_MS;
+  rxLuaBindPostDiagStartUlChunkCount = rxLuaUlChunkCount;
+  rxLuaBindPostDiagStartUlCompleteCount = rxLuaUlCompleteCount;
+  rxLuaBindPostDiagStartCrsfHandledCount = rxLuaCrsfHandledCount;
+  rxLuaBindPostDiagStartQueueDropCount = rxLuaQueueDropCount;
+  rxLuaBindPostDiagStartTelemetryTxCount = telemetryTxCount;
+  rxLuaBindPostDiagStartTelemetrySuppressedCount = telemetrySuppressedCount;
+  rxLuaBindPostDiagStartTelemetryDataUlAckCount = telemetryDataUlAckCount;
+#if ELRS_DIAG_TX_TURNAROUND
+  rxLuaBindPostDiagStartTelemetryRxAfterTx = telemetryRxAfterTx;
+  rxLuaBindPostDiagStartTelemetryMissedAfterTx = telemetryMissedAfterTx;
+  rxLuaBindPostDiagStartTelemetryTxBeforeRx = telemetryTxBeforeRx;
+#endif
+}
+#endif
 
 #if ELRS_DIAG_RX_LUA_UL
 static bool rxLuaShouldPrintDiag(uint32_t count) {
@@ -333,6 +487,81 @@ static uint8_t clampU8(uint8_t value, uint8_t minValue, uint8_t maxValue) {
     return maxValue;
   }
   return value;
+}
+
+static const char *rxLuaModelIdOptions() {
+  static char options[200] = {};
+  static bool initialized = false;
+
+  if (!initialized) {
+    size_t used = (size_t)snprintf(options, sizeof(options), "Off");
+    for (uint8_t i = 0; i <= 63 && used < sizeof(options); i++) {
+      int written = snprintf(options + used, sizeof(options) - used, ";%u", i);
+      if (written <= 0) {
+        break;
+      }
+      used += (size_t)written;
+    }
+    options[sizeof(options) - 1] = '\0';
+    initialized = true;
+  }
+
+  return options;
+}
+
+static uint8_t rxLuaModelIdToSelection(uint8_t modelId) {
+  return modelId == 0xFF ? 0 : (uint8_t)(clampU8(modelId, 0, 63) + 1);
+}
+
+static uint8_t rxLuaSelectionToModelId(uint8_t selection) {
+  return selection == 0 ? 0xFF : (uint8_t)(clampU8(selection, 1, 64) - 1);
+}
+
+static void rxLuaHandleCommandWrite(uint8_t arg, uint8_t *step,
+                                    const char **info, bool *pending) {
+  if (step == nullptr || info == nullptr || pending == nullptr) {
+    return;
+  }
+
+  switch (arg) {
+  case RX_LUA_CMD_CLICK:
+    *step = RX_LUA_CMD_ASK_CONFIRM;
+    *info = "Confirm";
+    *pending = false;
+    break;
+  case RX_LUA_CMD_CONFIRMED:
+    *step = RX_LUA_CMD_EXECUTING;
+    *info = "Entering...";
+    *pending = true;
+    rxLuaPendingActionAtMs = millis();
+    break;
+  case RX_LUA_CMD_CANCEL:
+    *step = RX_LUA_CMD_IDLE;
+    *info = "";
+    *pending = false;
+    break;
+  case RX_LUA_CMD_QUERY:
+  default:
+    break;
+  }
+}
+
+static void rxLuaHandleBindCommandWrite(uint8_t arg) {
+  // Mirrors upstream RXParameters: bind enters only after the TX polls QUERY.
+  if (arg == RX_LUA_CMD_QUERY) {
+    rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+    rxLuaBindCommandInfo = "";
+    rxLuaBindPending = true;
+    rxLuaPendingActionAtMs = millis();
+  } else if (arg < RX_LUA_CMD_CANCEL) {
+    rxLuaBindCommandStep = RX_LUA_CMD_EXECUTING;
+    rxLuaBindCommandInfo = "Entering...";
+    rxLuaBindPending = false;
+  } else {
+    rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+    rxLuaBindCommandInfo = "";
+    rxLuaBindPending = false;
+  }
 }
 
 static uint32_t versionStringToU32(const char *verStr) {
@@ -462,6 +691,7 @@ static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
     // dropping the oldest one during a burst of Lua polling.
     rxLuaQueueHead = (uint8_t)((rxLuaQueueHead + 1) % RX_LUA_QUEUE_DEPTH);
     rxLuaQueueCount--;
+    rxLuaQueueDropCount++;
   }
 
   memcpy(rxLuaQueue[rxLuaQueueTail], frame, len);
@@ -474,7 +704,7 @@ static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
 #endif
 }
 
-static void rxLuaPumpTelemetry() {
+[[maybe_unused]] static void rxLuaPumpTelemetry() {
   if (TelemetrySender.IsActive() || rxLuaQueueCount == 0) {
     return;
   }
@@ -492,6 +722,43 @@ static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
   }
 
   return cfg->serial_protocol <= ELRS_SERIAL_GPS ? cfg->serial_protocol : 0;
+}
+
+static uint8_t getConfiguredSerialProtocol() {
+  return getProtocolSelectionFromConfig(elrs_config_get());
+}
+
+static bool serialProtocolUsesCrsf(uint8_t protocol) {
+  return protocol == ELRS_SERIAL_CRSF ||
+         protocol == ELRS_SERIAL_INVERTED_CRSF;
+}
+
+static bool configuredSerialProtocolUsesCrsf() {
+  return serialProtocolUsesCrsf(getConfiguredSerialProtocol());
+}
+
+static void applyConfiguredSerialProtocol() {
+#if ELRS_DIAG_DISABLE_CRSF_SERIAL
+  DBGLN("CRSF serial output disabled for standalone RF timing test");
+#else
+  const uint8_t protocol = getConfiguredSerialProtocol();
+  if (!serialProtocolUsesCrsf(protocol)) {
+    if (crsf_serial_is_ready()) {
+      crsf_serial_deinit();
+    }
+    DBGLN("Serial protocol %u selected; CRSF UART output inactive", protocol);
+    return;
+  }
+
+  if (!crsf_serial_is_ready()) {
+    // Uses USART0 at 420000 baud, matching ELRS CRSF output.
+    if (crsf_serial_init(420000) != 0) {
+      DBGLN("WARNING: CRSF serial init failed - no FC output");
+    } else {
+      DBGLN("CRSF serial output initialized");
+    }
+  }
+#endif
 }
 
 static void rxLuaRefreshDynamicValues() {
@@ -676,9 +943,12 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     commandInfo = rxLuaBindCommandInfo;
     break;
   case RX_LUA_PARAM_MODEL_ID:
-    paramType = CRSF_INFO;
+    paramType = CRSF_TEXT_SELECTION;
     name = "Model Id";
-    value = rxLuaModelIdValue;
+    options = rxLuaModelIdOptions();
+    selectionValue =
+        rxLuaModelIdToSelection(cfg != nullptr ? cfg->model_id : modelMatchId);
+    selectionMax = selectionOptionMax(options);
     break;
   case RX_LUA_PARAM_TLM_RATIO:
     paramType = CRSF_INFO;
@@ -770,19 +1040,46 @@ static void rxLuaQueueDeviceInfo(crsf_addr_e destAddr) {
   }
 }
 
-static void rxLuaQueueParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
+static bool rxLuaQueueParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
                                 uint8_t fieldChunk) {
   uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
   uint8_t frameLen = 0;
   if (rxLuaBuildParameter(destAddr, parameterIndex, fieldChunk, frame,
                           &frameLen)) {
     rxLuaQueueFrame(frame, frameLen);
+    return true;
   }
+
+  return false;
 }
 
-static void rxLuaSaveConfig(void) {
+static void rxLuaSaveConfig(bool applySerialAfterSave = false) {
+  rxLuaConfigSavePending = true;
+  rxLuaSerialApplyPending = rxLuaSerialApplyPending || applySerialAfterSave;
+  rxLuaConfigSaveAtMs = millis() + RX_LUA_CONFIG_SAVE_DELAY_MS;
+}
+
+[[maybe_unused]] static void rxLuaProcessConfigSave() {
+  if (!rxLuaConfigSavePending ||
+      (uint32_t)(millis() - rxLuaConfigSaveAtMs) >= 0x80000000UL) {
+    return;
+  }
+
+  if (rxLuaQueueCount != 0 || TelemetrySender.IsActive()) {
+    return;
+  }
+
+  rxLuaConfigSavePending = false;
+  const bool applySerial = rxLuaSerialApplyPending;
+  rxLuaSerialApplyPending = false;
+
   if (elrs_config_save() != 0) {
     DBGLN("[RX_LUA] Config save failed");
+    return;
+  }
+
+  if (applySerial) {
+    applyConfiguredSerialProtocol();
   }
 }
 
@@ -795,7 +1092,7 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
     if (cfg != nullptr) {
       cfg->serial_protocol =
           (arg <= ELRS_SERIAL_GPS) ? arg : (uint8_t)ELRS_SERIAL_CRSF;
-      rxLuaSaveConfig();
+      rxLuaSaveConfig(true);
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
     break;
@@ -829,11 +1126,8 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
     }
     break;
   case RX_LUA_PARAM_WIFI:
-    rxLuaWifiCommandStep = RX_LUA_CMD_EXECUTING;
-    rxLuaWifiCommandInfo = "Entering...";
-    rxLuaWifiPending = (arg == RX_LUA_CMD_CLICK || arg == RX_LUA_CMD_CONFIRMED ||
-                        arg == RX_LUA_CMD_QUERY);
-    rxLuaPendingActionAtMs = millis();
+    rxLuaHandleCommandWrite(arg, &rxLuaWifiCommandStep, &rxLuaWifiCommandInfo,
+                            &rxLuaWifiPending);
     rxLuaQueueParameter(origin, parameterIndex, 0);
     break;
   case RX_LUA_PARAM_TEAM_RACE_CHANNEL:
@@ -858,19 +1152,23 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
     }
     break;
   case RX_LUA_PARAM_BIND:
-    rxLuaBindCommandStep = RX_LUA_CMD_EXECUTING;
-    rxLuaBindCommandInfo = "Entering...";
-    rxLuaBindPending = (arg == RX_LUA_CMD_CLICK || arg == RX_LUA_CMD_CONFIRMED ||
-                        arg == RX_LUA_CMD_QUERY);
-    rxLuaPendingActionAtMs = millis();
+    rxLuaHandleBindCommandWrite(arg);
     rxLuaQueueParameter(origin, parameterIndex, 0);
+    break;
+  case RX_LUA_PARAM_MODEL_ID:
+    if (cfg != nullptr) {
+      cfg->model_id = rxLuaSelectionToModelId(arg);
+      modelMatchId = cfg->model_id;
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
     break;
   default:
     break;
   }
 }
 
-static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
+[[maybe_unused]] static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
   uint8_t frameLen = 0;
   if (!validateCrsfFrame(frame, &frameLen)) {
     return false;
@@ -900,6 +1198,9 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
   switch (frameType) {
   case CRSF_FRAMETYPE_DEVICE_PING:
     rxLuaCrsfHandledCount++;
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+    rxLuaArmLoadSnapshot(frameType, 0xFF, 0, false);
+#endif
 #if ELRS_DIAG_RX_LUA_UL
     DBGLN("[RX_LUA] DEVICE_PING from 0x%02X", origin);
 #endif
@@ -910,6 +1211,10 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
     if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
       const uint8_t parameterIndex = payload[0];
       const uint8_t fieldChunk = payload[1];
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+      rxLuaArmLoadSnapshot(frameType, parameterIndex, fieldChunk,
+                           parameterIndex == RX_LUA_PARAM_BIND);
+#endif
 #if ELRS_DIAG_RX_LUA_UL && ELRS_DIAG_RX_LUA_UL_VERBOSE
       DBGLN("[RX_LUA] PARAM_READ id=%u chunk=%u from=0x%02X",
             parameterIndex, fieldChunk, origin);
@@ -921,12 +1226,24 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
         rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
         rxLuaBindCommandInfo = "";
       }
-      rxLuaQueueParameter(origin, parameterIndex, fieldChunk);
+      const bool queued = rxLuaQueueParameter(origin, parameterIndex, fieldChunk);
+      if (parameterIndex == RX_LUA_PARAM_BIND) {
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+        rxLuaArmBindPostSnapshot(fieldChunk);
+#endif
+        DBGLN("[RX_LUA] PARAM_READ bind chunk=%u step=%u queued=%u q=%u active=%u",
+              fieldChunk, rxLuaBindCommandStep, queued ? 1 : 0,
+              rxLuaQueueCount, TelemetrySender.IsActive() ? 1 : 0);
+      }
     }
     return true;
   case CRSF_FRAMETYPE_PARAMETER_WRITE:
     rxLuaCrsfHandledCount++;
     if (frameLen >= sizeof(crsf_ext_header_t) + 2 + CRSF_FRAME_CRC_SIZE) {
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+      rxLuaArmLoadSnapshot(frameType, payload[0], payload[1],
+                           payload[0] == RX_LUA_PARAM_BIND);
+#endif
 #if ELRS_DIAG_RX_LUA_UL
       DBGLN("[RX_LUA] PARAM_WRITE id=%u arg=%u", payload[0], payload[1]);
 #endif
@@ -941,12 +1258,15 @@ static bool rxLuaHandleCrsfFrame(const uint8_t *frame) {
   }
 }
 
-static void rxLuaProcessPendingActions() {
+[[maybe_unused]] static void rxLuaProcessPendingActions() {
   if (!rxLuaWifiPending && !rxLuaBindPending) {
     return;
   }
 
   const uint32_t elapsedMs = millis() - rxLuaPendingActionAtMs;
+  if (elapsedMs < RX_LUA_PENDING_ACTION_DELAY_MS) {
+    return;
+  }
   if ((rxLuaQueueCount != 0 || TelemetrySender.IsActive()) && elapsedMs < 5000) {
     return;
   }
@@ -1054,48 +1374,13 @@ static int32_t normalizePfdOffsetToInterval(int32_t offset) {
   return offset;
 }
 
-static void trimFreqOffsetTowardZero() {
-  if (hwTimer::FreqOffset > 0) {
-    hwTimer::decFreqOffset();
-  } else if (hwTimer::FreqOffset < 0) {
-    hwTimer::incFreqOffset();
-  }
-}
-
-static int32_t absPfdI32(int32_t value) { return value < 0 ? -value : value; }
-
-static int32_t clampPfdI32(int32_t value, int32_t minValue,
-                           int32_t maxValue) {
-  if (value < minValue) {
-    return minValue;
-  }
-  if (value > maxValue) {
-    return maxValue;
-  }
-  return value;
-}
-
-static bool pfdSampleLooksStable(int32_t offset, int32_t offsetDx,
-                                 int32_t maxOffset, int32_t maxDx) {
-  return absPfdI32(offset) <= maxOffset && absPfdI32(offsetDx) <= maxDx &&
-         LQCalc.getLQRaw() >= ELRS_PFD_FREQ_LOCK_MIN_LQ;
-}
-
-static void updateFreqOffsetFromPfd(int32_t offset, int32_t offsetDx) {
+static void updateFreqOffsetFromPfd(int32_t offset) {
   if (RXtimerState != tim_locked || (OtaNonce % 8) != 0) {
     return;
   }
 
-  // Frequency offset is for tiny steady clock drift. Large phase errors on
-  // SiW917 are usually task/timer ordering or telemetry-slot phase bias, so
-  // feeding them into the integrator walks telemetry slots until the TX drops
-  // downlink. Let phaseShift handle those and bleed stale freq trim back out.
-  if (!pfdSampleLooksStable(offset, offsetDx, ELRS_PFD_FREQ_LOCK_MAX_US,
-                            ELRS_PFD_FREQ_LOCK_DX_MAX_US)) {
-    trimFreqOffsetTowardZero();
-    return;
-  }
-
+  // Match upstream ELRS: once timer lock is established, adjust frequency from
+  // the filtered phase offset sign at a limited rate.
   if (offset > 0) {
     hwTimer::incFreqOffset();
   } else if (offset < 0) {
@@ -1103,24 +1388,12 @@ static void updateFreqOffsetFromPfd(int32_t offset, int32_t offsetDx) {
   }
 }
 
-static int32_t phaseShiftFromPfd(int32_t rawOffset, int32_t offset,
-                                 int32_t offsetDx) {
+static int32_t phaseShiftFromPfd(int32_t rawOffset, int32_t offset) {
   if (connectionState != connected) {
     return rawOffset >> 1;
   }
 
-  // The queued SiW917 task model can occasionally pair the packet timestamp
-  // with the adjacent timer edge. Those samples normalize near +/- half a
-  // packet and are not safe to feed into phase correction. Keep connected-mode
-  // phase nudges small; real crystal drift is handled by the guarded frequency
-  // trim above.
-  if (!pfdSampleLooksStable(offset, offsetDx, ELRS_PFD_PHASE_LOCK_MAX_US,
-                            ELRS_PFD_PHASE_LOCK_DX_MAX_US)) {
-    return 0;
-  }
-
-  return clampPfdI32(offset >> 2, -ELRS_PFD_PHASE_SHIFT_MAX_US,
-                     ELRS_PFD_PHASE_SHIFT_MAX_US);
+  return offset >> 2;
 }
 
 //=============================================================================
@@ -1130,6 +1403,38 @@ void ChannelDataReset() {
   for (int i = 0; i < CRSF_NUM_CHANNELS; i++) {
     ChannelData[i] = CRSF_CHANNEL_VALUE_MID;
   }
+}
+
+static uint8_t getConfiguredFailsafeMode() {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr || cfg->failsafe_mode > ELRS_FAILSAFE_SET) {
+    return ELRS_FAILSAFE_NO_PULSES;
+  }
+  return cfg->failsafe_mode;
+}
+
+static bool shouldOutputCrsfRcFrames() {
+  if (InBindingMode || InWiFiMode || !crsf_serial_is_ready() ||
+      !configuredSerialProtocolUsesCrsf() ||
+      (TxOtaProtocol != TX_NORMAL_MODE)) {
+    return false;
+  }
+
+  if (connectionState == connected) {
+    return connectionHasModelMatch;
+  }
+
+  const uint8_t failsafeMode = getConfiguredFailsafeMode();
+  if (failsafeMode == ELRS_FAILSAFE_LAST) {
+    return lastConnectionHadModelMatch;
+  }
+
+  if (failsafeMode == ELRS_FAILSAFE_SET) {
+    ChannelDataReset();
+    return lastConnectionHadModelMatch;
+  }
+
+  return false;
 }
 
 //=============================================================================
@@ -1152,6 +1457,27 @@ static uint8_t getStartupOrBindingRateIndex(void) {
   }
 
   return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
+}
+
+static uint8_t getFirstSupportedRFRateIndex(void) {
+  for (uint8_t i = 0; i < RATE_MAX; i++) {
+    if (isSupportedRFRate(i)) {
+      return i;
+    }
+  }
+
+  return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
+}
+
+static uint8_t getNextSupportedRFRateIndex(uint8_t index) {
+  for (uint8_t i = 1; i <= RATE_MAX; i++) {
+    uint8_t candidate = (uint8_t)((index + i) % RATE_MAX);
+    if (isSupportedRFRate(candidate)) {
+      return candidate;
+    }
+  }
+
+  return getFirstSupportedRFRateIndex();
 }
 
 //=============================================================================
@@ -1209,8 +1535,19 @@ static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
   }
 
   memcpy(firmwareOptions.uid, UID, UID_LEN);
-  memcpy(pendingUid, UID, UID_LEN);
-  uidSavePending = true;
+
+  elrs_config_t *cfg = elrs_config_get();
+  const uint8_t bindStorage =
+      cfg != nullptr ? cfg->bind_storage : (uint8_t)ELRS_BIND_STORAGE_PERSISTENT;
+  if (bindStorage == ELRS_BIND_STORAGE_VOLATILE) {
+    uidSavePending = false;
+    uidRefreshPending = true;
+    DBGLN("Volatile bind UID applied for this boot");
+  } else {
+    memcpy(pendingUid, UID, UID_LEN);
+    uidSavePending = true;
+  }
+  bindCompletePending = true;
 
   DBGLN("New UID from MSP bind = %u,%u,%u,%u,%u,%u", UID[0], UID[1], UID[2],
         UID[3], UID[4], UID[5]);
@@ -1230,9 +1567,9 @@ static void ICACHE_RAM_ATTR updatePhaseLock() {
     pfdLastOffsetDx = offsetDx;
     pfdResultCount++;
 
-    updateFreqOffsetFromPfd(offset, offsetDx);
+    updateFreqOffsetFromPfd(offset);
 
-    int32_t phaseShift = phaseShiftFromPfd(rawOffset, offset, offsetDx);
+    int32_t phaseShift = phaseShiftFromPfd(rawOffset, offset);
     pfdLastPhaseShift = phaseShift;
     hwTimer::phaseShift(phaseShift);
 
@@ -1262,6 +1599,12 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
+#if ELRS_DIAG_TX_TURNAROUND
+  if (telemetryAwaitingRx && !LQCalc.currentIsSet()) {
+    telemetryMissedAfterTx++;
+  }
+#endif
+
   uplinkLQ = LQCalc.getLQ();
   linkStats.uplink_Link_quality = uplinkLQ;
   if (!alreadyTLMresp) {
@@ -1318,11 +1661,21 @@ static void LostConnection(bool resumeRx) {
         (long)pfdLastOffset, (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
         (long)hwTimer::FreqOffset, OtaNonce, FHSSgetCurrIndex());
 
+#if ELRS_DIAG_PRINT_AFTER_LOSS
+  if (!InBindingMode && !InWiFiMode && lastDisconnectReason != DISC_RATE_CHANGE) {
+    diagPrintAfterLossPending = true;
+  }
+#endif
+
   setConnectionState(disconnected);
   RXtimerState = tim_disconnected;
   PfdPrevRawOffset = 0;
   GotConnectionMillis = 0;
   uplinkLQ = 0;
+  lastConnectionHadModelMatch = connectionHasModelMatch;
+  if (getConfiguredFailsafeMode() == ELRS_FAILSAFE_SET) {
+    ChannelDataReset();
+  }
   connectionHasModelMatch = false;
   LQCalc.reset();
   LPF_Offset.init(0);
@@ -1332,16 +1685,19 @@ static void LostConnection(bool resumeRx) {
   dataUlReady = false;
   DataUlReceiver.ResetState();
 
-  if (hwTimer::isRunning()) {
-    hwTimer::stop();
-  }
   hwTimer::resetFreqOffset();
 
   if (!InBindingMode) {
+    if (hwTimer::isRunning()) {
+      hwTimer::stop();
+    }
     SetRFLinkRate(ExpressLRS_nextAirRateIndex, false);
     if (resumeRx) {
       Radio.RXnb();
     }
+  } else if (resumeRx) {
+    SetRFLinkRate(getStartupOrBindingRateIndex(), true);
+    Radio.RXnb();
   }
 }
 
@@ -1449,13 +1805,16 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
   uint8_t packageIndex;
   uint8_t const *payload;
   uint8_t dataLen;
+  bool stubbornAck;
 
   if (OtaIsFullRes) {
     packageIndex = otaPktPtr->full.data_ul.packageIndex;
+    stubbornAck = otaPktPtr->full.data_ul.stubbornAck;
     payload = otaPktPtr->full.data_ul.payload;
     dataLen = sizeof(otaPktPtr->full.data_ul.payload);
   } else {
     packageIndex = otaPktPtr->std.data_ul.packageIndex;
+    stubbornAck = otaPktPtr->std.data_ul.stubbornAck;
     payload = otaPktPtr->std.data_ul.payload;
     dataLen = sizeof(otaPktPtr->std.data_ul.payload);
   }
@@ -1467,6 +1826,16 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
 
   if (connectionState != connected) {
     return;
+  }
+
+  // Match upstream RX behavior: DATA_UL carries a valid downlink stubborn ACK
+  // only for MAVLink data-over-OTA. CRSF Lua/device-management replies are
+  // acknowledged by the normal RC telemetry-confirm bit instead.
+  if (TelemetrySender.IsActive() &&
+      getConfiguredSerialProtocol() == ELRS_SERIAL_MAVLINK) {
+    TelemetrySender.ConfirmCurrentPayload(stubbornAck);
+    telemetryDataUlAckCount++;
+    telemetryLastDataUlAck = stubbornAck;
   }
 
 #if ELRS_DIAG_RX_LUA_UL
@@ -1702,6 +2071,16 @@ static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   }
 
   if (ProcessRFPacket(rxStatus)) {
+#if ELRS_DIAG_TX_TURNAROUND
+    if (telemetryAwaitingRx) {
+      const uint32_t now = micros();
+      telemetryRxnbToRxOkUs = now - telemetryRxnbDoneUs;
+      telemetryRxNonce = OtaNonce;
+      telemetryRxFhss = FHSSgetCurrIndex();
+      telemetryRxAfterTx++;
+      telemetryAwaitingRx = 0;
+    }
+#endif
     if (doStartTimer) {
       doStartTimer = false;
       hwTimer::resume();
@@ -1714,7 +2093,19 @@ static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
 
 static void ICACHE_RAM_ATTR TXdoneISR() {
   // After sending telemetry, switch back to RX
+#if ELRS_DIAG_TX_TURNAROUND
+  const uint32_t txDoneUs = micros();
+  telemetryTxDoneUs = txDoneUs;
+  telemetryTxToDoneUs = txDoneUs - telemetryTxStartUs;
+#endif
   Radio.RXnb();
+#if ELRS_DIAG_TX_TURNAROUND
+  const uint32_t rxnbDoneUs = micros();
+  telemetryRxnbDoneUs = rxnbDoneUs;
+  telemetryDoneToRxnbDoneUs = rxnbDoneUs - txDoneUs;
+  telemetryTxToRxnbDoneUs = rxnbDoneUs - telemetryTxStartUs;
+  telemetryAwaitingRx = 1;
+#endif
 }
 
 //=============================================================================
@@ -1836,6 +2227,22 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
   }
 
   OtaGeneratePacketCrc(&otaPkt);
+#if ELRS_DIAG_TX_TURNAROUND
+  if (telemetryAwaitingRx) {
+    telemetryTxBeforeRx++;
+  }
+  telemetryTxStartUs = micros();
+  telemetryTxDoneUs = 0;
+  telemetryRxnbDoneUs = 0;
+  telemetryTxToDoneUs = 0;
+  telemetryDoneToRxnbDoneUs = 0;
+  telemetryTxToRxnbDoneUs = 0;
+  telemetryRxnbToRxOkUs = 0;
+  telemetryMissedAfterTx = 0;
+  telemetryAwaitingRx = 0;
+  telemetryTxNonce = OtaNonce;
+  telemetryTxFhss = FHSSgetCurrIndex();
+#endif
   Radio.TXnb((uint8_t *)&otaPkt, false, nullptr, SX12XX_Radio_All);
   return true;
 }
@@ -1897,20 +2304,59 @@ static void DataUlReceiveComplete() {
     }
     break;
   default:
-    if (rxLuaHandleCrsfFrame(DataUlBuffer)) {
-      break;
-    }
-
-    if ((TxOtaProtocol == TX_NORMAL_MODE) && crsf_serial_is_ready()) {
+    if (TxOtaProtocol == TX_NORMAL_MODE) {
       const crsf_header_t *receivedHeader =
           reinterpret_cast<const crsf_header_t *>(DataUlBuffer);
-      uint32_t frameLen =
+      const uint32_t frameLen =
           receivedHeader->frame_size + CRSF_FRAME_NOT_COUNTED_BYTES;
       if (frameLen >= CRSF_MIN_PACKET_LEN && frameLen <= CRSF_MAX_PACKET_LEN) {
-        (void)crsf_serial_send_frame(DataUlBuffer, frameLen);
+        switch (receivedHeader->type) {
+        case CRSF_FRAMETYPE_DEVICE_PING:
+        case CRSF_FRAMETYPE_PARAMETER_READ:
+        case CRSF_FRAMETYPE_PARAMETER_WRITE:
+        case CRSF_FRAMETYPE_COMMAND:
+#if ELRS_DIAG_CRSF_OTA_VERBOSE
+          {
+            const auto *extHeader =
+                reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
+            const uint8_t *payload =
+                reinterpret_cast<const uint8_t *>(receivedHeader) +
+                sizeof(crsf_ext_header_t);
+            const uint8_t payloadLen =
+                receivedHeader->frame_size >= CRSF_FRAME_LENGTH_EXT_TYPE_CRC
+                    ? (uint8_t)(receivedHeader->frame_size -
+                                CRSF_FRAME_LENGTH_EXT_TYPE_CRC)
+                    : 0;
+            DBGLN("[DATA_UL] CRSF type=0x%02X len=%lu dest=0x%02X orig=0x%02X p0=%u p1=%u",
+                  receivedHeader->type, (unsigned long)frameLen,
+                  extHeader->dest_addr, extHeader->orig_addr,
+                  payloadLen > 0 ? payload[0] : 0,
+                  payloadLen > 1 ? payload[1] : 0);
+          }
+#endif
+#if ELRS_DIAG_LUA_DISCOVERY
+          if (receivedHeader->type == CRSF_FRAMETYPE_DEVICE_PING) {
+            const auto *extHeader =
+                reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
+            const uint32_t pingCount = ++luaDiscoveryPingCount;
+            DBGLN("LUA_DISC ping #%lu len=%lu dest=0x%02X orig=0x%02X den=%u active=%u",
+                  (unsigned long)pingCount, (unsigned long)frameLen,
+                  extHeader->dest_addr, extHeader->orig_addr,
+                  ExpressLRS_currTlmDenom, TelemetrySender.IsActive() ? 1 : 0);
+          }
+#endif
+          crsfRouter.processMessage(&otaConnector, receivedHeader);
+          break;
+        default:
+          if (crsf_serial_is_ready() && configuredSerialProtocolUsesCrsf()) {
+            (void)crsf_serial_send_frame(DataUlBuffer, frameLen);
+          }
+          break;
+        }
       } else {
-        DBGLN("Ignoring malformed UL CRSF frame len=%lu",
-              (unsigned long)frameLen);
+        DBGLN("[DATA_UL] malformed CRSF len=%lu first=%02X %02X %02X %02X",
+              (unsigned long)frameLen, DataUlBuffer[0], DataUlBuffer[1],
+              DataUlBuffer[2], DataUlBuffer[3]);
       }
     }
     break;
@@ -2078,8 +2524,28 @@ bool elrs_init(void) {
   rxLuaCrsfRejectCount = 0;
   rxLuaCrsfIgnoredCount = 0;
   rxLuaLastUlPackageIndex = 0;
+  rxLuaQueueDropCount = 0;
+  rxLuaConfigSavePending = false;
+  rxLuaSerialApplyPending = false;
+  rxLuaConfigSaveAtMs = 0;
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+  rxLuaDiagSnapshotPending = false;
+  rxLuaBindPostDiagPending = false;
+  rxLuaDiagLastSnapshotMs = 0;
+#endif
   DataUlReceiver.setMaxPackageIndex(ELRS_MSP_MAX_PACKAGES);
   DataUlReceiver.SetDataToReceive(DataUlBuffer, sizeof(DataUlBuffer));
+
+  // The SiWx917 startup path does not reliably run C++ global constructors for
+  // these CRSF objects. Construct them explicitly before routing Lua traffic so
+  // the router CRC table, endpoint base device id, and virtual tables are valid.
+  new (&crsfRouter) CRSFRouter();
+  new (&otaConnector) RXOTAConnector();
+  new (&crsfReceiver) SiW917RXEndpoint();
+  DBGLN("[CRSF_INIT] rx endpoint dev=0x%02X", crsfReceiver.getDeviceId());
+  crsfRouter.addEndpoint(&crsfReceiver);
+  crsfRouter.addConnector(&otaConnector);
+  crsfReceiver.updateParameters();
 
   // NOTE: Do NOT call radioHal.init() here!
   // Radio.Begin() below calls hal.init() which does the full init sequence.
@@ -2127,17 +2593,7 @@ bool elrs_init(void) {
   // Record start time for rate cycling
   RFmodeLastCycled = millis();
 
-#if ELRS_DIAG_DISABLE_CRSF_SERIAL
-  DBGLN("CRSF serial output disabled for standalone RF timing test");
-#else
-  // Initialize CRSF serial output to flight controller
-  // Uses USART0 at 420000 baud (ELRS standard)
-  if (crsf_serial_init(420000) != 0) {
-    DBGLN("WARNING: CRSF serial init failed - no FC output");
-  } else {
-    DBGLN("CRSF serial output initialized");
-  }
-#endif
+  applyConfiguredSerialProtocol();
 
   // Load model match ID from config (0xFF = disabled)
   elrs_config_t *cfg = elrs_config_get();
@@ -2164,9 +2620,32 @@ void elrs_loop(void) {
     dump_capture_buffer();
   }
 
+#if ELRS_DIAG_PERIODIC_STATS || ELRS_DIAG_PRINT_AFTER_LOSS
+#if ELRS_DIAG_PERIODIC_STATS
   static uint32_t lastDiag = 0;
-  if (millis() - lastDiag > 2000) {
+#endif
+  bool shouldPrintDiag = false;
+#if ELRS_DIAG_PRINT_AFTER_LOSS
+  if (diagPrintAfterLossPending && connectionState == disconnected) {
+    diagPrintAfterLossPending = false;
+    shouldPrintDiag = true;
+  }
+#endif
+#if ELRS_DIAG_PERIODIC_STATS
+  if (!shouldPrintDiag) {
+    const bool shouldPrintPeriodicDiag =
+#if ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED
+        true;
+#else
+        connectionState != connected;
+#endif
+    shouldPrintDiag = shouldPrintPeriodicDiag && millis() - lastDiag > 2000;
+  }
+#endif
+  if (shouldPrintDiag) {
+#if ELRS_DIAG_PERIODIC_STATS
     lastDiag = millis();
+#endif
 
     uint32_t isrCount = 0;
     uint32_t rxIrqCount = 0;
@@ -2282,7 +2761,179 @@ void elrs_loop(void) {
           (unsigned long)hwTimer::getQueueOverflowCount(),
           (unsigned long)hwTimer::getImmediateTockDeliveredCount());
 #endif
+#if ELRS_DIAG_TX_TURNAROUND
+    DBGLN("TXTRN t2d:%lu d2rx:%lu tx2rx:%lu rxok:%lu miss:%lu "
+          "pend:%u pre:%lu ok:%lu tx:%u/%u rx:%u/%u",
+          (unsigned long)telemetryTxToDoneUs,
+          (unsigned long)telemetryDoneToRxnbDoneUs,
+          (unsigned long)telemetryTxToRxnbDoneUs,
+          (unsigned long)telemetryRxnbToRxOkUs,
+          (unsigned long)telemetryMissedAfterTx, telemetryAwaitingRx,
+          (unsigned long)telemetryTxBeforeRx, (unsigned long)telemetryRxAfterTx,
+          telemetryTxNonce, telemetryTxFhss, telemetryRxNonce,
+          telemetryRxFhss);
+#endif
   }
+#endif
+
+#if ELRS_DIAG_RX_LUA_LOAD_SNAPSHOT
+  if (rxLuaDiagSnapshotPending &&
+      (uint32_t)(now - rxLuaDiagSnapshotAtMs) < 0x80000000UL) {
+    rxLuaDiagSnapshotPending = false;
+    rxLuaDiagLastSnapshotMs = now;
+
+    const uint8_t rateIndex = ExpressLRS_currAirRate_Modparams
+                                  ? ExpressLRS_currAirRate_Modparams->index
+                                  : 0;
+#if ELRS_DIAG_TX_TURNAROUND
+    DBGLN("LUA_DIAG age:%lu trig:0x%02X param:%u aux:%u conn:%d rxst:%d "
+          "rate:%u den:%u burst:%u q:%u active:%u st:%u wait:%u/%u "
+          "ulack:%lu/%u drop:%lu "
+          "ul:%lu/%lu crsf:%lu/%lu/%lu "
+          "tlm:%lu/%lu txrx:%lu/%lu/%lu pend:%u last:%u exp:%u/%u lq:%u/%u "
+          "rssi:%d snr:%d",
+          (unsigned long)(now - rxLuaDiagSnapshotStartMs),
+          rxLuaDiagSnapshotTrigger, rxLuaDiagSnapshotParam,
+          rxLuaDiagSnapshotAux, connectionState, RXtimerState, rateIndex,
+          ExpressLRS_currTlmDenom, telemetryBurstMax, rxLuaQueueCount,
+          TelemetrySender.IsActive() ? 1 : 0, TelemetrySender.GetState(),
+          TelemetrySender.GetWaitCount(), TelemetrySender.GetMaxPacketsBeforeResync(),
+          (unsigned long)(telemetryDataUlAckCount -
+                          rxLuaDiagStartTelemetryDataUlAckCount),
+          telemetryLastDataUlAck ? 1 : 0,
+          (unsigned long)(rxLuaQueueDropCount - rxLuaDiagStartQueueDropCount),
+          (unsigned long)(rxLuaUlChunkCount - rxLuaDiagStartUlChunkCount),
+          (unsigned long)(rxLuaUlCompleteCount - rxLuaDiagStartUlCompleteCount),
+          (unsigned long)(rxLuaCrsfHandledCount -
+                          rxLuaDiagStartCrsfHandledCount),
+          (unsigned long)(rxLuaCrsfRejectCount -
+                          rxLuaDiagStartCrsfRejectCount),
+          (unsigned long)(rxLuaCrsfIgnoredCount -
+                          rxLuaDiagStartCrsfIgnoredCount),
+          (unsigned long)(telemetryTxCount - rxLuaDiagStartTelemetryTxCount),
+          (unsigned long)(telemetrySuppressedCount -
+                          rxLuaDiagStartTelemetrySuppressedCount),
+          (unsigned long)(telemetryRxAfterTx -
+                          rxLuaDiagStartTelemetryRxAfterTx),
+          (unsigned long)(telemetryMissedAfterTx -
+                          rxLuaDiagStartTelemetryMissedAfterTx),
+          (unsigned long)(telemetryTxBeforeRx -
+                          rxLuaDiagStartTelemetryTxBeforeRx),
+          telemetryAwaitingRx, lastValidPacketType, lastValidExpectedNonce,
+          lastValidExpectedFhss, LQCalc.getLQRaw(), LQCalc.getCount(),
+          Radio.LastPacketRSSI, Radio.LastPacketSNRRaw);
+#else
+    DBGLN("LUA_DIAG age:%lu trig:0x%02X param:%u aux:%u conn:%d rxst:%d "
+          "rate:%u den:%u burst:%u q:%u active:%u st:%u wait:%u/%u "
+          "ulack:%lu/%u drop:%lu "
+          "ul:%lu/%lu crsf:%lu/%lu/%lu "
+          "tlm:%lu/%lu last:%u exp:%u/%u lq:%u/%u rssi:%d snr:%d",
+          (unsigned long)(now - rxLuaDiagSnapshotStartMs),
+          rxLuaDiagSnapshotTrigger, rxLuaDiagSnapshotParam,
+          rxLuaDiagSnapshotAux, connectionState, RXtimerState, rateIndex,
+          ExpressLRS_currTlmDenom, telemetryBurstMax, rxLuaQueueCount,
+          TelemetrySender.IsActive() ? 1 : 0, TelemetrySender.GetState(),
+          TelemetrySender.GetWaitCount(), TelemetrySender.GetMaxPacketsBeforeResync(),
+          (unsigned long)(telemetryDataUlAckCount -
+                          rxLuaDiagStartTelemetryDataUlAckCount),
+          telemetryLastDataUlAck ? 1 : 0,
+          (unsigned long)(rxLuaQueueDropCount - rxLuaDiagStartQueueDropCount),
+          (unsigned long)(rxLuaUlChunkCount - rxLuaDiagStartUlChunkCount),
+          (unsigned long)(rxLuaUlCompleteCount - rxLuaDiagStartUlCompleteCount),
+          (unsigned long)(rxLuaCrsfHandledCount -
+                          rxLuaDiagStartCrsfHandledCount),
+          (unsigned long)(rxLuaCrsfRejectCount -
+                          rxLuaDiagStartCrsfRejectCount),
+          (unsigned long)(rxLuaCrsfIgnoredCount -
+                          rxLuaDiagStartCrsfIgnoredCount),
+          (unsigned long)(telemetryTxCount - rxLuaDiagStartTelemetryTxCount),
+          (unsigned long)(telemetrySuppressedCount -
+                          rxLuaDiagStartTelemetrySuppressedCount),
+          lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
+          LQCalc.getLQRaw(), LQCalc.getCount(), Radio.LastPacketRSSI,
+          Radio.LastPacketSNRRaw);
+#endif
+  }
+
+  if (rxLuaBindPostDiagPending &&
+      (uint32_t)(now - rxLuaBindPostDiagAtMs) < 0x80000000UL) {
+    rxLuaBindPostDiagPending = false;
+
+    const uint8_t rateIndex = ExpressLRS_currAirRate_Modparams
+                                  ? ExpressLRS_currAirRate_Modparams->index
+                                  : 0;
+#if ELRS_DIAG_TX_TURNAROUND
+    DBGLN("LUA_BIND_POST age:%lu chunk:%u conn:%d rxst:%d rate:%u den:%u "
+          "burst:%u q:%u active:%u st:%u pkg:%u off:%u bytes:%u wait:%u/%u "
+          "expack:%u ulack:%lu/%u drop:%lu ul:%lu/%lu crsf:%lu "
+          "tlm:%lu/%lu txrx:%lu/%lu/%lu pend:%u last:%u exp:%u/%u "
+          "lq:%u/%u rssi:%d snr:%d",
+          (unsigned long)(now - rxLuaBindPostDiagStartMs),
+          rxLuaBindPostDiagChunk, connectionState, RXtimerState, rateIndex,
+          ExpressLRS_currTlmDenom, telemetryBurstMax, rxLuaQueueCount,
+          TelemetrySender.IsActive() ? 1 : 0, TelemetrySender.GetState(),
+          TelemetrySender.GetCurrentPackage(), TelemetrySender.GetCurrentOffset(),
+          TelemetrySender.GetBytesLastPayload(), TelemetrySender.GetWaitCount(),
+          TelemetrySender.GetMaxPacketsBeforeResync(),
+          TelemetrySender.GetExpectedAck() ? 1 : 0,
+          (unsigned long)(telemetryDataUlAckCount -
+                          rxLuaBindPostDiagStartTelemetryDataUlAckCount),
+          telemetryLastDataUlAck ? 1 : 0,
+          (unsigned long)(rxLuaQueueDropCount -
+                          rxLuaBindPostDiagStartQueueDropCount),
+          (unsigned long)(rxLuaUlChunkCount -
+                          rxLuaBindPostDiagStartUlChunkCount),
+          (unsigned long)(rxLuaUlCompleteCount -
+                          rxLuaBindPostDiagStartUlCompleteCount),
+          (unsigned long)(rxLuaCrsfHandledCount -
+                          rxLuaBindPostDiagStartCrsfHandledCount),
+          (unsigned long)(telemetryTxCount -
+                          rxLuaBindPostDiagStartTelemetryTxCount),
+          (unsigned long)(telemetrySuppressedCount -
+                          rxLuaBindPostDiagStartTelemetrySuppressedCount),
+          (unsigned long)(telemetryRxAfterTx -
+                          rxLuaBindPostDiagStartTelemetryRxAfterTx),
+          (unsigned long)(telemetryMissedAfterTx -
+                          rxLuaBindPostDiagStartTelemetryMissedAfterTx),
+          (unsigned long)(telemetryTxBeforeRx -
+                          rxLuaBindPostDiagStartTelemetryTxBeforeRx),
+          telemetryAwaitingRx, lastValidPacketType, lastValidExpectedNonce,
+          lastValidExpectedFhss, LQCalc.getLQRaw(), LQCalc.getCount(),
+          Radio.LastPacketRSSI, Radio.LastPacketSNRRaw);
+#else
+    DBGLN("LUA_BIND_POST age:%lu chunk:%u conn:%d rxst:%d rate:%u den:%u "
+          "burst:%u q:%u active:%u st:%u pkg:%u off:%u bytes:%u wait:%u/%u "
+          "expack:%u ulack:%lu/%u drop:%lu ul:%lu/%lu crsf:%lu "
+          "tlm:%lu/%lu last:%u exp:%u/%u lq:%u/%u rssi:%d snr:%d",
+          (unsigned long)(now - rxLuaBindPostDiagStartMs),
+          rxLuaBindPostDiagChunk, connectionState, RXtimerState, rateIndex,
+          ExpressLRS_currTlmDenom, telemetryBurstMax, rxLuaQueueCount,
+          TelemetrySender.IsActive() ? 1 : 0, TelemetrySender.GetState(),
+          TelemetrySender.GetCurrentPackage(), TelemetrySender.GetCurrentOffset(),
+          TelemetrySender.GetBytesLastPayload(), TelemetrySender.GetWaitCount(),
+          TelemetrySender.GetMaxPacketsBeforeResync(),
+          TelemetrySender.GetExpectedAck() ? 1 : 0,
+          (unsigned long)(telemetryDataUlAckCount -
+                          rxLuaBindPostDiagStartTelemetryDataUlAckCount),
+          telemetryLastDataUlAck ? 1 : 0,
+          (unsigned long)(rxLuaQueueDropCount -
+                          rxLuaBindPostDiagStartQueueDropCount),
+          (unsigned long)(rxLuaUlChunkCount -
+                          rxLuaBindPostDiagStartUlChunkCount),
+          (unsigned long)(rxLuaUlCompleteCount -
+                          rxLuaBindPostDiagStartUlCompleteCount),
+          (unsigned long)(rxLuaCrsfHandledCount -
+                          rxLuaBindPostDiagStartCrsfHandledCount),
+          (unsigned long)(telemetryTxCount -
+                          rxLuaBindPostDiagStartTelemetryTxCount),
+          (unsigned long)(telemetrySuppressedCount -
+                          rxLuaBindPostDiagStartTelemetrySuppressedCount),
+          lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
+          LQCalc.getLQRaw(), LQCalc.getCount(), Radio.LastPacketRSSI,
+          Radio.LastPacketSNRRaw);
+#endif
+  }
+#endif
 
   updateTelemetryBurst();
 
@@ -2291,15 +2942,88 @@ void elrs_loop(void) {
     (void)elrs_config_set_uid(pendingUid);
     (void)elrs_config_save();
     OtaUpdateCrcInitFromUid();
+    FHSSrandomiseFHSSsequence(uidMacSeedGet());
     DBGLN("Persisted UID from MSP bind");
+  }
+
+  if (uidRefreshPending) {
+    uidRefreshPending = false;
+    OtaUpdateCrcInitFromUid();
+    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+  }
+
+  if (bindCompletePending && !uidSavePending && !uidRefreshPending) {
+    bindCompletePending = false;
+    if (InBindingMode) {
+      DBGLN("Bind UID applied - leaving binding mode");
+      elrs_exit_binding_mode();
+    }
   }
 
   if (dataUlReady) {
     DataUlReceiveComplete();
   }
 
-  rxLuaPumpTelemetry();
-  rxLuaProcessPendingActions();
+  if (!TelemetrySender.IsActive()) {
+    uint8_t nextPayloadSize = 0;
+    if (otaConnector.GetNextPayload(&nextPayloadSize, TelemetryBuffer) &&
+        nextPayloadSize > 0) {
+#if ELRS_DIAG_CRSF_OTA_VERBOSE
+      DBGLN("[DATA_DL] TelemetrySender set type=0x%02X len=%u den=%u active=%u",
+            TelemetryBuffer[CRSF_TELEMETRY_TYPE_INDEX], nextPayloadSize,
+            ExpressLRS_currTlmDenom, TelemetrySender.IsActive() ? 1 : 0);
+#endif
+#if ELRS_DIAG_LUA_DISCOVERY
+      const uint8_t payloadType = TelemetryBuffer[CRSF_TELEMETRY_TYPE_INDEX];
+      if (payloadType == CRSF_FRAMETYPE_DEVICE_INFO ||
+          payloadType == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY) {
+        luaDiscoveryActive = true;
+        luaDiscoveryType = payloadType;
+        luaDiscoveryLen = nextPayloadSize;
+        luaDiscoveryPrintCount = 0;
+        luaDiscoveryStartMs = now;
+        luaDiscoveryLastPrintMs = 0;
+        luaDiscoveryStartTxCount = telemetryTxCount;
+        DBGLN("LUA_DISC dl-start type=0x%02X len=%u den=%u burst=%u fifoEmpty=%u",
+              payloadType, nextPayloadSize, ExpressLRS_currTlmDenom,
+              telemetryBurstMax, otaConnector.IsEmpty() ? 1 : 0);
+      }
+#endif
+      TelemetrySender.SetDataToTransmit(TelemetryBuffer, nextPayloadSize);
+    }
+  }
+
+  crsfReceiver.processPending(TelemetrySender.IsActive() ||
+                              !otaConnector.IsEmpty());
+  if (crsfReceiver.consumeSerialApplyRequest()) {
+    applyConfiguredSerialProtocol();
+  }
+
+#if ELRS_DIAG_LUA_DISCOVERY
+  if (luaDiscoveryActive) {
+    if (!TelemetrySender.IsActive() && otaConnector.IsEmpty()) {
+      DBGLN("LUA_DISC dl-done type=0x%02X len=%u age=%lu tx=%lu",
+            luaDiscoveryType, luaDiscoveryLen,
+            (unsigned long)(now - luaDiscoveryStartMs),
+            (unsigned long)(telemetryTxCount - luaDiscoveryStartTxCount));
+      luaDiscoveryActive = false;
+    } else if (luaDiscoveryPrintCount < 5 &&
+               (luaDiscoveryLastPrintMs == 0 ||
+                (uint32_t)(now - luaDiscoveryLastPrintMs) >= 250U)) {
+      luaDiscoveryLastPrintMs = now;
+      luaDiscoveryPrintCount++;
+      DBGLN("LUA_DISC dl-state type=0x%02X age=%lu active=%u st=%u pkg=%u off=%u bytes=%u wait=%u/%u expAck=%u tx=%lu fifoEmpty=%u",
+            luaDiscoveryType, (unsigned long)(now - luaDiscoveryStartMs),
+            TelemetrySender.IsActive() ? 1 : 0, TelemetrySender.GetState(),
+            TelemetrySender.GetCurrentPackage(), TelemetrySender.GetCurrentOffset(),
+            TelemetrySender.GetBytesLastPayload(), TelemetrySender.GetWaitCount(),
+            TelemetrySender.GetMaxPacketsBeforeResync(),
+            TelemetrySender.GetExpectedAck() ? 1 : 0,
+            (unsigned long)(telemetryTxCount - luaDiscoveryStartTxCount),
+            otaConnector.IsEmpty() ? 1 : 0);
+    }
+  }
+#endif
 
   updateSwitchMode();
 
@@ -2330,6 +3054,23 @@ void elrs_loop(void) {
   // Rate change handling
   if ((connectionState != disconnected) &&
       (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index)) {
+    uint8_t requestedRateIndex = ExpressLRS_nextAirRateIndex;
+    DBGLN("Req air rate change %u->%u",
+          (unsigned)ExpressLRS_currAirRate_Modparams->index,
+          (unsigned)requestedRateIndex);
+
+    if (!isSupportedRFRate(requestedRateIndex)) {
+      DBGLN("Mode %u not supported, ignoring", (unsigned)requestedRateIndex);
+      requestedRateIndex = ExpressLRS_currAirRate_Modparams->index;
+      ExpressLRS_nextAirRateIndex = requestedRateIndex;
+    }
+
+    // If the immediate landing on the requested rate fails, do not let the
+    // first-connection rate lock strand the RX on a rate it cannot decode.
+    LockRFmode = false;
+    RFmodeCycleMultiplier = 1;
+    scanIndex = getNextSupportedRFRateIndex(requestedRateIndex);
+
     lastDisconnectReason = DISC_RATE_CHANGE;
     LostConnection(true);
     LastSyncPacket = now;
@@ -2349,16 +3090,12 @@ void elrs_loop(void) {
     RXtimerState = tim_locked;
   }
 
-  // Send CRSF RC channels to flight controller when connected
+  // Send CRSF RC channels, honoring the configured failsafe mode after RF loss.
   static uint32_t lastRcOutput = 0;
-  if ((connectionState == connected) && connectionHasModelMatch &&
-      (TxOtaProtocol == TX_NORMAL_MODE) &&
+  if (shouldOutputCrsfRcFrames() &&
       (now - lastRcOutput) >= CRSF_RC_OUTPUT_INTERVAL) {
     lastRcOutput = now;
-
-    if (crsf_serial_is_ready()) {
-      crsf_serial_send_channels(ChannelData);
-    }
+    crsf_serial_send_channels(ChannelData);
   }
 
   // Update external link stats and send to FC periodically
@@ -2376,8 +3113,8 @@ void elrs_loop(void) {
     }
 
     // Send link stats to FC via CRSF
-    if (crsf_serial_is_ready() && (connectionState == connected) &&
-        (TxOtaProtocol == TX_NORMAL_MODE)) {
+    if (crsf_serial_is_ready() && configuredSerialProtocolUsesCrsf() &&
+        (connectionState == connected) && (TxOtaProtocol == TX_NORMAL_MODE)) {
       crsf_link_stats_t crsfStats;
       crsfStats.uplink_rssi_1 = linkStats.uplink_RSSI_1;
       crsfStats.uplink_rssi_2 = linkStats.uplink_RSSI_2;
@@ -2487,13 +3224,31 @@ void elrs_enter_binding_mode(void) {
     return;
   }
 
+  if ((connectionState != disconnected) || hwTimer::isRunning()) {
+    lastDisconnectReason = DISC_EXTERNAL;
+    LostConnection(false);
+  }
+
+  TelemetrySender.ResetState();
+  DataUlReceiver.ResetState();
+  dataUlReady = false;
+  alreadyTLMresp = false;
+  connectionHasModelMatch = false;
+  lastConnectionHadModelMatch = false;
+
   OtaCrcInitializer = OTA_VERSION_ID;
   OtaNonce = 0;
   InBindingMode = true;
+  setConnectionState(disconnected);
+  RXtimerState = tim_disconnected;
   scanIndex = getStartupOrBindingRateIndex();
   ExpressLRS_nextAirRateIndex = scanIndex;
   SetRFLinkRate(scanIndex, true);
   Radio.RXnb();
+  LastValidPacket = millis();
+  LastSyncPacket = LastValidPacket;
+  RFmodeLastCycled = LastValidPacket;
+  status_led_set_mode(LED_MODE_BINDING);
   DBGLN("Entering binding mode");
 }
 
@@ -2502,13 +3257,26 @@ void elrs_exit_binding_mode(void) {
     return;
   }
 
-  InBindingMode = false;
+  TelemetrySender.ResetState();
+  DataUlReceiver.ResetState();
+  dataUlReady = false;
+  Radio.SetTxIdleMode();
+
+  bindCompletePending = false;
   OtaUpdateCrcInitFromUid();
   FHSSrandomiseFHSSsequence(uidMacSeedGet());
   LockRFmode = false;
-  scanIndex = getStartupOrBindingRateIndex();
+  RFmodeCycleMultiplier = 1;
+  scanIndex = getFirstSupportedRFRateIndex();
   ExpressLRS_nextAirRateIndex = scanIndex;
-  LostConnection(true);
+  InBindingMode = false;
+  lastDisconnectReason = DISC_EXTERNAL;
+  LostConnection(false);
+  Radio.RXnb();
+  LastValidPacket = millis();
+  LastSyncPacket = LastValidPacket;
+  RFmodeLastCycled = LastValidPacket;
+  status_led_set_mode(LED_MODE_DISCONNECTED);
   DBGLN("Exiting binding mode");
 }
 

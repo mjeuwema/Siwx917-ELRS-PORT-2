@@ -59,6 +59,12 @@ set(ELRS_CPP_SOURCES
     "${ELRS_CPP_LIB_DIR}/StubbornSender/stubborn_sender.cpp"
     # StubbornReceiver (for telemetry RX / downlink data)
     "${ELRS_CPP_LIB_DIR}/StubbornReceiver/stubborn_receiver.cpp"
+    # CRSF routing and RX Lua parameters
+    "${ELRS_CPP_LIB_DIR}/CrsfProtocol/CRSFConnector.cpp"
+    "${ELRS_CPP_LIB_DIR}/CrsfProtocol/CRSFRouter.cpp"
+    "${ELRS_CPP_LIB_DIR}/CrsfProtocol/CRSFEndpoint.cpp"
+    "${ELRS_CPP_LIB_DIR}/rx-crsf/RXOTAConnector.cpp"
+    "${ELRS_CPP_LIB_DIR}/rx-crsf/SiW917RXEndpoint.cpp"
 )
 
 #=============================================================================
@@ -88,6 +94,7 @@ set(ELRS_UPSTREAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ExpressLRS/src")
 
 target_include_directories(wifi_gspi_merged PUBLIC
     # Our SiW917 platform headers (must come FIRST to override upstream)
+    "../src"
     "../src/elrs_cpp/hal"
     "../src/elrs_cpp/include"
     "../src/elrs_cpp/lib/CRC"
@@ -96,6 +103,7 @@ target_include_directories(wifi_gspi_merged PUBLIC
     "../src/elrs_cpp/lib/LR1121Driver"
     "../src/elrs_cpp/lib/SX12xxDriverCommon"
     "../src/elrs_cpp/lib/CrsfProtocol"
+    "../src/elrs_cpp/lib/rx-crsf"
     "../src/elrs_cpp/lib/TelemetryProtocol"
     "../src/elrs_cpp/lib/LQCALC"
     "../src/elrs_cpp/lib/PFD"

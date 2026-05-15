@@ -26,6 +26,12 @@ public:
     void ConfirmCurrentPayload(bool telemetryConfirmValue);
     bool IsActive() const { return senderState != SENDER_IDLE; }
     uint16_t GetMaxPacketsBeforeResync() const { return maxWaitCount; }
+    uint8_t GetState() const { return (uint8_t)senderState; }
+    uint8_t GetCurrentPackage() const { return currentPackage; }
+    uint8_t GetCurrentOffset() const { return currentOffset; }
+    uint8_t GetBytesLastPayload() const { return bytesLastPayload; }
+    uint16_t GetWaitCount() const { return waitCount; }
+    bool GetExpectedAck() const { return telemetryConfirmExpectedValue; }
 private:
     uint8_t *data;
     uint8_t length;
