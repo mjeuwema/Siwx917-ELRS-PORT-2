@@ -9,6 +9,7 @@
 #include <cstring>
 
 #define RX_EP_DIAG 0
+#define RX_EP_EVENT_LOG 1
 
 extern "C" void elrs_cpp_request_wifi_mode(void);
 extern "C" void elrs_enter_binding_mode(void);
@@ -145,6 +146,20 @@ static uint8_t selectionToModelId(uint8_t selection) {
   return selection == 0 ? 0xFF : (uint8_t)(clampU8(selection, 1, 64) - 1);
 }
 
+#if RX_EP_EVENT_LOG
+static void logParameterWrite(const char *name, int32_t value) {
+  DBGLN("[RX_LUA] PARAM_WRITE %s=%ld", name, (long)value);
+}
+
+static void logModelIdWrite(uint8_t modelId) {
+  if (modelId == 0xFF) {
+    DBGLN("[RX_LUA] PARAM_WRITE Model Id=Off");
+  } else {
+    DBGLN("[RX_LUA] PARAM_WRITE Model Id=%u", modelId);
+  }
+}
+#endif
+
 SiW917RXEndpoint::SiW917RXEndpoint()
     : CRSFEndpoint(CRSF_ADDRESS_CRSF_RECEIVER) {
   initModelOptions();
@@ -161,6 +176,9 @@ bool SiW917RXEndpoint::handleRaw(const crsf_header_t *message) {
           payload[2]);
 #endif
     if (payload[0] == 'b' && payload[1] == 'd') {
+#if RX_EP_EVENT_LOG
+      DBGLN("[RX_LUA] RAW_BIND_COMMAND");
+#endif
       elrs_enter_binding_mode();
       return true;
     }
@@ -188,6 +206,9 @@ void SiW917RXEndpoint::handleMessage(const crsf_header_t *message) {
       payload[1] == CRSF_COMMAND_SUBCMD_RX_BIND) {
 #if RX_EP_DIAG
     DBGLN("[RX_EP] command bind");
+#endif
+#if RX_EP_EVENT_LOG
+    DBGLN("[RX_LUA] DIRECT_BIND_COMMAND");
 #endif
     elrs_enter_binding_mode();
     return;
@@ -225,6 +246,9 @@ void SiW917RXEndpoint::registerParameters() {
     if (cfg != nullptr) {
       cfg->serial_protocol =
           (uint8_t)clampU8((uint8_t)arg, ELRS_SERIAL_CRSF, ELRS_SERIAL_GPS);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Protocol", cfg->serial_protocol);
+#endif
       requestConfigSave(true);
     }
   });
@@ -235,6 +259,9 @@ void SiW917RXEndpoint::registerParameters() {
       cfg->failsafe_mode =
           (uint8_t)clampU8((uint8_t)arg, ELRS_FAILSAFE_NO_PULSES,
                            ELRS_FAILSAFE_LAST);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("SBUS failsafe", cfg->failsafe_mode);
+#endif
       requestConfigSave();
     }
   });
@@ -243,6 +270,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->mavlink_target_sys_id = clampU8((uint8_t)arg, 1, 255);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Target SysID", cfg->mavlink_target_sys_id);
+#endif
       requestConfigSave();
     }
   });
@@ -251,6 +281,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->mavlink_source_sys_id = clampU8((uint8_t)arg, 1, 255);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Source SysID", cfg->mavlink_source_sys_id);
+#endif
       requestConfigSave();
     }
   });
@@ -259,6 +292,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->force_tlm = arg != 0 ? 1 : 0;
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Force Tlm", cfg->force_tlm);
+#endif
       requestConfigSave();
     }
   });
@@ -272,6 +308,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->teamrace_channel = clampU8((uint8_t)arg, 0, 10);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Team Race Channel", cfg->teamrace_channel);
+#endif
       requestConfigSave();
     }
   }, luaTeamraceFolder.common.id);
@@ -280,6 +319,10 @@ void SiW917RXEndpoint::registerParameters() {
                       elrs_config_t *cfg = elrs_config_get();
                       if (cfg != nullptr) {
                         cfg->teamrace_position = clampU8((uint8_t)arg, 0, 7);
+#if RX_EP_EVENT_LOG
+                        logParameterWrite("Team Race Position",
+                                          cfg->teamrace_position);
+#endif
                         requestConfigSave();
                       }
                     },
@@ -289,6 +332,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->bind_storage = clampU8((uint8_t)arg, 0, 3);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Bind Storage", cfg->bind_storage);
+#endif
       requestConfigSave();
     }
   });
@@ -302,6 +348,9 @@ void SiW917RXEndpoint::registerParameters() {
     if (cfg != nullptr) {
       cfg->model_id = selectionToModelId((uint8_t)arg);
       siw917_rx_set_model_match_id(cfg->model_id);
+#if RX_EP_EVENT_LOG
+      logModelIdWrite(cfg->model_id);
+#endif
       requestConfigSave();
     }
   });
@@ -355,6 +404,10 @@ void SiW917RXEndpoint::requestConfigSave(bool applySerialAfterSave) {
   configSavePending = true;
   serialApplyPending = serialApplyPending || applySerialAfterSave;
   configSaveAtMs = millis() + 500U;
+#if RX_EP_EVENT_LOG
+  DBGLN("[RX_LUA] CONFIG_SAVE_QUEUED serialApply=%u",
+        serialApplyPending ? 1 : 0);
+#endif
 #if RX_EP_DIAG
   DBGLN("[RX_EP] defer config save serial=%u", serialApplyPending ? 1 : 0);
 #endif
@@ -374,6 +427,10 @@ void SiW917RXEndpoint::handleWiFiCommand(propertiesCommon *item, int32_t arg) {
     pendingActionAtMs = millis();
   }
 
+#if RX_EP_EVENT_LOG
+  DBGLN("[RX_LUA] WIFI_COMMAND arg=%ld step=%u pending=%u", (long)arg, step,
+        wifiPending ? 1 : 0);
+#endif
 #if RX_EP_DIAG
   DBGLN("[RX_EP] wifi cmd arg=%ld step=%u pending=%u", (long)arg, step,
         wifiPending ? 1 : 0);
@@ -387,6 +444,10 @@ void SiW917RXEndpoint::handleBindCommand(propertiesCommon *item, int32_t arg) {
     pendingActionAtMs = millis();
   }
 
+#if RX_EP_EVENT_LOG
+  DBGLN("[RX_LUA] BIND_COMMAND arg=%ld pending=%u", (long)arg,
+        bindPending ? 1 : 0);
+#endif
 #if RX_EP_DIAG
   DBGLN("[RX_EP] bind cmd arg=%ld pending=%u", (long)arg,
         bindPending ? 1 : 0);
@@ -404,7 +465,12 @@ void SiW917RXEndpoint::processPending(bool telemetryBusy) {
     configSavePending = false;
     const bool applySerial = serialApplyPending;
     serialApplyPending = false;
-    if (elrs_config_save() == 0 && applySerial) {
+    const int saveResult = elrs_config_save();
+#if RX_EP_EVENT_LOG
+    DBGLN("[RX_LUA] CONFIG_SAVE_DONE result=%d serialApply=%u", saveResult,
+          applySerial ? 1 : 0);
+#endif
+    if (saveResult == 0 && applySerial) {
       serialApplyRequested = true;
     }
   }
@@ -413,6 +479,9 @@ void SiW917RXEndpoint::processPending(bool telemetryBusy) {
       (uint32_t)(now - pendingActionAtMs) >= 200U && !telemetryBusy) {
     if (wifiPending) {
       wifiPending = false;
+#if RX_EP_EVENT_LOG
+      DBGLN("[RX_LUA] WIFI_COMMAND_EXECUTE");
+#endif
 #if RX_EP_DIAG
       DBGLN("[RX_EP] enter wifi mode");
 #endif
@@ -421,6 +490,9 @@ void SiW917RXEndpoint::processPending(bool telemetryBusy) {
 
     if (bindPending) {
       bindPending = false;
+#if RX_EP_EVENT_LOG
+      DBGLN("[RX_LUA] BIND_COMMAND_EXECUTE requires_tx_bind=1");
+#endif
 #if RX_EP_DIAG
       DBGLN("[RX_EP] enter bind mode");
 #endif
