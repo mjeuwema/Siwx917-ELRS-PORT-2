@@ -70,7 +70,7 @@ void elrs_enter_binding_mode(void);
 #define RFmodeCycleMultiplierSlow 10
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
-#define ELRS_DIAG_DISABLE_CRSF_SERIAL 1
+#define ELRS_DIAG_DISABLE_CRSF_SERIAL 0
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 1
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
 #define ELRS_DIAG_TX_TURNAROUND 1
@@ -118,6 +118,7 @@ bool connectionHasModelMatch = false;
 bool teamraceHasModelMatch = true; // Always true for basic RX
 static bool lastConnectionHadModelMatch = false;
 bool InBindingMode = false;
+static bool bindingModeRequest = false;
 bool InWiFiMode = false; // WiFi configuration mode
 uint8_t ExpressLRS_currTlmDenom = 1;
 
@@ -1340,6 +1341,7 @@ static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now);
 static void GotConnection(unsigned long now);
 static void LostConnection(bool resumeRx);
 static uint8_t minLqForChaos();
+static void enterBindingModeNow();
 static void updateBindingMode(unsigned long now);
 static void LinkStatsToOta(OTA_LinkStats_s *ls);
 static bool ICACHE_RAM_ATTR HandleSendDataDl();
@@ -2406,6 +2408,13 @@ static void cycleRfMode() {
 static void updateBindingMode(unsigned long now) {
   static uint32_t bindingRateChangeMs = 0;
 
+  if (bindingModeRequest) {
+    bindingModeRequest = false;
+    DBGLN("Binding mode request pending - entering safely");
+    enterBindingModeNow();
+    return;
+  }
+
   if (!InBindingMode || !ExpressLRS_currAirRate_Modparams) {
     return;
   }
@@ -2469,6 +2478,41 @@ static void onBindButtonEvent(bool long_press) {
       elrs_cpp_request_wifi_mode();
     }
   }
+}
+
+static void enterBindingModeNow() {
+  if (InBindingMode) {
+    return;
+  }
+
+  bindingModeRequest = false;
+
+  if ((connectionState != disconnected) || hwTimer::isRunning()) {
+    lastDisconnectReason = DISC_EXTERNAL;
+    LostConnection(false);
+  }
+
+  TelemetrySender.ResetState();
+  DataUlReceiver.ResetState();
+  dataUlReady = false;
+  alreadyTLMresp = false;
+  connectionHasModelMatch = false;
+  lastConnectionHadModelMatch = false;
+
+  OtaCrcInitializer = OTA_VERSION_ID;
+  OtaNonce = 0;
+  InBindingMode = true;
+  setConnectionState(disconnected);
+  RXtimerState = tim_disconnected;
+  scanIndex = getStartupOrBindingRateIndex();
+  ExpressLRS_nextAirRateIndex = scanIndex;
+  SetRFLinkRate(scanIndex, true);
+  Radio.RXnb();
+  LastValidPacket = millis();
+  LastSyncPacket = LastValidPacket;
+  RFmodeLastCycled = LastValidPacket;
+  status_led_set_mode(LED_MODE_BINDING);
+  DBGLN("Entering binding mode");
 }
 
 //=============================================================================
@@ -3224,32 +3268,14 @@ void elrs_enter_binding_mode(void) {
     return;
   }
 
-  if ((connectionState != disconnected) || hwTimer::isRunning()) {
-    lastDisconnectReason = DISC_EXTERNAL;
-    LostConnection(false);
+  if (connectionState == connected || connectionState == tentative ||
+      hwTimer::isRunning()) {
+    bindingModeRequest = true;
+    DBGLN("Binding mode requested");
+    return;
   }
 
-  TelemetrySender.ResetState();
-  DataUlReceiver.ResetState();
-  dataUlReady = false;
-  alreadyTLMresp = false;
-  connectionHasModelMatch = false;
-  lastConnectionHadModelMatch = false;
-
-  OtaCrcInitializer = OTA_VERSION_ID;
-  OtaNonce = 0;
-  InBindingMode = true;
-  setConnectionState(disconnected);
-  RXtimerState = tim_disconnected;
-  scanIndex = getStartupOrBindingRateIndex();
-  ExpressLRS_nextAirRateIndex = scanIndex;
-  SetRFLinkRate(scanIndex, true);
-  Radio.RXnb();
-  LastValidPacket = millis();
-  LastSyncPacket = LastValidPacket;
-  RFmodeLastCycled = LastValidPacket;
-  status_led_set_mode(LED_MODE_BINDING);
-  DBGLN("Entering binding mode");
+  enterBindingModeNow();
 }
 
 void elrs_exit_binding_mode(void) {
@@ -3257,6 +3283,7 @@ void elrs_exit_binding_mode(void) {
     return;
   }
 
+  bindingModeRequest = false;
   TelemetrySender.ResetState();
   DataUlReceiver.ResetState();
   dataUlReady = false;
