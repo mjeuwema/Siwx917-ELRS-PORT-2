@@ -26,6 +26,7 @@ set(ELRS_PLATFORM_SOURCES
     "../src/elrs_cpp/hal/SPIEx.cpp"
     "../src/elrs_cpp/hal/hwTimer.cpp"
     "../src/elrs_cpp/hal/LR1121_hal.cpp"
+    "../src/elrs_cpp/hal/elrs_task_wakeup.cpp"
     "../src/elrs_cpp/elrs_main.cpp"
     "../src/elrs_cpp/common.cpp"
     # CT-based hardware timer (C implementation wrapped by hwTimer.cpp)

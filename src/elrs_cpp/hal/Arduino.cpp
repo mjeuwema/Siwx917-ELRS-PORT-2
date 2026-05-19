@@ -6,6 +6,7 @@
  */
 
 #include "targets.h"
+#include "siw917_elrs_timing.h"
 
 // Suppress missing-field-initializers warnings from SDK headers
 #pragma GCC diagnostic push
@@ -78,11 +79,109 @@ static uint32_t micros_systick_fallback(void) {
     return (tick_before * 1000U) + sub_ms_us;
 }
 
+#if SIW917_ELRS_DWT_MICROS
+extern uint32_t SystemCoreClock;
+
+static bool micros_dwt_ready = false;
+static bool micros_dwt_unavailable = false;
+static uint32_t micros_dwt_cycles_per_us = 0;
+static uint32_t micros_dwt_last_cycles = 0;
+static uint64_t micros_dwt_accum_us = 0;
+static uint32_t micros_dwt_remainder_cycles = 0;
+
+static inline uint32_t micros_enter_critical(void) {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+static inline void micros_exit_critical(uint32_t primask) {
+    if ((primask & 1U) == 0U) {
+        __enable_irq();
+    }
+}
+
+static bool micros_dwt_init_locked(void) {
+    if (micros_dwt_ready) {
+        return true;
+    }
+    if (micros_dwt_unavailable) {
+        return false;
+    }
+
+    const uint32_t cycles_per_us = SystemCoreClock / 1000000U;
+    if (cycles_per_us == 0U) {
+        micros_dwt_unavailable = true;
+        return false;
+    }
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    __DSB();
+    __ISB();
+
+    const uint32_t before = DWT->CYCCNT;
+    for (volatile uint32_t spin = 0; spin < 64U; ++spin) {
+        __NOP();
+    }
+    const uint32_t after = DWT->CYCCNT;
+    if (after == before) {
+        micros_dwt_unavailable = true;
+        return false;
+    }
+
+    micros_dwt_cycles_per_us = cycles_per_us;
+    micros_dwt_last_cycles = after;
+    micros_dwt_accum_us = micros_systick_fallback();
+    micros_dwt_remainder_cycles = 0U;
+    micros_dwt_ready = true;
+    return true;
+}
+
+static uint32_t micros_dwt_extended(void) {
+    uint32_t primask = micros_enter_critical();
+    if (!micros_dwt_init_locked()) {
+        micros_exit_critical(primask);
+        return micros_systick_fallback();
+    }
+
+    const uint32_t now_cycles = DWT->CYCCNT;
+    const uint32_t delta_cycles = now_cycles - micros_dwt_last_cycles;
+    micros_dwt_last_cycles = now_cycles;
+
+    uint32_t elapsed_us;
+    uint32_t remainder_cycles;
+    const uint32_t cycles = delta_cycles + micros_dwt_remainder_cycles;
+    if (cycles < delta_cycles) {
+        const uint64_t wide_cycles =
+            (uint64_t)delta_cycles + micros_dwt_remainder_cycles;
+        elapsed_us = (uint32_t)(wide_cycles / micros_dwt_cycles_per_us);
+        remainder_cycles = (uint32_t)(wide_cycles % micros_dwt_cycles_per_us);
+    } else {
+        elapsed_us = cycles / micros_dwt_cycles_per_us;
+        remainder_cycles = cycles - (elapsed_us * micros_dwt_cycles_per_us);
+    }
+
+    micros_dwt_accum_us += elapsed_us;
+    micros_dwt_remainder_cycles = remainder_cycles;
+    const uint32_t result = (uint32_t)micros_dwt_accum_us;
+
+    micros_exit_critical(primask);
+    return result;
+}
+
+bool micros_uses_dwt(void) {
+    return micros_dwt_ready && !micros_dwt_unavailable;
+}
+#endif
+
 uint32_t micros(void) {
-    // Do not use raw 32-bit DWT->CYCCNT here: at 180 MHz it wraps every
-    // ~23.9 seconds. Arduino/ESP32 micros() wraps on the microsecond counter,
-    // and ELRS PFD math relies on that wider time base.
+#if SIW917_ELRS_DWT_MICROS
+    return micros_dwt_extended();
+#else
     return micros_systick_fallback();
+#endif
 }
 
 void delay(uint32_t ms) {

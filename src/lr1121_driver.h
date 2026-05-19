@@ -386,6 +386,14 @@ void lr1121_gpio_toggle_test(uint32_t cycles);
 bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
 
 /**
+ * @brief Hot-path BUSY wait with no coarse delay.
+ *
+ * This is intended for ELRS timing-critical commands that should fail fast
+ * instead of sleeping in 100 us chunks once the RF link is running.
+ */
+bool lr1121_wait_busy_fast(uint32_t max_iterations);
+
+/**
  * @brief Send a command to the LR1121 (Phase 1 of SPI protocol)
  *
  * Citation: LR1121 User Manual - SPI Communication
@@ -398,6 +406,24 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
  */
 bool lr1121_send_command(uint16_t opcode, const uint8_t *params,
                          uint16_t param_len);
+
+/**
+ * @brief Send a command while synchronously pumping the GSPI ISR.
+ *
+ * This is intended for ELRS RF hot-path commands where waiting for a normal
+ * GSPI interrupt completion adds jitter.
+ */
+bool lr1121_send_command_polled_pub(uint16_t opcode, const uint8_t *params,
+                                    uint16_t param_len);
+
+/**
+ * @brief Send a command through the direct register GSPI path.
+ *
+ * This bypasses the Silicon Labs GSPI transfer state machine for narrow ELRS
+ * hot-path commands where IRQ/callback overhead can consume the timing budget.
+ */
+bool lr1121_send_command_raw_pub(uint16_t opcode, const uint8_t *params,
+                                 uint16_t param_len);
 
 /**
  * @brief Read response from LR1121 (Phase 2 of SPI protocol)
@@ -564,6 +590,14 @@ bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
  */
 bool lr1121_spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
                                 uint16_t length);
+
+/**
+ * @brief Raw full-duplex SPI transfer using direct GSPI register pumping.
+ *
+ * Caller must handle CS assertion/deassertion.
+ */
+bool lr1121_spi_transfer_raw(const uint8_t *tx_data, uint8_t *rx_data,
+                             uint16_t length);
 
 /*******************************************************************************
  * Firmware Version Structure (for OTA updates)

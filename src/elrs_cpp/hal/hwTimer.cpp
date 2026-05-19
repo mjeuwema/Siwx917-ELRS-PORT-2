@@ -16,11 +16,16 @@
  */
 
 #include "hwTimer.h"
+#include "elrs_task_wakeup.h"
 #include "logging.h"
+#include "siw917_elrs_timing.h"
 
 // Include our C timer implementation
 extern "C" {
 #include "hw_timer.h"
+#if SIW917_ELRS_DWT_MICROS
+bool micros_uses_dwt(void);
+#endif
 }
 
 // Static member definitions
@@ -35,6 +40,7 @@ volatile int32_t hwTimer::PhaseShift = 0;
 volatile int32_t hwTimer::FreqOffset = 0;
 
 static volatile bool immediateTockPending = false;
+static volatile uint32_t immediateTockMicros = 0;
 static volatile uint32_t activeEventMicros = 0;
 
 enum TimerEventType : uint8_t {
@@ -58,8 +64,31 @@ static volatile uint32_t processedTickCount = 0;
 static volatile uint32_t processedTockCount = 0;
 static volatile uint32_t immediateTockDeliveredCount = 0;
 
+static void processTimerEvent(uint8_t type, uint32_t timestampUs) {
+  activeEventMicros = timestampUs;
+
+  if (type == TIMER_EVENT_TICK) {
+    hwTimer::isTick = true;
+    processedTickCount++;
+    if (hwTimer::callbackTick) {
+      hwTimer::callbackTick();
+    }
+    hwTimer::isTick = false;
+  } else if (type == TIMER_EVENT_TOCK) {
+    hwTimer::isTick = false;
+    processedTockCount++;
+    if (hwTimer::callbackTock) {
+      hwTimer::callbackTock();
+    }
+    hwTimer::isTick = true;
+  }
+
+  activeEventMicros = 0;
+}
+
 static void resetTimerEventQueue() {
   immediateTockPending = false;
+  immediateTockMicros = 0;
   timerEventHead = 0;
   timerEventTail = 0;
 }
@@ -73,7 +102,8 @@ static void resetTimerEventStats() {
   immediateTockDeliveredCount = 0;
 }
 
-static void enqueueTimerEvent(uint8_t type) {
+static void __attribute__((unused))
+enqueueTimerEvent(uint8_t type, uint32_t timestampUs) {
   const uint16_t head = timerEventHead;
   const uint16_t nextHead =
       (uint16_t)((head + 1U) % TIMER_EVENT_QUEUE_SIZE);
@@ -86,7 +116,7 @@ static void enqueueTimerEvent(uint8_t type) {
   }
 
   timerEventQueue[head].type = type;
-  timerEventQueue[head].timestampUs = micros();
+  timerEventQueue[head].timestampUs = timestampUs;
   timerEventHead = nextHead;
 
   if (type == TIMER_EVENT_TICK) {
@@ -94,6 +124,8 @@ static void enqueueTimerEvent(uint8_t type) {
   } else if (type == TIMER_EVENT_TOCK) {
     queuedTockCount++;
   }
+
+  elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_TIMER);
 }
 
 static bool dequeueTimerEvent(TimerEvent *event) {
@@ -107,22 +139,39 @@ static bool dequeueTimerEvent(TimerEvent *event) {
   return true;
 }
 
+bool hwTimer::hasPendingEvent() {
+  return running && (immediateTockPending || timerEventTail != timerEventHead);
+}
+
+extern "C" bool elrs_hw_timer_has_pending_event(void) {
+  return hwTimer::hasPendingEvent();
+}
+
 //-----------------------------------------------------------------------------
 // Internal C callback bridge
 //-----------------------------------------------------------------------------
 
-// These functions are called by hw_timer.c ISR. Queue the work so ELRS core
-// callbacks can do LR1121 SPI from task context instead of timer interrupt
-// context; the queued timestamp preserves PFD timing.
+// These functions are called by hw_timer.c ISR. In timing mode, run the ELRS
+// Tick/Tock callbacks directly from CT so RF hop/telemetry scheduling is not
+// delayed by the FreeRTOS task wakeup path. The queued fallback is kept for
+// bring-up and for quickly backing out if a platform command is not ISR-safe.
 static void hwTimerTickBridge(void) {
   if (hwTimer::running) {
-    enqueueTimerEvent(TIMER_EVENT_TICK);
+#if SIW917_ELRS_DIRECT_TIMER_CALLBACKS || SIW917_ELRS_DIRECT_TIMER_TICK
+    processTimerEvent(TIMER_EVENT_TICK, hw_timer_get_last_edge_micros());
+#else
+    enqueueTimerEvent(TIMER_EVENT_TICK, hw_timer_get_last_edge_micros());
+#endif
   }
 }
 
 static void hwTimerTockBridge(void) {
   if (hwTimer::running) {
-    enqueueTimerEvent(TIMER_EVENT_TOCK);
+#if SIW917_ELRS_DIRECT_TIMER_CALLBACKS
+    processTimerEvent(TIMER_EVENT_TOCK, hw_timer_get_last_edge_micros());
+#else
+    enqueueTimerEvent(TIMER_EVENT_TOCK, hw_timer_get_last_edge_micros());
+#endif
   }
 }
 
@@ -162,6 +211,20 @@ void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
   printf("hwTimer::init - setting callbacks...\n");
   hw_timer_set_tick_callback(hwTimerTickBridge);
   hw_timer_set_tock_callback(hwTimerTockBridge);
+#if SIW917_ELRS_DIRECT_TIMER_CALLBACKS
+  const char *timerCallbackPath = "direct-isr";
+#elif SIW917_ELRS_DIRECT_TIMER_TICK
+  const char *timerCallbackPath = "tick-direct/tock-queued";
+#else
+  const char *timerCallbackPath = "queued-task";
+#endif
+  printf("hwTimer::init - timer callback path: %s\n", timerCallbackPath);
+
+#if SIW917_ELRS_DWT_MICROS
+  (void)micros();
+  printf("hwTimer::init - micros source: %s\n",
+         micros_uses_dwt() ? "DWT CYCCNT" : "SysTick fallback");
+#endif
 
   printf("hwTimer::init COMPLETE OK\n");
   DBGLN("hwTimer initialized (CT-based)");
@@ -189,6 +252,9 @@ void hwTimer::resume() {
   resetTimerEventQueue();
   resetTimerEventStats();
 
+  const uint32_t resumeMicros = micros();
+  hw_timer_set_event_epoch(resumeMicros);
+
   sl_status_t status = hw_timer_start();
   if (status != SL_STATUS_OK) {
     running = false;
@@ -199,6 +265,7 @@ void hwTimer::resume() {
   running = true;
   isTick = false;
   hw_timer_note_immediate_tock();
+  immediateTockMicros = resumeMicros;
   immediateTockPending = true;
 
   DBGLN("hwTimer resumed, interval=%lu us", HWtimerInterval);
@@ -211,38 +278,16 @@ void hwTimer::service() {
 
   if (immediateTockPending) {
     immediateTockPending = false;
-    isTick = false;
-    activeEventMicros = micros();
+    const uint32_t eventMicros =
+        immediateTockMicros != 0 ? immediateTockMicros : micros();
+    immediateTockMicros = 0;
     immediateTockDeliveredCount++;
-    processedTockCount++;
-
-    if (callbackTock) {
-      callbackTock();
-    }
-
-    activeEventMicros = 0;
-    isTick = true;
+    processTimerEvent(TIMER_EVENT_TOCK, eventMicros);
   }
 
   TimerEvent event;
   while (running && dequeueTimerEvent(&event)) {
-    activeEventMicros = event.timestampUs;
-    if (event.type == TIMER_EVENT_TICK) {
-      isTick = true;
-      processedTickCount++;
-      if (callbackTick) {
-        callbackTick();
-      }
-      isTick = false;
-    } else if (event.type == TIMER_EVENT_TOCK) {
-      isTick = false;
-      processedTockCount++;
-      if (callbackTock) {
-        callbackTock();
-      }
-      isTick = true;
-    }
-    activeEventMicros = 0;
+    processTimerEvent(event.type, event.timestampUs);
   }
 }
 

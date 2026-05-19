@@ -191,6 +191,7 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
   fallBackMode = LR1121_MODE_FS;
   hal.WriteCommand(LR11XX_RADIO_SET_RX_TX_FALLBACK_MODE_OC, FBbuf,
                    sizeof(FBbuf), SX12XX_Radio_All);
+  DBGLN("SetRxTxFallbackMode: FS");
 
   // 7.2.12 SetRxBoosted
   uint8_t abuf[1] = {1};
@@ -886,11 +887,7 @@ bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
 }
 
 void ICACHE_RAM_ATTR LR1121Driver::RXnb() {
-  // HOT PATH - No debug output or extra SPI commands here!
-  // This is called from ISR context and must be fast.
-  // Citation: LR1121 User Manual Section 7.2.2 SetRx
-  // "The command SetRx can be issued only in STDBY_RC or STDBY_XOSC modes"
-  SetMode(LR1121_MODE_STDBY_XOSC, SX12XX_Radio_All);
+  // Match upstream ELRS: TX_DONE returns via fallback mode, then SetRx only.
   SetMode(LR1121_MODE_RX_CONT, SX12XX_Radio_All);
 }
 

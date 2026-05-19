@@ -290,6 +290,20 @@ bool hw_timer_is_running(void);
 uint32_t hw_timer_get_micros(void);
 
 /**
+ * @brief Seed the scheduled timer-edge timestamp.
+ *
+ * The CT ISR advances this timestamp by the programmed half interval at each
+ * edge, so queued ELRS events can use hardware-scheduled time without calling
+ * micros() from the interrupt path.
+ */
+void hw_timer_set_event_epoch(uint32_t epoch_us);
+
+/**
+ * @brief Return the scheduled timestamp for the most recent CT edge.
+ */
+uint32_t hw_timer_get_last_edge_micros(void);
+
+/**
  * @brief Diagnostics: number of hardware half-interval interrupts processed.
  */
 uint32_t hw_timer_get_total_half_ticks(void);

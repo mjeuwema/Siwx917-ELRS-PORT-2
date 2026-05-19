@@ -54,9 +54,18 @@ void StubbornSender::SetDataToTransmit(uint8_t* dataToTransmit, uint8_t lengthTo
  **/
 uint8_t StubbornSender::GetCurrentPayload(uint8_t *outData, uint8_t maxLen)
 {
-    uint8_t packageIndex;
+    StubbornSenderPreparedPayload prepared = {};
+    uint8_t packageIndex = PrepareCurrentPayload(outData, maxLen, &prepared);
+    (void)CommitPreparedPayload(prepared);
+    return packageIndex;
+}
 
-    bytesLastPayload = 0;
+uint8_t StubbornSender::PrepareCurrentPayload(uint8_t *outData, uint8_t maxLen, StubbornSenderPreparedPayload *prepared) const
+{
+    uint8_t packageIndex = 0;
+    uint8_t preparedBytesLastPayload = 0;
+    stubborn_sender_state_e committedState = senderState;
+
     switch (senderState)
     {
     case RESYNC:
@@ -65,26 +74,54 @@ uint8_t StubbornSender::GetCurrentPayload(uint8_t *outData, uint8_t maxLen)
         break;
     case SEND_PENDING:
         // This package can now be acked
-        senderState = SENDING;
+        committedState = SENDING;
         // fallthrough
     case SENDING:
         {
-            bytesLastPayload = std::min((uint8_t)(length - currentOffset), maxLen);
+            preparedBytesLastPayload = std::min((uint8_t)(length - currentOffset), maxLen);
             // If this is the last data chunk, and there has been at least one other packet
             // skip the blank packet needed for WAIT_UNTIL_NEXT_CONFIRM
-            if (currentPackage > 1 && (currentOffset + bytesLastPayload) >= length)
+            if (currentPackage > 1 && (currentOffset + preparedBytesLastPayload) >= length)
                 packageIndex = 0;
             else
                 packageIndex = currentPackage;
 
-            memcpy(outData, &data[currentOffset], bytesLastPayload);
+            memcpy(outData, &data[currentOffset], preparedBytesLastPayload);
         }
         break;
     default:
         packageIndex = 0;
     }
 
+    if (prepared != nullptr)
+    {
+        prepared->sourceData = data;
+        prepared->sourceLength = length;
+        prepared->sourceOffset = currentOffset;
+        prepared->sourcePackage = currentPackage;
+        prepared->sourceState = senderState;
+        prepared->committedState = committedState;
+        prepared->packageIndex = packageIndex;
+        prepared->bytesLastPayload = preparedBytesLastPayload;
+    }
+
     return packageIndex;
+}
+
+bool StubbornSender::CommitPreparedPayload(const StubbornSenderPreparedPayload &prepared)
+{
+    if (prepared.sourceData != data ||
+        prepared.sourceLength != length ||
+        prepared.sourceOffset != currentOffset ||
+        prepared.sourcePackage != currentPackage ||
+        prepared.sourceState != senderState)
+    {
+        return false;
+    }
+
+    bytesLastPayload = prepared.bytesLastPayload;
+    senderState = prepared.committedState;
+    return true;
 }
 
 void StubbornSender::ConfirmCurrentPayload(bool telemetryConfirmValue)

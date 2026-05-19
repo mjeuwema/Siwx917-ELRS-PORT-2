@@ -14,6 +14,18 @@ typedef enum {
     RESYNC_THEN_SEND, // perform a RESYNC then go to SENDING
 } stubborn_sender_state_e;
 
+struct StubbornSenderPreparedPayload
+{
+    const uint8_t *sourceData;
+    uint8_t sourceLength;
+    uint8_t sourceOffset;
+    uint8_t sourcePackage;
+    uint8_t packageIndex;
+    uint8_t bytesLastPayload;
+    stubborn_sender_state_e sourceState;
+    stubborn_sender_state_e committedState;
+};
+
 class StubbornSender
 {
 public:
@@ -23,6 +35,8 @@ public:
     void UpdateTelemetryRate(uint16_t airRate, uint8_t tlmRatio, uint8_t tlmBurst);
     void SetDataToTransmit(uint8_t* dataToTransmit, uint8_t lengthToTransmit);
     uint8_t GetCurrentPayload(uint8_t *outData, uint8_t maxLen);
+    uint8_t PrepareCurrentPayload(uint8_t *outData, uint8_t maxLen, StubbornSenderPreparedPayload *prepared) const;
+    bool CommitPreparedPayload(const StubbornSenderPreparedPayload &prepared);
     void ConfirmCurrentPayload(bool telemetryConfirmValue);
     bool IsActive() const { return senderState != SENDER_IDLE; }
     uint16_t GetMaxPacketsBeforeResync() const { return maxWaitCount; }

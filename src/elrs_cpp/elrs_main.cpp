@@ -35,6 +35,7 @@
 #include "stubborn_sender.h"
 #include "telemetry_protocol.h"
 #include "msptypes.h"
+#include "siw917_elrs_timing.h"
 
 // Standard includes
 #include <new>
@@ -52,6 +53,9 @@ void elrs_cpp_request_wifi_mode(void);
 int lr1121_dio1_read(void);
 uint32_t lr1121_hal_get_last_dio1_edge_us(void);
 uint32_t lr1121_hal_get_last_deferred_us(void);
+uint32_t lr1121_hal_get_direct_dio_count(void);
+uint32_t lr1121_hal_get_direct_reentrant_count(void);
+uint32_t lr1121_hal_get_level_requeue_count(void);
 uint32_t lr1121_get_last_rxnbisr_entry_us(void);
 uint32_t lr1121_get_last_packet_ready_us(void);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
@@ -71,12 +75,16 @@ void elrs_enter_binding_mode(void);
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL 0
-#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 1
+#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
-#define ELRS_DIAG_TX_TURNAROUND 1
+#define ELRS_DIAG_TX_TURNAROUND 0
+#define ELRS_DIAG_TLM_RATE_LOG 0
+#define ELRS_DIAG_TLM_STALE_RX 0
+#define ELRS_DIAG_TLM150_SNAPSHOT 0
+#define ELRS_DIAG_RATE_CHANGE_LOG 0
 #define ELRS_DIAG_PERIODIC_STATS 0
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
-#define ELRS_DIAG_PRINT_AFTER_LOSS 1
+#define ELRS_DIAG_PRINT_AFTER_LOSS 0
 #define ELRS_DIAG_RX_LUA_UL 0
 #define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
@@ -217,6 +225,28 @@ static volatile uint32_t telemetryTxCount = 0;
 static volatile uint32_t telemetrySuppressedCount = 0;
 static volatile uint32_t telemetryDataUlAckCount = 0;
 static volatile bool telemetryLastDataUlAck = false;
+static volatile uint32_t dataUlChunkCount = 0;
+static volatile uint32_t dataUlCompleteCount = 0;
+static volatile uint32_t dataUlHandledCount = 0;
+static volatile uint32_t dataUlMalformedCount = 0;
+static volatile uint32_t dataUlLastChunkMs = 0;
+static volatile uint32_t dataUlLastCompleteMs = 0;
+static volatile uint8_t dataUlLastPackageIndex = 0;
+static volatile uint8_t dataUlLastPayload0 = 0;
+static volatile uint8_t dataUlLastPayload1 = 0;
+static volatile uint8_t dataUlLastFrameType = 0;
+static volatile uint8_t dataUlLastFrameLen = 0;
+#if SIW917_ELRS_PREBUILD_TLM_PACKET
+static WORD_ALIGNED_ATTR OTA_Packet_s prebuiltTelemetryPacket = {};
+static StubbornSenderPreparedPayload prebuiltTelemetryPayload = {};
+static bool prebuiltTelemetryValid = false;
+static uint8_t prebuiltTelemetryNonce = 0;
+static uint8_t prebuiltNextTelemetryType = PACKET_TYPE_LINKSTATS;
+static uint8_t prebuiltTelemetryBurstCount = 0;
+static volatile uint32_t telemetryPrebuildCount = 0;
+static volatile uint32_t telemetryPrebuildHitCount = 0;
+static volatile uint32_t telemetryPrebuildMissCount = 0;
+#endif
 #if ELRS_DIAG_TX_TURNAROUND
 static volatile uint32_t telemetryTxStartUs = 0;
 static volatile uint32_t telemetryTxDoneUs = 0;
@@ -229,16 +259,32 @@ static volatile uint32_t telemetryMissedAfterTx = 0;
 static volatile uint32_t telemetryTxBeforeRx = 0;
 static volatile uint32_t telemetryRxAfterTx = 0;
 static volatile uint8_t telemetryAwaitingRx = 0;
+static volatile uint8_t telemetryStaleRxReported = 0;
+static volatile uint32_t telemetryStaleRxReportCount = 0;
+static volatile uint32_t telemetryStaleRxLastAgeUs = 0;
+static volatile uint32_t telemetryLqSetWhileAwaitingCount = 0;
 static volatile uint8_t telemetryTxNonce = 0;
 static volatile uint8_t telemetryTxFhss = 0;
 static volatile uint8_t telemetryRxNonce = 0;
 static volatile uint8_t telemetryRxFhss = 0;
+#if ELRS_DIAG_TLM150_SNAPSHOT
+static bool telemetry150DiagNeedArm = false;
+static bool telemetry150DiagArmed = false;
+static bool telemetry150DiagPrinted = false;
+static uint32_t telemetry150DiagArmMs = 0;
+static uint32_t telemetry150DiagArmTxCount = 0;
+static uint32_t telemetry150DiagArmRxAfterTx = 0;
+static uint32_t telemetry150DiagArmTxBeforeRx = 0;
+static uint32_t telemetry150DiagArmDataUlAck = 0;
+#endif
 #endif
 static volatile bool dataUlReady = false;
 static volatile bool uidSavePending = false;
 static volatile bool uidRefreshPending = false;
 static volatile bool bindCompletePending = false;
 static uint8_t pendingUid[UID_LEN] = {0};
+
+static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry();
 
 #if ELRS_DIAG_LUA_DISCOVERY
 static bool luaDiscoveryActive = false;
@@ -715,6 +761,7 @@ static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
   rxLuaQueueHead = (uint8_t)((rxLuaQueueHead + 1) % RX_LUA_QUEUE_DEPTH);
   rxLuaQueueCount--;
   TelemetrySender.SetDataToTransmit(TelemetryBuffer, len);
+  InvalidatePrebuiltTelemetry();
 }
 
 static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
@@ -1337,6 +1384,10 @@ static void ICACHE_RAM_ATTR HWtimerCallbackTick();
 static void ICACHE_RAM_ATTR HWtimerCallbackTock();
 static void ICACHE_RAM_ATTR HandleFHSS();
 static void ICACHE_RAM_ATTR updatePhaseLock();
+static void waitForRecentTockBeforeTimerStop();
+static void armTelemetry150Snapshot(const expresslrs_mod_settings_s *params,
+                                    bool bindMode);
+static void maybePrintTelemetry150Snapshot(unsigned long now);
 static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now);
 static void GotConnection(unsigned long now);
 static void LostConnection(bool resumeRx);
@@ -1345,6 +1396,8 @@ static void enterBindingModeNow();
 static void updateBindingMode(unsigned long now);
 static void LinkStatsToOta(OTA_LinkStats_s *ls);
 static bool ICACHE_RAM_ATTR HandleSendDataDl();
+static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry();
+static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock();
 static void updateTelemetryBurst();
 static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode);
 static void updateSwitchMode();
@@ -1352,51 +1405,7 @@ static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4);
 static void ICACHE_RAM_ATTR ProcessRfPacket_DataUl(
     OTA_Packet_s const *const otaPktPtr);
 static void DataUlReceiveComplete();
-
-static int32_t normalizePfdOffsetToInterval(int32_t offset) {
-  if (ExpressLRS_currAirRate_Modparams == nullptr ||
-      ExpressLRS_currAirRate_Modparams->interval == 0) {
-    return offset;
-  }
-
-  const int32_t interval =
-      (int32_t)ExpressLRS_currAirRate_Modparams->interval;
-  const int32_t halfInterval = interval / 2;
-
-  // SiW917 defers both radio and timer work into task context. If a packet
-  // callback and timer TOCK cross in the queue, the PFD sample can land one RF
-  // period away. Normalize to the nearest equivalent phase before the LPF so
-  // the correction loop does not integrate toward a false +/-20 ms error.
-  while (offset > halfInterval) {
-    offset -= interval;
-  }
-  while (offset < -halfInterval) {
-    offset += interval;
-  }
-  return offset;
-}
-
-static void updateFreqOffsetFromPfd(int32_t offset) {
-  if (RXtimerState != tim_locked || (OtaNonce % 8) != 0) {
-    return;
-  }
-
-  // Match upstream ELRS: once timer lock is established, adjust frequency from
-  // the filtered phase offset sign at a limited rate.
-  if (offset > 0) {
-    hwTimer::incFreqOffset();
-  } else if (offset < 0) {
-    hwTimer::decFreqOffset();
-  }
-}
-
-static int32_t phaseShiftFromPfd(int32_t rawOffset, int32_t offset) {
-  if (connectionState != connected) {
-    return rawOffset >> 1;
-  }
-
-  return offset >> 2;
-}
+static void maybeReportStaleTelemetryRx();
 
 //=============================================================================
 // Channel data initialization
@@ -1558,20 +1567,28 @@ static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
 static void ICACHE_RAM_ATTR updatePhaseLock() {
   if (connectionState != disconnected && PFDloop.hasResult()) {
     int32_t rawOffset = PFDloop.calcResult();
-    int32_t normalizedOffset = normalizePfdOffsetToInterval(rawOffset);
-    int32_t offset = LPF_Offset.update(normalizedOffset);
+    int32_t offset = LPF_Offset.update(rawOffset);
     int32_t offsetDx =
-        LPF_OffsetDx.update(normalizedOffset - PfdPrevRawOffset);
-    PfdPrevRawOffset = normalizedOffset;
+        LPF_OffsetDx.update(rawOffset - PfdPrevRawOffset);
+    PfdPrevRawOffset = rawOffset;
     pfdLastRawOffset = rawOffset;
-    pfdLastNormalizedOffset = normalizedOffset;
+    pfdLastNormalizedOffset = rawOffset;
     pfdLastOffset = offset;
     pfdLastOffsetDx = offsetDx;
     pfdResultCount++;
 
-    updateFreqOffsetFromPfd(offset);
+    if (RXtimerState == tim_locked) {
+      if ((OtaNonce % 8) == 0) {
+        if (offset > 0) {
+          hwTimer::incFreqOffset();
+        } else if (offset < 0) {
+          hwTimer::decFreqOffset();
+        }
+      }
+    }
 
-    int32_t phaseShift = phaseShiftFromPfd(rawOffset, offset);
+    int32_t phaseShift =
+        connectionState != connected ? (rawOffset >> 1) : (offset >> 2);
     pfdLastPhaseShift = phaseShift;
     hwTimer::phaseShift(phaseShift);
 
@@ -1595,9 +1612,10 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
-  // Match upstream RX core: platform-specific fused retune/RX handling belongs
-  // behind the LR1121 HAL boundary.
-  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
+  // In direct timer mode this runs from CT IRQ context, so keep FHSS on the
+  // synchronous LR1121 hot path instead of the SDK-backed SetRfFrequency path.
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
+                        SIW917_ELRS_DIRECT_TIMER_CALLBACKS);
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
@@ -1623,6 +1641,21 @@ static void ICACHE_RAM_ATTR HWtimerCallbackTock() {
     telemetryTxCount++;
   }
   updatePhaseLock();
+}
+
+static void waitForRecentTockBeforeTimerStop() {
+  const uint32_t interval =
+      ExpressLRS_currAirRate_Modparams ? ExpressLRS_currAirRate_Modparams->interval
+                                       : 20000U;
+  const uint32_t start = micros();
+  const uint32_t deadline = start + interval + 1000U;
+
+  while ((uint32_t)(micros() - PFDloop.getIntEventTime()) > 250U) {
+    hwTimer::service();
+    if ((int32_t)(deadline - micros()) <= 0) {
+      break;
+    }
+  }
 }
 
 static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
@@ -1656,12 +1689,15 @@ static void LostConnection(bool resumeRx) {
   }
 
   DBGLN("LostConnection reason=%u age=%lu pfd raw=%ld norm=%ld off=%ld dx=%ld phase=%ld "
-        "fo=%ld nonce=%u fhss=%u",
+        "fo=%ld nonce=%u fhss=%u dio:%lu/%lu/%lu",
         (unsigned)lastDisconnectReason,
         (unsigned long)(millis() - LastValidPacket),
         (long)pfdLastRawOffset, (long)pfdLastNormalizedOffset,
         (long)pfdLastOffset, (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
-        (long)hwTimer::FreqOffset, OtaNonce, FHSSgetCurrIndex());
+        (long)hwTimer::FreqOffset, OtaNonce, FHSSgetCurrIndex(),
+        (unsigned long)lr1121_hal_get_direct_dio_count(),
+        (unsigned long)lr1121_hal_get_direct_reentrant_count(),
+        (unsigned long)lr1121_hal_get_level_requeue_count());
 
 #if ELRS_DIAG_PRINT_AFTER_LOSS
   if (!InBindingMode && !InWiFiMode && lastDisconnectReason != DISC_RATE_CHANGE) {
@@ -1686,11 +1722,15 @@ static void LostConnection(bool resumeRx) {
   SwitchModePending = 0;
   dataUlReady = false;
   DataUlReceiver.ResetState();
+  InvalidatePrebuiltTelemetry();
 
   hwTimer::resetFreqOffset();
 
   if (!InBindingMode) {
     if (hwTimer::isRunning()) {
+      if (lastDisconnectReason == DISC_RATE_CHANGE) {
+        waitForRecentTockBeforeTimerStop();
+      }
       hwTimer::stop();
     }
     SetRFLinkRate(ExpressLRS_nextAirRateIndex, false);
@@ -1760,9 +1800,38 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
                                (uint8_t)TLM_RATIO_NO_TLM);
   uint8_t TlmDenom = TLMratioEnumToValue(TLMrateIn);
   if (ExpressLRS_currTlmDenom != TlmDenom) {
-    DBGLN("New TLMrate 1:%u", TlmDenom);
+#if ELRS_DIAG_TLM_RATE_LOG
+    const uint8_t previousTlmDenom = ExpressLRS_currTlmDenom;
+    const uint8_t syncFlags = ((const uint8_t *)otaSync)[3];
+    DBGLN("New TLMrate 1:%u (sync=%u rate=%u)", TlmDenom,
+          otaSync->newTlmRatio, ExpressLRS_nextAirRateIndex);
+    if (TlmDenom == 2 || previousTlmDenom == 2) {
+      const uint32_t nowMs = millis();
+      const uint32_t chunkAge =
+          dataUlLastChunkMs != 0 ? nowMs - dataUlLastChunkMs : 0xFFFFFFFFU;
+      const uint32_t completeAge =
+          dataUlLastCompleteMs != 0 ? nowMs - dataUlLastCompleteMs
+                                    : 0xFFFFFFFFU;
+      DBGLN("TLM_BOOST_TRACE prev:%u next:%u raw:0x%02X ul:%lu/%lu/%lu/%lu "
+            "last:%u/%02X/%02X frame:%02X/%u age:%lu/%lu q:%u tx:%lu active:%u st:%u wait:%u/%u",
+            previousTlmDenom, TlmDenom, syncFlags,
+            (unsigned long)dataUlChunkCount,
+            (unsigned long)dataUlCompleteCount,
+            (unsigned long)dataUlHandledCount,
+            (unsigned long)dataUlMalformedCount, dataUlLastPackageIndex,
+            dataUlLastPayload0, dataUlLastPayload1, dataUlLastFrameType,
+            dataUlLastFrameLen, (unsigned long)chunkAge,
+            (unsigned long)completeAge, rxLuaQueueCount,
+            (unsigned long)telemetryTxCount,
+            TelemetrySender.IsActive() ? 1 : 0,
+            (unsigned)TelemetrySender.GetState(),
+            TelemetrySender.GetWaitCount(),
+            TelemetrySender.GetMaxPacketsBeforeResync());
+    }
+#endif
     ExpressLRS_currTlmDenom = TlmDenom;
     telemBurstValid = false;
+    InvalidatePrebuiltTelemetry();
   }
 
   // Model match check
@@ -1795,6 +1864,7 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
 
   bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
   TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
+  InvalidatePrebuiltTelemetry();
 
   // Notify callback if registered
   if (connectionHasModelMatch && channelCallback) {
@@ -1830,12 +1900,19 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
     return;
   }
 
+  dataUlChunkCount++;
+  dataUlLastChunkMs = millis();
+  dataUlLastPackageIndex = packageIndex;
+  dataUlLastPayload0 = dataLen > 0 ? payload[0] : 0;
+  dataUlLastPayload1 = dataLen > 1 ? payload[1] : 0;
+
   // Match upstream RX behavior: DATA_UL carries a valid downlink stubborn ACK
   // only for MAVLink data-over-OTA. CRSF Lua/device-management replies are
   // acknowledged by the normal RC telemetry-confirm bit instead.
   if (TelemetrySender.IsActive() &&
       getConfiguredSerialProtocol() == ELRS_SERIAL_MAVLINK) {
     TelemetrySender.ConfirmCurrentPayload(stubbornAck);
+    InvalidatePrebuiltTelemetry();
     telemetryDataUlAckCount++;
     telemetryLastDataUlAck = stubbornAck;
   }
@@ -1857,6 +1934,8 @@ ProcessRfPacket_DataUl(OTA_Packet_s const *const otaPktPtr) {
   DataUlReceiver.ReceiveData(packageIndex, payload, dataLen);
   if (DataUlReceiver.HasFinishedData()) {
     dataUlReady = true;
+    dataUlCompleteCount++;
+    dataUlLastCompleteMs = millis();
 #if ELRS_DIAG_RX_LUA_UL && ELRS_DIAG_RX_LUA_UL_VERBOSE
     DBGLN("[RX_LUA] UL complete pending after pkg=%u first:%02X %02X %02X %02X %02X %02X %02X %02X",
           packageIndex, DataUlBuffer[0], DataUlBuffer[1], DataUlBuffer[2],
@@ -2069,6 +2148,11 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 //=============================================================================
 static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   if (LQCalc.currentIsSet() && connectionState == connected) {
+#if ELRS_DIAG_TX_TURNAROUND
+    if (telemetryAwaitingRx) {
+      telemetryLqSetWhileAwaitingCount++;
+    }
+#endif
     return false;
   }
 
@@ -2081,6 +2165,7 @@ static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
       telemetryRxFhss = FHSSgetCurrIndex();
       telemetryRxAfterTx++;
       telemetryAwaitingRx = 0;
+      telemetryStaleRxReported = 0;
     }
 #endif
     if (doStartTimer) {
@@ -2107,8 +2192,167 @@ static void ICACHE_RAM_ATTR TXdoneISR() {
   telemetryDoneToRxnbDoneUs = rxnbDoneUs - txDoneUs;
   telemetryTxToRxnbDoneUs = rxnbDoneUs - telemetryTxStartUs;
   telemetryAwaitingRx = 1;
+  telemetryStaleRxReported = 0;
 #endif
 }
+
+static void maybeReportStaleTelemetryRx() {
+#if ELRS_DIAG_TX_TURNAROUND && ELRS_DIAG_TLM_STALE_RX
+  if (!telemetryAwaitingRx || telemetryStaleRxReported ||
+      connectionState != connected ||
+      ExpressLRS_currAirRate_Modparams == nullptr) {
+    return;
+  }
+
+  const uint32_t ageUs = micros() - telemetryRxnbDoneUs;
+  const uint32_t intervalUs = ExpressLRS_currAirRate_Modparams->interval;
+  const uint32_t thresholdUs = intervalUs + 1000U;
+  if (ageUs < thresholdUs || ageUs > 1000000U) {
+    return;
+  }
+
+  telemetryStaleRxReported = 1;
+  telemetryStaleRxReportCount++;
+  telemetryStaleRxLastAgeUs = ageUs;
+
+  uint32_t isrCount = 0;
+  uint32_t rxIrqCount = 0;
+  uint32_t txIrqCount = 0;
+  uint32_t otherIrqCount = 0;
+  uint32_t lastIrq = 0;
+  lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
+                       &lastIrq);
+
+  DBGLN("TLM_STALE_RX age:%lu int:%lu den:%u rate:%u tx:%u/%u rx:%u/%u "
+        "exp:%u/%u sync:%u/%u vf:%lu lq:%u/%u dio:%lu/%lu/%lu irq:%lu/%lu/%lu/%lu/0x%08lX "
+        "lqskip:%lu stale:%lu",
+        (unsigned long)ageUs, (unsigned long)intervalUs,
+        ExpressLRS_currTlmDenom,
+        ExpressLRS_currAirRate_Modparams
+            ? ExpressLRS_currAirRate_Modparams->index
+            : 0,
+        telemetryTxNonce, telemetryTxFhss, telemetryRxNonce, telemetryRxFhss,
+        lastValidExpectedNonce, lastValidExpectedFhss, lastValidSyncNonce,
+        lastValidSyncFhss, (unsigned long)lastValidFreq, LQCalc.getLQRaw(),
+        LQCalc.getCount(), (unsigned long)lr1121_hal_get_direct_dio_count(),
+        (unsigned long)lr1121_hal_get_direct_reentrant_count(),
+        (unsigned long)lr1121_hal_get_level_requeue_count(),
+        (unsigned long)isrCount, (unsigned long)rxIrqCount,
+        (unsigned long)txIrqCount, (unsigned long)otherIrqCount,
+        (unsigned long)lastIrq,
+        (unsigned long)telemetryLqSetWhileAwaitingCount,
+        (unsigned long)telemetryStaleRxReportCount);
+#endif
+}
+
+#if ELRS_DIAG_TX_TURNAROUND && ELRS_DIAG_TLM150_SNAPSHOT
+static bool isTelemetry150Rate(const expresslrs_mod_settings_s *params) {
+  return params &&
+         ((params->enum_rate == RATE_LORA_900_100HZ) ||
+          (params->enum_rate == RATE_LORA_900_100HZ_8CH) ||
+          (params->enum_rate == RATE_LORA_2G4_100HZ) ||
+          (params->enum_rate == RATE_LORA_2G4_100HZ_8CH) ||
+          (params->enum_rate == RATE_LORA_DUAL_100HZ_8CH) ||
+          (params->enum_rate == RATE_LORA_2G4_150HZ) ||
+          (params->enum_rate == RATE_LORA_DUAL_150HZ));
+}
+
+static void armTelemetry150Snapshot(const expresslrs_mod_settings_s *params,
+                                    bool bindMode) {
+  const bool shouldArm = !bindMode && isTelemetry150Rate(params);
+  telemetry150DiagNeedArm = shouldArm;
+  telemetry150DiagArmed = false;
+  telemetry150DiagPrinted = false;
+}
+
+static void maybePrintTelemetry150Snapshot(unsigned long now) {
+  if (telemetry150DiagNeedArm && connectionState == connected &&
+      isTelemetry150Rate(ExpressLRS_currAirRate_Modparams)) {
+    telemetry150DiagNeedArm = false;
+    telemetry150DiagArmed = true;
+    telemetry150DiagPrinted = false;
+    telemetry150DiagArmMs = now;
+    telemetry150DiagArmTxCount = telemetryTxCount;
+    telemetry150DiagArmRxAfterTx = telemetryRxAfterTx;
+    telemetry150DiagArmTxBeforeRx = telemetryTxBeforeRx;
+    telemetry150DiagArmDataUlAck = telemetryDataUlAckCount;
+  }
+
+  if (!telemetry150DiagArmed || telemetry150DiagPrinted ||
+      !isTelemetry150Rate(ExpressLRS_currAirRate_Modparams)) {
+    return;
+  }
+
+  const uint32_t elapsedMs = now - telemetry150DiagArmMs;
+  const uint32_t txDelta = telemetryTxCount - telemetry150DiagArmTxCount;
+  if (txDelta == 0) {
+    if (elapsedMs < 1000U) {
+      return;
+    }
+
+    DBGLN("TLMFAST_NO_TX age:%lu den:%u burst:%u active:%u st:%u wait:%u/%u "
+          "lq:%u/%u dio:%lu/%lu/%lu",
+          (unsigned long)elapsedMs, ExpressLRS_currTlmDenom,
+          telemetryBurstMax, TelemetrySender.IsActive() ? 1 : 0,
+          (unsigned)TelemetrySender.GetState(), TelemetrySender.GetWaitCount(),
+          TelemetrySender.GetMaxPacketsBeforeResync(), LQCalc.getLQRaw(),
+          LQCalc.getCount(),
+          (unsigned long)lr1121_hal_get_direct_dio_count(),
+          (unsigned long)lr1121_hal_get_direct_reentrant_count(),
+          (unsigned long)lr1121_hal_get_level_requeue_count());
+    telemetry150DiagPrinted = true;
+    return;
+  }
+
+  const bool txPathDone = (telemetryTxDoneUs != 0) && (telemetryRxnbDoneUs != 0);
+  if (!txPathDone && elapsedMs < 250U) {
+    return;
+  }
+
+  const uint32_t interval = ExpressLRS_currAirRate_Modparams->interval;
+  const uint32_t nowUs = micros();
+  const bool rxSettled =
+      !telemetryAwaitingRx || (telemetryMissedAfterTx != 0) ||
+      ((uint32_t)(nowUs - telemetryRxnbDoneUs) > (interval + 500U));
+  if (txPathDone && !rxSettled && elapsedMs < 750U) {
+    return;
+  }
+
+  const int32_t fitUs =
+      (int32_t)interval - (int32_t)telemetryTxToRxnbDoneUs;
+  DBGLN("TLMFAST_TX age:%lu tx:%lu interval:%lu fit:%ld den:%u burst:%u "
+        "active:%u st:%u wait:%u/%u t2d:%lu d2rx:%lu tx2rx:%lu rxok:%lu "
+        "miss:%lu pend:%u overlap:%lu ok:%lu ack:%lu/%u tx:%u/%u rx:%u/%u "
+        "lq:%u/%u dio:%lu/%lu/%lu",
+        (unsigned long)elapsedMs, (unsigned long)txDelta,
+        (unsigned long)interval, (long)fitUs, ExpressLRS_currTlmDenom,
+        telemetryBurstMax, TelemetrySender.IsActive() ? 1 : 0,
+        (unsigned)TelemetrySender.GetState(), TelemetrySender.GetWaitCount(),
+        TelemetrySender.GetMaxPacketsBeforeResync(),
+        (unsigned long)telemetryTxToDoneUs,
+        (unsigned long)telemetryDoneToRxnbDoneUs,
+        (unsigned long)telemetryTxToRxnbDoneUs,
+        (unsigned long)telemetryRxnbToRxOkUs,
+        (unsigned long)telemetryMissedAfterTx, telemetryAwaitingRx,
+        (unsigned long)(telemetryTxBeforeRx - telemetry150DiagArmTxBeforeRx),
+        (unsigned long)(telemetryRxAfterTx - telemetry150DiagArmRxAfterTx),
+        (unsigned long)(telemetryDataUlAckCount - telemetry150DiagArmDataUlAck),
+        telemetryLastDataUlAck ? 1 : 0, telemetryTxNonce, telemetryTxFhss,
+        telemetryRxNonce, telemetryRxFhss, LQCalc.getLQRaw(), LQCalc.getCount(),
+        (unsigned long)lr1121_hal_get_direct_dio_count(),
+        (unsigned long)lr1121_hal_get_direct_reentrant_count(),
+        (unsigned long)lr1121_hal_get_level_requeue_count());
+  telemetry150DiagPrinted = true;
+}
+#else
+static void armTelemetry150Snapshot(const expresslrs_mod_settings_s *params,
+                                    bool bindMode) {
+  (void)params;
+  (void)bindMode;
+}
+
+static void maybePrintTelemetry150Snapshot(unsigned long now) { (void)now; }
+#endif
 
 //=============================================================================
 // RF Link rate setting
@@ -2128,6 +2372,7 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   bool invertIQ = bindMode || (UID[5] & 0x01);
 
   uint32_t interval = ModParams->interval;
+  const uint8_t defaultTlmDenom = TLMratioEnumToValue(ModParams->TLMinterval);
   hwTimer::updateInterval(interval);
   DBGLN("SetRFLinkRate timer updated: interval=%lu",
         (unsigned long)interval);
@@ -2166,69 +2411,91 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   ExpressLRS_currAirRate_RFperfParams = RFperf;
   ExpressLRS_nextAirRateIndex = index;
   telemBurstValid = false;
+  InvalidatePrebuiltTelemetry();
+  armTelemetry150Snapshot(ModParams, bindMode);
 
-  DBGLN("Set RF rate index %d, interval %lu us", index, interval);
+  DBGLN("Set RF rate index %d, interval %lu us, default TLM 1:%u", index,
+        interval, defaultTlmDenom);
 }
 
-static bool ICACHE_RAM_ATTR HandleSendDataDl() {
-  if ((connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) ||
-      alreadyTLMresp || !teamraceHasModelMatch ||
-      ((OtaNonce % ExpressLRS_currTlmDenom) != 0)) {
-    return false;
-  }
+static bool ICACHE_RAM_ATTR isTelemetrySlotForNonce(uint8_t nonce) {
+  return (connectionState != disconnected) && (ExpressLRS_currTlmDenom != 1) &&
+         !alreadyTLMresp && teamraceHasModelMatch &&
+         ((nonce % ExpressLRS_currTlmDenom) == 0);
+}
 
-#if ELRS_DIAG_DISABLE_DOWNLINK_TLM
-  // Isolation test: reserve the telemetry slot without keying the LR1121 TX.
-  // This preserves LQ timing while proving whether TX/TX_DONE/RX return causes
-  // the post-connect packet loss.
-  alreadyTLMresp = true;
-  telemetrySuppressedCount++;
-  return false;
-#endif
+static void ICACHE_RAM_ATTR GenerateTelemetryPacketCrcForNonce(OTA_Packet_s *pkt,
+                                                               uint8_t nonce) {
+  const uint8_t savedNonce = OtaNonce;
+  OtaNonce = nonce;
+  OtaGeneratePacketCrc(pkt);
+  OtaNonce = savedNonce;
+}
 
-  WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {};
-  alreadyTLMresp = true;
+static bool ICACHE_RAM_ATTR
+BuildTelemetryPacket(OTA_Packet_s *otaPkt,
+                     StubbornSenderPreparedPayload *preparedPayload,
+                     uint8_t nonce, uint8_t *nextTelemetryType,
+                     uint8_t *nextTelemetryBurstCount) {
+  memset(otaPkt, 0, sizeof(*otaPkt));
 
+  uint8_t localNextTelemetryType = NextTelemetryType;
+  uint8_t localTelemetryBurstCount = telemetryBurstCount;
   bool tlmQueued = TelemetrySender.IsActive();
-  if ((NextTelemetryType == PACKET_TYPE_LINKSTATS) || !tlmQueued) {
-    otaPkt.std.type = PACKET_TYPE_LINKSTATS;
+
+  if ((localNextTelemetryType == PACKET_TYPE_LINKSTATS) || !tlmQueued) {
+    otaPkt->std.type = PACKET_TYPE_LINKSTATS;
 
     if (OtaIsFullRes) {
-      otaPkt.full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt.full.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
-          otaPkt.full.data_dl.ul_link_stats.payload,
-          sizeof(otaPkt.full.data_dl.ul_link_stats.payload));
-      LinkStatsToOta(&otaPkt.full.data_dl.ul_link_stats.stats);
+      otaPkt->full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt->full.data_dl.packageIndex =
+          TelemetrySender.PrepareCurrentPayload(
+              otaPkt->full.data_dl.ul_link_stats.payload,
+              sizeof(otaPkt->full.data_dl.ul_link_stats.payload),
+              preparedPayload);
+      LinkStatsToOta(&otaPkt->full.data_dl.ul_link_stats.stats);
     } else {
-      otaPkt.std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt.std.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
-          otaPkt.std.data_dl.ul_link_stats.payload,
-          sizeof(otaPkt.std.data_dl.ul_link_stats.payload));
-      LinkStatsToOta(&otaPkt.std.data_dl.ul_link_stats.stats);
+      otaPkt->std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt->std.data_dl.packageIndex =
+          TelemetrySender.PrepareCurrentPayload(
+              otaPkt->std.data_dl.ul_link_stats.payload,
+              sizeof(otaPkt->std.data_dl.ul_link_stats.payload),
+              preparedPayload);
+      LinkStatsToOta(&otaPkt->std.data_dl.ul_link_stats.stats);
     }
 
-    NextTelemetryType = PACKET_TYPE_DATA;
-    telemetryBurstCount = 1;
+    localNextTelemetryType = PACKET_TYPE_DATA;
+    localTelemetryBurstCount = 1;
   } else {
-    if (telemetryBurstCount < telemetryBurstMax) {
-      telemetryBurstCount++;
+    if (localTelemetryBurstCount < telemetryBurstMax) {
+      localTelemetryBurstCount++;
     } else {
-      NextTelemetryType = PACKET_TYPE_LINKSTATS;
+      localNextTelemetryType = PACKET_TYPE_LINKSTATS;
     }
 
-    otaPkt.std.type = PACKET_TYPE_DATA;
+    otaPkt->std.type = PACKET_TYPE_DATA;
     if (OtaIsFullRes) {
-      otaPkt.full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt.full.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
-          otaPkt.full.data_dl.payload, sizeof(otaPkt.full.data_dl.payload));
+      otaPkt->full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt->full.data_dl.packageIndex =
+          TelemetrySender.PrepareCurrentPayload(
+              otaPkt->full.data_dl.payload, sizeof(otaPkt->full.data_dl.payload),
+              preparedPayload);
     } else {
-      otaPkt.std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt.std.data_dl.packageIndex = TelemetrySender.GetCurrentPayload(
-          otaPkt.std.data_dl.payload, sizeof(otaPkt.std.data_dl.payload));
+      otaPkt->std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
+      otaPkt->std.data_dl.packageIndex =
+          TelemetrySender.PrepareCurrentPayload(
+              otaPkt->std.data_dl.payload, sizeof(otaPkt->std.data_dl.payload),
+              preparedPayload);
     }
   }
 
-  OtaGeneratePacketCrc(&otaPkt);
+  GenerateTelemetryPacketCrcForNonce(otaPkt, nonce);
+  *nextTelemetryType = localNextTelemetryType;
+  *nextTelemetryBurstCount = localTelemetryBurstCount;
+  return true;
+}
+
+static void ICACHE_RAM_ATTR SendTelemetryPacket(OTA_Packet_s *otaPkt) {
 #if ELRS_DIAG_TX_TURNAROUND
   if (telemetryAwaitingRx) {
     telemetryTxBeforeRx++;
@@ -2242,10 +2509,89 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
   telemetryRxnbToRxOkUs = 0;
   telemetryMissedAfterTx = 0;
   telemetryAwaitingRx = 0;
+  telemetryStaleRxReported = 0;
+  telemetryStaleRxLastAgeUs = 0;
   telemetryTxNonce = OtaNonce;
   telemetryTxFhss = FHSSgetCurrIndex();
 #endif
-  Radio.TXnb((uint8_t *)&otaPkt, false, nullptr, SX12XX_Radio_All);
+  Radio.TXnb((uint8_t *)otaPkt, false, nullptr, SX12XX_Radio_All);
+}
+
+#if SIW917_ELRS_PREBUILD_TLM_PACKET
+static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry() {
+  prebuiltTelemetryValid = false;
+}
+
+static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {
+  const uint8_t targetNonce = (uint8_t)(OtaNonce + 1U);
+
+  if (!isTelemetrySlotForNonce(targetNonce)) {
+    prebuiltTelemetryValid = false;
+    return;
+  }
+
+  if (prebuiltTelemetryValid && prebuiltTelemetryNonce == targetNonce) {
+    return;
+  }
+
+  if (BuildTelemetryPacket(&prebuiltTelemetryPacket, &prebuiltTelemetryPayload,
+                           targetNonce, &prebuiltNextTelemetryType,
+                           &prebuiltTelemetryBurstCount)) {
+    prebuiltTelemetryNonce = targetNonce;
+    prebuiltTelemetryValid = true;
+    telemetryPrebuildCount++;
+  }
+}
+#else
+static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry() {}
+static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {}
+#endif
+
+static bool ICACHE_RAM_ATTR HandleSendDataDl() {
+  if (!isTelemetrySlotForNonce(OtaNonce)) {
+    return false;
+  }
+
+#if ELRS_DIAG_DISABLE_DOWNLINK_TLM
+  // Isolation test: reserve the telemetry slot without keying the LR1121 TX.
+  // This preserves LQ timing while proving whether TX/TX_DONE/RX return causes
+  // the post-connect packet loss.
+  alreadyTLMresp = true;
+  telemetrySuppressedCount++;
+  return false;
+#endif
+
+#if SIW917_ELRS_PREBUILD_TLM_PACKET
+  if (prebuiltTelemetryValid && prebuiltTelemetryNonce == OtaNonce) {
+    prebuiltTelemetryValid = false;
+    if (TelemetrySender.CommitPreparedPayload(prebuiltTelemetryPayload)) {
+      alreadyTLMresp = true;
+      NextTelemetryType = prebuiltNextTelemetryType;
+      telemetryBurstCount = prebuiltTelemetryBurstCount;
+      telemetryPrebuildHitCount++;
+      SendTelemetryPacket(&prebuiltTelemetryPacket);
+      return true;
+    }
+
+    telemetryPrebuildMissCount++;
+  }
+#endif
+
+  WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {};
+  StubbornSenderPreparedPayload preparedPayload = {};
+  uint8_t nextTelemetryType = NextTelemetryType;
+  uint8_t nextTelemetryBurstCount = telemetryBurstCount;
+
+  if (!BuildTelemetryPacket(&otaPkt, &preparedPayload, OtaNonce,
+                            &nextTelemetryType, &nextTelemetryBurstCount) ||
+      !TelemetrySender.CommitPreparedPayload(preparedPayload)) {
+    return false;
+  }
+
+  alreadyTLMresp = true;
+  NextTelemetryType = nextTelemetryType;
+  telemetryBurstCount = nextTelemetryBurstCount;
+  SendTelemetryPacket(&otaPkt);
   return true;
 }
 
@@ -2273,6 +2619,9 @@ static void updateSwitchMode() {
 }
 
 static void DataUlReceiveComplete() {
+  dataUlHandledCount++;
+  dataUlLastFrameType = 0;
+  dataUlLastFrameLen = 0;
 #if ELRS_DIAG_RX_LUA_UL
   const uint32_t completeCount = ++rxLuaUlCompleteCount;
 #if ELRS_DIAG_RX_LUA_UL_VERBOSE
@@ -2311,6 +2660,9 @@ static void DataUlReceiveComplete() {
           reinterpret_cast<const crsf_header_t *>(DataUlBuffer);
       const uint32_t frameLen =
           receivedHeader->frame_size + CRSF_FRAME_NOT_COUNTED_BYTES;
+      dataUlLastFrameType = receivedHeader->type;
+      dataUlLastFrameLen =
+          frameLen > UINT8_MAX ? UINT8_MAX : (uint8_t)frameLen;
       if (frameLen >= CRSF_MIN_PACKET_LEN && frameLen <= CRSF_MAX_PACKET_LEN) {
         switch (receivedHeader->type) {
         case CRSF_FRAMETYPE_DEVICE_PING:
@@ -2356,6 +2708,7 @@ static void DataUlReceiveComplete() {
           break;
         }
       } else {
+        dataUlMalformedCount++;
         DBGLN("[DATA_UL] malformed CRSF len=%lu first=%02X %02X %02X %02X",
               (unsigned long)frameLen, DataUlBuffer[0], DataUlBuffer[1],
               DataUlBuffer[2], DataUlBuffer[3]);
@@ -2493,6 +2846,7 @@ static void enterBindingModeNow() {
   }
 
   TelemetrySender.ResetState();
+  InvalidatePrebuiltTelemetry();
   DataUlReceiver.ResetState();
   dataUlReady = false;
   alreadyTLMresp = false;
@@ -2655,6 +3009,8 @@ void elrs_loop(void) {
   // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
+  maybeReportStaleTelemetryRx();
+  PrepareTelemetryForNextTock();
   hwTimer::service();
 
   unsigned long now = millis();
@@ -2980,6 +3336,7 @@ void elrs_loop(void) {
 #endif
 
   updateTelemetryBurst();
+  maybePrintTelemetry150Snapshot(now);
 
   if (uidSavePending) {
     uidSavePending = false;
@@ -3034,6 +3391,7 @@ void elrs_loop(void) {
       }
 #endif
       TelemetrySender.SetDataToTransmit(TelemetryBuffer, nextPayloadSize);
+      InvalidatePrebuiltTelemetry();
     }
   }
 
@@ -3099,9 +3457,33 @@ void elrs_loop(void) {
   if ((connectionState != disconnected) &&
       (ExpressLRS_nextAirRateIndex != ExpressLRS_currAirRate_Modparams->index)) {
     uint8_t requestedRateIndex = ExpressLRS_nextAirRateIndex;
+#if ELRS_DIAG_RATE_CHANGE_LOG
     DBGLN("Req air rate change %u->%u",
           (unsigned)ExpressLRS_currAirRate_Modparams->index,
           (unsigned)requestedRateIndex);
+    DBGLN("RATECHG_TLM tx:%lu ack:%lu/%u den:%u burst:%u state:%u wait:%u/%u "
+          "last:%u exp:%u/%u sync:%u/%u lq:%u/%u",
+          (unsigned long)telemetryTxCount,
+          (unsigned long)telemetryDataUlAckCount,
+          telemetryLastDataUlAck ? 1 : 0, ExpressLRS_currTlmDenom,
+          telemetryBurstMax, (unsigned)TelemetrySender.GetState(),
+          TelemetrySender.GetWaitCount(),
+          TelemetrySender.GetMaxPacketsBeforeResync(), lastValidPacketType,
+          lastValidExpectedNonce, lastValidExpectedFhss, lastValidSyncNonce,
+          lastValidSyncFhss, LQCalc.getLQRaw(), LQCalc.getCount());
+#if ELRS_DIAG_TX_TURNAROUND
+    DBGLN("RATECHG_TXTRN t2d:%lu d2rx:%lu tx2rx:%lu rxok:%lu miss:%lu "
+          "pend:%u pre:%lu ok:%lu tx:%u/%u rx:%u/%u",
+          (unsigned long)telemetryTxToDoneUs,
+          (unsigned long)telemetryDoneToRxnbDoneUs,
+          (unsigned long)telemetryTxToRxnbDoneUs,
+          (unsigned long)telemetryRxnbToRxOkUs,
+          (unsigned long)telemetryMissedAfterTx, telemetryAwaitingRx,
+          (unsigned long)telemetryTxBeforeRx, (unsigned long)telemetryRxAfterTx,
+          telemetryTxNonce, telemetryTxFhss, telemetryRxNonce,
+          telemetryRxFhss);
+#endif
+#endif
 
     if (!isSupportedRFRate(requestedRateIndex)) {
       DBGLN("Mode %u not supported, ignoring", (unsigned)requestedRateIndex);
@@ -3285,6 +3667,7 @@ void elrs_exit_binding_mode(void) {
 
   bindingModeRequest = false;
   TelemetrySender.ResetState();
+  InvalidatePrebuiltTelemetry();
   DataUlReceiver.ResetState();
   dataUlReady = false;
   Radio.SetTxIdleMode();

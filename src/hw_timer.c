@@ -37,6 +37,7 @@
 #include "rsi_ct.h" /* For RSI_CT_Config(), RSI_CT_Reset() */
 #include "rsi_pll.h"
 #include "rsi_rom_clks.h" /* For RSI_CLK_GetBaseClock(), RSI_CLK_SetCtClock() */
+#include "siw917_elrs_timing.h"
 #include "sl_si91x_config_timer.h"
 #include "system_si91x.h"
 #include <stdio.h> /* For printf debug output */
@@ -114,6 +115,8 @@ typedef struct {
 
   /* Monotonic timestamp tracking */
   volatile uint32_t total_half_ticks; /**< Total half-tick count since init */
+  volatile uint32_t last_edge_timestamp_us; /**< Scheduled timestamp of last edge */
+  uint32_t programmed_half_interval_us; /**< Interval currently in CT hardware */
 
   /* Phase/frequency adjustment - applied at next appropriate edge */
   volatile int32_t pending_phase_shift_us; /**< Pending phase adjustment */
@@ -142,9 +145,14 @@ static volatile uint32_t ct_interrupt_flag = 0;
 /* ========================================================================== */
 
 static void hw_timer_ct_callback(void *callback_flag);
+#if SIW917_ELRS_DIRECT_CT_IRQ
+static void hw_timer_direct_ct_irq(void);
+static bool hw_timer_install_direct_ct_vector(void);
+#endif
 static uint32_t us_to_match_value(uint32_t us);
 static uint32_t clamp_half_interval_us(int32_t interval_us);
 static int32_t hw_timer_consume_freq_adjust_us(void);
+static void hw_timer_note_edge_from_isr(void);
 static uint32_t hw_timer_get_ct_source_hz(CT_CLK_SRC_SEL_T source);
 static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source);
 static uint32_t hw_timer_calibrate_ct_frequency(uint32_t register_ct_freq);
@@ -234,6 +242,10 @@ static int32_t hw_timer_consume_freq_adjust_us(void) {
       adjust_us * ELRS_FREQ_OFFSET_UNITS_PER_US;
 
   return adjust_us;
+}
+
+static void hw_timer_note_edge_from_isr(void) {
+  hw_timer.last_edge_timestamp_us += hw_timer.programmed_half_interval_us;
 }
 
 static uint32_t hw_timer_get_ct_source_hz(CT_CLK_SRC_SEL_T source) {
@@ -427,6 +439,7 @@ static void hw_timer_update_match(uint32_t interval_us) {
 
   uint32_t new_match = us_to_match_value(interval_us);
   hw_timer.match_value = new_match;
+  hw_timer.programmed_half_interval_us = interval_us;
 
   /* Buffering is enabled, so update Counter 0 through its match buffer. */
   hw_timer_write_match(new_match, true);
@@ -459,6 +472,7 @@ static void hw_timer_ct_callback(void *callback_flag) {
 
   /* Increment monotonic counter for timestamp tracking */
   hw_timer.total_half_ticks++;
+  hw_timer_note_edge_from_isr();
 
   /*
    * Calculate next interval - FreqOffset applied to EVERY half-interval
@@ -515,6 +529,68 @@ static void hw_timer_ct_callback(void *callback_flag) {
   hw_timer.is_tock = !hw_timer.is_tock;
 }
 
+#if SIW917_ELRS_DIRECT_CT_IRQ
+#define HW_TIMER_VECTOR_RESERVED_ENTRIES 16U
+#define HW_TIMER_CT_VECTOR_INDEX                                                \
+  (HW_TIMER_VECTOR_RESERVED_ENTRIES + (uint32_t)CT_IRQn)
+
+static uint32_t hw_timer_ram_vector_table[SI91X_VECTOR_TABLE_ENTRIES]
+    __attribute__((aligned(512)));
+
+static void hw_timer_direct_ct_irq(void) {
+  const uint32_t status = CT->CT_INTR_STS;
+
+  if (status & SL_CT_COUNTER_0_IS_PEAK_FLAG) {
+    CT->CT_INTR_ACK = SL_CT_COUNTER_0_IS_PEAK_FLAG;
+    hw_timer_ct_callback(NULL);
+    return;
+  }
+
+  if (status != 0U) {
+    CT->CT_INTR_ACK = status;
+  }
+}
+
+static bool hw_timer_install_direct_ct_vector(void) {
+  if (HW_TIMER_CT_VECTOR_INDEX >= SI91X_VECTOR_TABLE_ENTRIES) {
+    printf("hw_timer: CT vector index %lu outside table size %lu\n",
+           (unsigned long)HW_TIMER_CT_VECTOR_INDEX,
+           (unsigned long)SI91X_VECTOR_TABLE_ENTRIES);
+    return false;
+  }
+
+  const uint32_t new_vtor =
+      (uint32_t)(uintptr_t)&hw_timer_ram_vector_table[0];
+  uint32_t old_vtor;
+  uint32_t old_ct_vector;
+  uint32_t primask = hw_timer_enter_critical();
+
+  old_vtor = SCB->VTOR;
+  if (old_vtor != new_vtor) {
+    memcpy(hw_timer_ram_vector_table, (const void *)(uintptr_t)old_vtor,
+           sizeof(hw_timer_ram_vector_table));
+  }
+
+  old_ct_vector = hw_timer_ram_vector_table[HW_TIMER_CT_VECTOR_INDEX];
+  hw_timer_ram_vector_table[HW_TIMER_CT_VECTOR_INDEX] =
+      (uint32_t)(uintptr_t)hw_timer_direct_ct_irq;
+
+  __DSB();
+  __ISB();
+  SCB->VTOR = new_vtor;
+  __DSB();
+  __ISB();
+  hw_timer_exit_critical(primask);
+
+  printf("hw_timer: RAM CT vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
+         "oldCT=0x%08lX newCT=0x%08lX\n",
+         (unsigned long)old_vtor, (unsigned long)new_vtor,
+         (unsigned long)old_ct_vector,
+         (unsigned long)(uintptr_t)hw_timer_direct_ct_irq);
+  return true;
+}
+#endif
+
 /* ========================================================================== */
 /*                           PUBLIC API FUNCTIONS                             */
 /* ========================================================================== */
@@ -554,6 +630,8 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   hw_timer.is_running = false;
   hw_timer.is_paused = false;
   hw_timer.total_half_ticks = 0;
+  hw_timer.last_edge_timestamp_us = 0;
+  hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
   hw_timer.pending_phase_shift_us = 0;
   hw_timer.freq_offset_units = 0;
   hw_timer.freq_offset_remainder_units = 0;
@@ -703,6 +781,7 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   }
 
   hw_timer.match_value = us_to_match_value(hw_timer.half_interval_us);
+  hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
   printf("hw_timer: final ct_freq=%lu Hz, ticks/us=%lu, match_value=%lu "
          "(16-bit max=%lu)\n",
          (unsigned long)ct_freq_hz, (unsigned long)ct_ticks_per_us,
@@ -737,15 +816,12 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   printf("hw_timer: [6/7] Clearing pending CT IRQ...\n");
   NVIC_ClearPendingIRQ(CT_IRQn);
 
-  /* Set CT interrupt to priority 6 (below DMA at priority 5)
-   *
-   * CRITICAL: ELRS rate hopping performs SPI transitions from inside this ISR.
-   * If CT_IRQn is at priority 5 (matching DMA), the DMA completion interrupt
-   * cannot preempt this ISR, leading to a deadlock. Priority 6 ensures
-   * the GSPI driver can always complete its transfer and clear the busy flag.
+  /* Keep CT at the highest FreeRTOS-safe priority. The timer ISR only queues
+   * ELRS work and wakes the task; all LR1121 SPI stays in task context.
    */
-  NVIC_SetPriority(CT_IRQn, 6);
-  printf("hw_timer: [6/7] DONE (priority=6, preemptible by DMA)\n");
+  NVIC_SetPriority(CT_IRQn, SIW917_ELRS_CT_IRQ_PRIORITY);
+  printf("hw_timer: [6/7] DONE (priority=%u, FreeRTOS-safe)\n",
+         (unsigned)SIW917_ELRS_CT_IRQ_PRIORITY);
 
   /* Unregister any existing callback first (in case of re-init) */
   printf("hw_timer: [7/7] Unregistering existing callback (if any)...\n");
@@ -760,6 +836,11 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   if (status != SL_STATUS_OK) {
     printf("hw_timer: FAILED at register_callback!");
   } else {
+#if SIW917_ELRS_DIRECT_CT_IRQ
+    if (!hw_timer_install_direct_ct_vector()) {
+      printf("hw_timer: direct CT IRQ install failed; using SDK handler\n");
+    }
+#endif
     hw_timer.is_initialized = true;
     hw_timer_force_stop_counter0();
     printf("hw_timer: init COMPLETE OK (counter stopped)\n");
@@ -811,6 +892,7 @@ sl_status_t hw_timer_start(void) {
 
   hw_timer_reset_counter0();
   hw_timer_write_match(hw_timer.match_value, false);
+  hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
 
   hw_timer.is_running = true;
   hw_timer.is_paused = false;
@@ -866,6 +948,8 @@ void hw_timer_deinit(void) {
   /* Reset state */
   hw_timer.is_paused = false;
   hw_timer.total_half_ticks = 0;
+  hw_timer.last_edge_timestamp_us = 0;
+  hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
 }
 
 /**
@@ -949,6 +1033,16 @@ uint32_t hw_timer_get_micros(void) {
 
   /* Total time = completed half-ticks + elapsed in current */
   return (half_ticks * hw_timer.half_interval_us) + elapsed;
+}
+
+void hw_timer_set_event_epoch(uint32_t epoch_us) {
+  uint32_t primask = hw_timer_enter_critical();
+  hw_timer.last_edge_timestamp_us = epoch_us;
+  hw_timer_exit_critical(primask);
+}
+
+uint32_t hw_timer_get_last_edge_micros(void) {
+  return hw_timer.last_edge_timestamp_us;
 }
 
 /**
@@ -1041,6 +1135,7 @@ void hw_timer_set_interval(uint32_t interval_us) {
 
   /* Calculate match value for Counter 0. */
   hw_timer.match_value = us_to_match_value(hw_timer.half_interval_us);
+  hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
 
   hw_timer_exit_critical(primask);
 

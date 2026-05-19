@@ -39,6 +39,11 @@ public:
     static void service();
 
     /**
+     * @brief Return true when a deferred timer event is waiting for service.
+     */
+    static bool hasPendingEvent();
+
+    /**
      * @brief Timestamp for the timer event currently being serviced.
      *
      * Platforms that defer timer callbacks out of ISR context use this to keep

@@ -18,8 +18,12 @@
 
 #include "../lib/LR1121Driver/LR1121_hal.h"
 #include "../lib/LR1121Driver/LR1121_Regs.h"
+#include "../include/common.h"
 #include "Arduino.h"
+#include "elrs_task_wakeup.h"
+#include "em_device.h"
 #include "logging.h"
+#include "siw917_elrs_timing.h"
 #include "targets.h"
 
 #include <string.h>
@@ -40,14 +44,15 @@ volatile bool isr_1_pending = false;
 volatile bool isr_2_pending = false;
 volatile uint32_t busy_timeout_count = 0;
 static volatile uint16_t last_command_opcode = 0;
+#if SIW917_ELRS_FUSED_RX_RETUNE
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
-
-// Diagnostic toggle: keep the ELRS LR1121 fused SetFreq+Rx helper enabled by
-// default. Disabling it made phase error much worse on SiW917.
-#define ELRS_DIAG_DISABLE_FUSED_RX_RETUNE 0
+#endif
 
 extern LR1121Driver Radio;
+extern RXtimerState_e RXtimerState;
+
+static bool dio1StageInit();
 
 // Static instance pointer
 LR1121Hal *LR1121Hal::instance = nullptr;
@@ -105,8 +110,19 @@ void LR1121Hal::init() {
   // dioISR_1, RISING)
   lr1121_dio1_init();
   lr1121_dio1_set_callback(dioISR_1);
+#if SIW917_ELRS_TWO_STAGE_DIO_ISR
+  const bool dioStageReady = dio1StageInit();
+#else
+  const bool dioStageReady = false;
+#endif
   lr1121_dio1_enable();
 
+  DBGLN("LR1121Hal DIO hot path: %s",
+        SIW917_ELRS_TWO_STAGE_DIO_ISR
+            ? (dioStageReady ? "two-stage-connected-only"
+                             : "two-stage-fallback-task")
+            : (SIW917_ELRS_DIRECT_DIO_ISR ? "direct-when-connected"
+                                           : "deferred-task"));
   DBGLN("LR1121Hal initialized");
 }
 
@@ -154,10 +170,12 @@ void LR1121Hal::WriteCommand(uint16_t opcode,
     return;
   }
 
+#if SIW917_ELRS_FUSED_RX_RETUNE
   if (pending_rx_retune && opcode != LR11XX_RADIO_SET_RF_FREQUENCY_OC &&
       opcode != LR11XX_SYSTEM_SET_STANDBY_OC) {
     pending_rx_retune = false;
   }
+#endif
 
   if (!WaitOnBusy(radioNumber)) {
     busy_timeout_count++;
@@ -184,8 +202,8 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     return;
   }
 
-  if (!ELRS_DIAG_DISABLE_FUSED_RX_RETUNE &&
-      opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC && pending_rx_retune &&
+#if SIW917_ELRS_FUSED_RX_RETUNE
+  if (opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC && pending_rx_retune &&
       buffer != nullptr && size >= 4) {
     const uint32_t freq_hz = ((uint32_t)buffer[0] << 24) |
                              ((uint32_t)buffer[1] << 16) |
@@ -198,6 +216,7 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     }
     DBGLN("SetFreq_SetRx failed, falling back to SetRfFrequency");
   }
+#endif
 
   uint8_t patched_buffer[16];
   uint8_t *tx_buffer = buffer;
@@ -219,10 +238,12 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     }
   }
 
+#if SIW917_ELRS_FUSED_RX_RETUNE
   if (pending_rx_retune && opcode != LR11XX_RADIO_SET_RF_FREQUENCY_OC &&
       opcode != LR11XX_SYSTEM_SET_STANDBY_OC) {
     pending_rx_retune = false;
   }
+#endif
 
   if (!WaitOnBusy(radioNumber)) {
     busy_timeout_count++;
@@ -230,10 +251,36 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     return;
   }
 
-  if (!lr1121_send_command(opcode, tx_buffer, size)) {
+  bool command_ok = false;
+  bool handled_hot_command = false;
+#if SIW917_ELRS_RAW_GSPI_TX
+  if (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX) {
+    command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
+#if SIW917_ELRS_RAW_GSPI_SET_RX
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RX_OC) {
+    command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
+#if SIW917_ELRS_POLLED_HOT_SPI
+  if (!handled_hot_command &&
+      (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX ||
+       opcode == LR11XX_RADIO_SET_RX_OC)) {
+    command_ok = lr1121_send_command_polled_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
+  if (!handled_hot_command) {
+    command_ok = lr1121_send_command(opcode, tx_buffer, size);
+  }
+  if (!command_ok) {
     DBGLN("WriteCommand failed (opcode=0x%04X size=%u)", opcode, size);
   }
 
+#if SIW917_ELRS_FUSED_RX_RETUNE
   if (opcode == LR11XX_SYSTEM_SET_STANDBY_OC && buffer != nullptr &&
       size >= 1) {
     if (rx_continuous_active) {
@@ -249,6 +296,7 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     rx_continuous_active = false;
     pending_rx_retune = false;
   }
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -280,7 +328,14 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
         return;
       }
       lr1121_cs_assert();
-      const bool ok = lr1121_spi_transfer(tx_buffer, buffer, size);
+      const bool ok =
+#if SIW917_ELRS_RAW_GSPI_CLEAR_IRQ
+          lr1121_spi_transfer_raw(tx_buffer, buffer, size);
+#elif SIW917_ELRS_POLLED_HOT_SPI
+          lr1121_spi_transfer_polled(tx_buffer, buffer, size);
+#else
+          lr1121_spi_transfer(tx_buffer, buffer, size);
+#endif
       lr1121_cs_deassert();
       if (!ok) {
         DBGLN("ReadCommand inline transfer failed opcode=0x%04X size=%u",
@@ -324,9 +379,18 @@ bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
   // We only support single radio (Radio_1)
   (void)radioNumber;
 
-  // Upstream ESP targets poll for roughly 2 ms, but the Core1121-HF TCXO/XOSC
-  // transitions on this SiW917 board can legitimately hold BUSY longer. A too
-  // short timeout silently skips critical config commands such as SetPacketType.
+  if (lr1121_wait_busy_fast(SIW917_ELRS_BUSY_FAST_ITERATIONS)) {
+    return true;
+  }
+
+#if SIW917_ELRS_BUSY_FAST_ONLY_WHEN_CONNECTED
+  if (connectionState == connected || RXtimerState == tim_locked) {
+    return false;
+  }
+#endif
+
+  // Keep the long fallback for TCXO/XOSC transitions during init and rate
+  // changes before the timing island is active.
   return lr1121_wait_busy_timeout(100);
 }
 
@@ -339,9 +403,155 @@ bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
 // callback small, mask DIO1 while the IRQ line is asserted, and do all SPI work
 // from elrs_loop().
 static volatile bool dio1_isr_pending = false;
+static volatile bool dio1_isr_processing = false;
+static volatile uint32_t dio1_direct_count = 0;
+static volatile uint32_t dio1_direct_reentrant_count = 0;
 static volatile uint32_t dio1_level_requeue_count = 0;
 static volatile uint32_t dio1_last_edge_us = 0;
 static volatile uint32_t dio1_last_deferred_us = 0;
+#if SIW917_ELRS_TWO_STAGE_DIO_ISR
+static volatile bool dio1_stage_irq_installed = false;
+static volatile uint32_t dio1_stage_irq_count = 0;
+static volatile uint32_t dio1_stage_pend_count = 0;
+
+#define DIO1_STAGE_IRQ EGPIO_PIN_7_IRQn
+#define DIO1_STAGE_VECTOR_RESERVED_ENTRIES 16U
+#define DIO1_STAGE_VECTOR_INDEX                                               \
+  (DIO1_STAGE_VECTOR_RESERVED_ENTRIES + (uint32_t)DIO1_STAGE_IRQ)
+
+static uint32_t dio1_stage_ram_vector_table[SI91X_VECTOR_TABLE_ENTRIES]
+    __attribute__((aligned(512)));
+
+static inline uint32_t dio1StageEnterCritical() {
+  uint32_t primask;
+  __asm volatile("mrs %0, primask" : "=r"(primask));
+  __asm volatile("cpsid i" ::: "memory");
+  return primask;
+}
+
+static inline void dio1StageExitCritical(uint32_t primask) {
+  __asm volatile("msr primask, %0" ::"r"(primask) : "memory");
+}
+#endif
+
+static inline bool dio1DirectPathAllowed() {
+#if SIW917_ELRS_DIRECT_DIO_ISR
+  return connectionState == connected;
+#else
+  return false;
+#endif
+}
+
+static void processDio1IrqNow() {
+  // Match the LR1121 driver's ISR callback path, but keep the IRQ status read
+  // in one place so direct and deferred handling cannot drift apart.
+  if (LR1121Hal::instance && LR1121Hal::instance->IsrCallback_1) {
+    LR1121Driver::instance = &Radio;
+    uint32_t irqStatus = Radio.GetIrqStatus(SX12XX_Radio_1);
+    LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_1, irqStatus);
+    if (irqStatus != 0 && !(irqStatus & (LR1121_IRQ_TX_DONE |
+                                         LR1121_IRQ_RX_DONE |
+                                         LR1121_IRQ_TIMEOUT))) {
+      Radio.ClearIrqStatus(SX12XX_Radio_1);
+    }
+  }
+}
+
+#if SIW917_ELRS_TWO_STAGE_DIO_ISR
+static void dio1PendStageFromIsr() {
+  dio1_stage_pend_count++;
+  NVIC_SetPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
+}
+
+static void dio1StageIrqHandler() {
+  NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
+  dio1_stage_irq_count++;
+
+  if (!dio1DirectPathAllowed()) {
+    dio1_isr_pending = true;
+    isr_1_pending = true;
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    return;
+  }
+
+  if (dio1_isr_processing) {
+    dio1_direct_reentrant_count++;
+    dio1_isr_pending = true;
+    isr_1_pending = true;
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    return;
+  }
+
+  if (!dio1_isr_pending && lr1121_dio1_read() == 0) {
+    return;
+  }
+
+  dio1_isr_pending = false;
+  isr_1_pending = false;
+  dio1_direct_count++;
+  dio1_last_deferred_us = micros();
+  dio1_isr_processing = true;
+  processDio1IrqNow();
+  dio1_isr_processing = false;
+
+  lr1121_dio1_resume_isr();
+  if (lr1121_dio1_read() != 0) {
+    dio1_level_requeue_count++;
+    dio1_isr_pending = true;
+    isr_1_pending = true;
+    lr1121_dio1_pause_isr();
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+  }
+}
+
+static bool dio1StageInit() {
+  if (DIO1_STAGE_VECTOR_INDEX >= SI91X_VECTOR_TABLE_ENTRIES) {
+    DBGLN("LR1121Hal DIO stage vector index %lu outside table size %lu",
+          (unsigned long)DIO1_STAGE_VECTOR_INDEX,
+          (unsigned long)SI91X_VECTOR_TABLE_ENTRIES);
+    return false;
+  }
+
+  const uint32_t newVtor =
+      (uint32_t)(uintptr_t)&dio1_stage_ram_vector_table[0];
+  uint32_t oldVtor;
+  uint32_t oldStageVector;
+  const uint32_t primask = dio1StageEnterCritical();
+
+  oldVtor = SCB->VTOR;
+  if (oldVtor != newVtor) {
+    memcpy(dio1_stage_ram_vector_table, (const void *)(uintptr_t)oldVtor,
+           sizeof(dio1_stage_ram_vector_table));
+  }
+
+  oldStageVector = dio1_stage_ram_vector_table[DIO1_STAGE_VECTOR_INDEX];
+  dio1_stage_ram_vector_table[DIO1_STAGE_VECTOR_INDEX] =
+      (uint32_t)(uintptr_t)dio1StageIrqHandler;
+
+  __DSB();
+  __ISB();
+  SCB->VTOR = newVtor;
+  __DSB();
+  __ISB();
+  dio1StageExitCritical(primask);
+
+  NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
+  NVIC_SetPriority((IRQn_Type)DIO1_STAGE_IRQ,
+                   SIW917_ELRS_DIO_STAGE_IRQ_PRIORITY);
+  NVIC_EnableIRQ((IRQn_Type)DIO1_STAGE_IRQ);
+  dio1_stage_irq_installed = true;
+
+  DBGLN("LR1121Hal DIO stage vector installed irq=%d priority=%u "
+        "oldVTOR=0x%08lX newVTOR=0x%08lX oldStage=0x%08lX newStage=0x%08lX",
+        (int)DIO1_STAGE_IRQ, (unsigned)SIW917_ELRS_DIO_STAGE_IRQ_PRIORITY,
+        (unsigned long)oldVtor, (unsigned long)newVtor,
+        (unsigned long)oldStageVector,
+        (unsigned long)(uintptr_t)dio1StageIrqHandler);
+  return true;
+}
+#else
+static bool dio1StageInit() { return false; }
+#endif
 
 extern "C" uint32_t lr1121_hal_get_last_dio1_edge_us(void) {
   return dio1_last_edge_us;
@@ -355,15 +565,71 @@ extern "C" bool lr1121_hal_has_pending_dio1(void) {
   return dio1_isr_pending || (lr1121_dio1_read() != 0);
 }
 
+extern "C" uint32_t lr1121_hal_get_direct_dio_count(void) {
+  return dio1_direct_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_direct_reentrant_count(void) {
+  return dio1_direct_reentrant_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_level_requeue_count(void) {
+  return dio1_level_requeue_count;
+}
+
 void LR1121Hal::dioISR_1() {
   dio1_last_edge_us = micros();
   isr_1_total_count++;
+
+#if SIW917_ELRS_TWO_STAGE_DIO_ISR
+  dio1_isr_pending = true;
+  isr_1_pending = true;
+
+  // The real GPIO ISR is now edge-capture only. Keep it safe to raise above
+  // FreeRTOS later by avoiding OS APIs and LR1121 SPI here.
+  lr1121_dio1_pause_isr();
+  if (dio1_stage_irq_installed) {
+    dio1PendStageFromIsr();
+  } else {
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+  }
+  return;
+#endif
+
+  if (dio1DirectPathAllowed()) {
+    if (dio1_isr_processing) {
+      dio1_direct_reentrant_count++;
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+      lr1121_dio1_pause_isr();
+      elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+      return;
+    }
+
+    dio1_direct_count++;
+    dio1_isr_processing = true;
+    lr1121_dio1_pause_isr();
+    processDio1IrqNow();
+    dio1_isr_processing = false;
+
+    lr1121_dio1_resume_isr();
+    if (lr1121_dio1_read() != 0) {
+      dio1_level_requeue_count++;
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+      lr1121_dio1_pause_isr();
+      elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    }
+    return;
+  }
+
   dio1_isr_pending = true;
   isr_1_pending = true;
 
   // DIO1 stays high until the LR1121 IRQ is cleared over SPI. Mask it here so
   // the GPIO interrupt cannot repeatedly fire before the deferred handler runs.
   lr1121_dio1_pause_isr();
+  elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
 }
 
 // Called from elrs_loop() to process deferred DIO1 interrupts safely
@@ -391,16 +657,7 @@ void LR1121Hal::handleDeferredISR() {
     // Call the ISR callback from task context. On SiW917, explicitly clear and
     // re-arm after RX-side IRQs so DIO1 cannot remain asserted and starve the
     // ELRS loop after the first real packet.
-    if (instance && instance->IsrCallback_1) {
-      LR1121Driver::instance = &Radio;
-      uint32_t irqStatus = Radio.GetIrqStatus(SX12XX_Radio_1);
-      LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_1, irqStatus);
-      if (irqStatus != 0 && !(irqStatus & (LR1121_IRQ_TX_DONE |
-                                           LR1121_IRQ_RX_DONE |
-                                           LR1121_IRQ_TIMEOUT))) {
-        Radio.ClearIrqStatus(SX12XX_Radio_1);
-      }
-    }
+    processDio1IrqNow();
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {

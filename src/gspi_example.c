@@ -21,6 +21,8 @@
 #include "sl_si91x_gspi.h"
 #include "sl_si91x_gspi_common_config.h"
 
+#include "elrs_cpp/hal/elrs_task_wakeup.h"
+
 #include "rsi_rom_clks.h"
 
 /*******************************************************************************
@@ -998,6 +1000,9 @@ void elrs_cpp_task(void *argument) {
   extern void test_lr1121_dma_shift(void);
   extern bool elrs_is_connected(void);
   extern bool lr1121_hal_has_pending_dio1(void);
+  extern bool elrs_hw_timer_has_pending_event(void);
+
+  elrs_task_wakeup_set_thread(osThreadGetId());
 
   DEBUGOUT("[ELRS] Initializing receiver...\n");
   elrs_rx_init();
@@ -1019,9 +1024,18 @@ void elrs_cpp_task(void *argument) {
    */
   uint32_t boot_time = osKernelGetTickCount();
   wifi_auto_on_prevented = false;
+  uint8_t elrs_hot_drain_budget = 0;
 
   /* Main loop - standard ELRS RX loop */
   while (1) {
+    if ((lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event()) &&
+        elrs_hot_drain_budget < 16U) {
+      elrs_hot_drain_budget++;
+      elrs_rx_loop();
+      continue;
+    }
+    elrs_hot_drain_budget = 0;
+
     uint32_t now = osKernelGetTickCount();
 
     /* Check if connection established - prevent WiFi auto-on
@@ -1076,11 +1090,11 @@ void elrs_cpp_task(void *argument) {
      * the ELRS loop can drain the radio IRQ. Otherwise sleep normally so
      * buttons, LEDs, and WiFi housekeeping still get CPU time.
      */
-    if (lr1121_hal_has_pending_dio1()) {
-      osThreadYield();
-    } else {
-      osDelay(1);
+    if (lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event()) {
+      continue;
     }
+
+    (void)elrs_task_wakeup_wait(1);
   }
 }
 #endif /* TEST_MODE_ELRS_CPP_TEST */
