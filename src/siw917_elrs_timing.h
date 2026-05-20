@@ -38,12 +38,12 @@
 #endif
 
 /*
- * Full direct Tick+Tock was flight-tested and rejected: TOCK performs FHSS and
- * telemetry radio commands, and the SiW917 GSPI/SDK transfer path times out
- * when those commands are issued from CT IRQ context.
+ * Run TOCK directly from the CT interrupt, matching upstream's deterministic
+ * timer model. This is only safe because the TOCK hot-path LR1121 commands
+ * below are routed to raw/polled GSPI instead of the SDK/DMA transfer path.
  */
 #ifndef SIW917_ELRS_DIRECT_TIMER_CALLBACKS
-#define SIW917_ELRS_DIRECT_TIMER_CALLBACKS 0
+#define SIW917_ELRS_DIRECT_TIMER_CALLBACKS SIW917_ELRS_TIMING_LEAN
 #endif
 
 /*
@@ -61,6 +61,28 @@
  */
 #ifndef SIW917_ELRS_PREBUILD_TLM_PACKET
 #define SIW917_ELRS_PREBUILD_TLM_PACKET 0
+#endif
+
+/*
+ * Experimental SiW917 ISR boundary: keep the upstream telemetry slot decision
+ * at TOCK, but start the LR1121 TX command from the ELRS task.
+ *
+ * Flight testing rejected this as the default: the queue drains, but the actual
+ * downlink leaves too late for the TX telemetry receive window at 150 Hz+ and
+ * can overlap the next timer-driven FHSS retune. Keep it available only as an
+ * explicit A/B diagnostic switch.
+ */
+#ifndef SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+#define SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER 0
+#endif
+
+/*
+ * Hot-path timing probes. These keep only high-water counters and print nothing
+ * from ISR context; elrs_main reports them on disconnect. Disable after the
+ * bottleneck is found to remove the timestamp-read overhead.
+ */
+#ifndef SIW917_ELRS_HOTPATH_TIMING_DIAG
+#define SIW917_ELRS_HOTPATH_TIMING_DIAG 1
 #endif
 
 /*
@@ -136,7 +158,7 @@
 #endif
 
 #ifndef SIW917_ELRS_BUSY_FAST_ITERATIONS
-#define SIW917_ELRS_BUSY_FAST_ITERATIONS 40000U
+#define SIW917_ELRS_BUSY_FAST_ITERATIONS 80000U
 #endif
 
 /*
@@ -151,9 +173,17 @@
 #endif
 
 /*
- * Fused SetFrequency+SetRx is issued on every FHSS hop. Once raw GET_PACKET is
- * proven, move this retune command to the same direct GSPI path so 100 Hz and
- * faster rates do not pay the pumped CMSIS transfer cost on each slot.
+ * Keep upstream FHSS semantics: hops use SetRfFrequency only, not the custom
+ * SetFreq+SetRx helper. Route that command through raw GSPI so direct timer
+ * TOCK can still run without the SDK/DMA transfer path.
+ */
+#ifndef SIW917_ELRS_RAW_GSPI_SET_FREQ
+#define SIW917_ELRS_RAW_GSPI_SET_FREQ SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
+ * Custom SetFrequency+SetRx helper. This is useful for explicit A/B tests but
+ * is not used by the upstream FHSS path.
  */
 #ifndef SIW917_ELRS_RAW_GSPI_SET_FREQ_RX
 #define SIW917_ELRS_RAW_GSPI_SET_FREQ_RX SIW917_ELRS_TIMING_LEAN

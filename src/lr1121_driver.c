@@ -37,6 +37,7 @@
 #include "rsi_debug.h"
 #include "rsi_egpio.h"
 #include "rsi_rom_egpio.h"
+#include "hw_timer.h"
 #include "siw917_elrs_timing.h"
 #include "sl_si91x_gspi.h"
 
@@ -125,6 +126,12 @@
 #define LR1121_CLEAR_IRQ_BACKEND_NAME "raw-register"
 #else
 #define LR1121_CLEAR_IRQ_BACKEND_NAME LR1121_HOT_SPI_SYNC_NAME
+#endif
+
+#if SIW917_ELRS_RAW_GSPI_SET_FREQ
+#define LR1121_SET_FREQ_BACKEND_NAME "raw-register"
+#else
+#define LR1121_SET_FREQ_BACKEND_NAME LR1121_HOT_SPI_SYNC_NAME
 #endif
 
 #if SIW917_ELRS_RAW_GSPI_TX
@@ -608,6 +615,29 @@ static void delay_us(uint32_t us) {
 #define LR1121_BUSY_READ_BACKEND_NAME "bit-load"
 #endif
 
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+static volatile uint32_t lr1121_raw_gspi_max_us = 0;
+static volatile uint32_t lr1121_raw_gspi_count = 0;
+static volatile uint32_t lr1121_raw_gspi_fail_count = 0;
+static volatile uint32_t lr1121_busy_fast_max_iterations = 0;
+static volatile uint32_t lr1121_busy_fast_fail_count = 0;
+
+static inline void lr1121_diag_update_max(volatile uint32_t *max_value,
+                                          uint32_t value) {
+  if (value > *max_value) {
+    *max_value = value;
+  }
+}
+
+static inline void lr1121_diag_update_elapsed_us(volatile uint32_t *max_value,
+                                                 uint32_t start_us) {
+  const uint32_t elapsed_us = hw_timer_get_micros() - start_us;
+  if (elapsed_us < 1000000U) {
+    lr1121_diag_update_max(max_value, elapsed_us);
+  }
+}
+#endif
+
 static inline int read_busy_pin(void) {
 #if SIW917_ELRS_BUSY_PORT_READ
   return (int)HP_GPIO_READ_PORT1(LR1121_PIN_BUSY);
@@ -682,11 +712,18 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
 #ifdef USE_SOFT_SPI
   return spi_transfer(tx_data, rx_data, length);
 #else
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t diag_start_us = hw_timer_get_micros();
+#endif
   if (length == 0) {
     return true;
   }
 
   if (!wait_gspi_idle_timeout(100000U)) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    lr1121_raw_gspi_fail_count++;
+    lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
     DEBUGOUT("LR1121: raw GSPI busy before transfer\n");
     return false;
   }
@@ -785,6 +822,9 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
   lr1121_exit_critical(primask);
 
   if (log_raw_timeout) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    lr1121_raw_gspi_fail_count++;
+#endif
     static uint32_t raw_timeout_count = 0;
     if (raw_timeout_count < 16) {
       raw_timeout_count++;
@@ -796,6 +836,11 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
                (unsigned long)log_write_data2, (unsigned long)log_fifo_thrld);
     }
   }
+
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  lr1121_raw_gspi_count++;
+  lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
 
   return ok;
 #endif
@@ -1368,11 +1413,11 @@ lr1121_status_t lr1121_init(void) {
   DEBUGOUT("LR1121: GSPI configured: %lu Hz, Mode 0, 8-bit, div=%lu\n",
            (unsigned long)gspi_config.bitrate,
            (unsigned long)sl_si91x_gspi_get_clock_division_factor(gspi_handle));
-  DEBUGOUT("LR1121: ELRS hot-path SPI get_packet=%s set_freq_rx=%s "
-           "clear_irq=%s tx=%s set_rx=%s\n",
-           LR1121_GET_PACKET_BACKEND_NAME, LR1121_SET_FREQ_RX_BACKEND_NAME,
-           LR1121_CLEAR_IRQ_BACKEND_NAME, LR1121_TX_BACKEND_NAME,
-           LR1121_SET_RX_BACKEND_NAME);
+  DEBUGOUT("LR1121: ELRS hot-path SPI get_packet=%s set_freq=%s "
+           "set_freq_rx=%s clear_irq=%s tx=%s set_rx=%s\n",
+           LR1121_GET_PACKET_BACKEND_NAME, LR1121_SET_FREQ_BACKEND_NAME,
+           LR1121_SET_FREQ_RX_BACKEND_NAME, LR1121_CLEAR_IRQ_BACKEND_NAME,
+           LR1121_TX_BACKEND_NAME, LR1121_SET_RX_BACKEND_NAME);
   DEBUGOUT("LR1121: BUSY read backend=%s fast_connected=%u iterations=%lu\n",
            LR1121_BUSY_READ_BACKEND_NAME,
            (unsigned)SIW917_ELRS_BUSY_FAST_ONLY_WHEN_CONNECTED,
@@ -2295,14 +2340,68 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms) {
 }
 
 bool lr1121_wait_busy_fast(uint32_t max_iterations) {
+  const uint32_t original_iterations = max_iterations;
   while (max_iterations-- > 0U) {
     if (read_busy_pin() == 0) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      const uint32_t used_iterations = original_iterations - max_iterations - 1U;
+      lr1121_diag_update_max(&lr1121_busy_fast_max_iterations,
+                             used_iterations);
+#endif
       return true;
     }
     __asm volatile("nop");
   }
 
-  return read_busy_pin() == 0;
+  const bool ready = read_busy_pin() == 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  lr1121_diag_update_max(&lr1121_busy_fast_max_iterations,
+                         original_iterations);
+  if (!ready) {
+    lr1121_busy_fast_fail_count++;
+  }
+#endif
+  return ready;
+}
+
+uint32_t lr1121_get_raw_gspi_max_us(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return lr1121_raw_gspi_max_us;
+#else
+  return 0;
+#endif
+}
+
+uint32_t lr1121_get_raw_gspi_count(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return lr1121_raw_gspi_count;
+#else
+  return 0;
+#endif
+}
+
+uint32_t lr1121_get_raw_gspi_fail_count(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return lr1121_raw_gspi_fail_count;
+#else
+  return 0;
+#endif
+}
+
+uint32_t lr1121_get_busy_fast_max_iterations(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return lr1121_busy_fast_max_iterations;
+#else
+  return 0;
+#endif
+}
+
+uint32_t lr1121_get_busy_fast_fail_count(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return lr1121_busy_fast_fail_count;
+#else
+  return 0;
+#endif
 }
 
 /**

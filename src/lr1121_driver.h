@@ -392,6 +392,11 @@ bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
  * instead of sleeping in 100 us chunks once the RF link is running.
  */
 bool lr1121_wait_busy_fast(uint32_t max_iterations);
+uint32_t lr1121_get_busy_fast_max_iterations(void);
+uint32_t lr1121_get_busy_fast_fail_count(void);
+uint32_t lr1121_get_raw_gspi_max_us(void);
+uint32_t lr1121_get_raw_gspi_count(void);
+uint32_t lr1121_get_raw_gspi_fail_count(void);
 
 /**
  * @brief Send a command to the LR1121 (Phase 1 of SPI protocol)

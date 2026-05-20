@@ -63,8 +63,22 @@ static volatile uint32_t queuedTockCount = 0;
 static volatile uint32_t processedTickCount = 0;
 static volatile uint32_t processedTockCount = 0;
 static volatile uint32_t immediateTockDeliveredCount = 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+static volatile uint32_t maxTickDurationUs = 0;
+static volatile uint32_t maxTockDurationUs = 0;
+
+static inline void updateMaxDuration(volatile uint32_t &maxValue,
+                                     uint32_t durationUs) {
+  if (durationUs > maxValue) {
+    maxValue = durationUs;
+  }
+}
+#endif
 
 static void processTimerEvent(uint8_t type, uint32_t timestampUs) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t startUs = hw_timer_get_micros();
+#endif
   activeEventMicros = timestampUs;
 
   if (type == TIMER_EVENT_TICK) {
@@ -84,6 +98,14 @@ static void processTimerEvent(uint8_t type, uint32_t timestampUs) {
   }
 
   activeEventMicros = 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t durationUs = hw_timer_get_micros() - startUs;
+  if (type == TIMER_EVENT_TICK) {
+    updateMaxDuration(maxTickDurationUs, durationUs);
+  } else if (type == TIMER_EVENT_TOCK) {
+    updateMaxDuration(maxTockDurationUs, durationUs);
+  }
+#endif
 }
 
 static void resetTimerEventQueue() {
@@ -100,6 +122,10 @@ static void resetTimerEventStats() {
   processedTickCount = 0;
   processedTockCount = 0;
   immediateTockDeliveredCount = 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  maxTickDurationUs = 0;
+  maxTockDurationUs = 0;
+#endif
 }
 
 static void __attribute__((unused))
@@ -365,4 +391,20 @@ uint32_t hwTimer::getQueueOverflowCount() {
 
 uint32_t hwTimer::getImmediateTockDeliveredCount() {
   return immediateTockDeliveredCount;
+}
+
+uint32_t hwTimer::getMaxTickDurationUs() {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return maxTickDurationUs;
+#else
+  return 0;
+#endif
+}
+
+uint32_t hwTimer::getMaxTockDurationUs() {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return maxTockDurationUs;
+#else
+  return 0;
+#endif
 }

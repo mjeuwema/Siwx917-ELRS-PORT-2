@@ -116,6 +116,8 @@ public:
     static uint32_t getProcessedTockCount();
     static uint32_t getQueueOverflowCount();
     static uint32_t getImmediateTockDeliveredCount();
+    static uint32_t getMaxTickDurationUs();
+    static uint32_t getMaxTockDurationUs();
 };
 
 // Macro for ISR attribute (platform specific)

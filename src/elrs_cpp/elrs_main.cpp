@@ -28,6 +28,7 @@
 #include "common.h"
 #include "crc.h"
 #include "crsf_protocol.h"
+#include "elrs_task_wakeup.h"
 #include "hwTimer.h"
 #include "logging.h"
 #include "options.h"
@@ -56,8 +57,15 @@ uint32_t lr1121_hal_get_last_deferred_us(void);
 uint32_t lr1121_hal_get_direct_dio_count(void);
 uint32_t lr1121_hal_get_direct_reentrant_count(void);
 uint32_t lr1121_hal_get_level_requeue_count(void);
+uint32_t lr1121_hal_get_stage_max_us(void);
+uint32_t lr1121_hal_get_deferred_max_us(void);
 uint32_t lr1121_get_last_rxnbisr_entry_us(void);
 uint32_t lr1121_get_last_packet_ready_us(void);
+uint32_t lr1121_get_busy_fast_max_iterations(void);
+uint32_t lr1121_get_busy_fast_fail_count(void);
+uint32_t lr1121_get_raw_gspi_max_us(void);
+uint32_t lr1121_get_raw_gspi_count(void);
+uint32_t lr1121_get_raw_gspi_fail_count(void);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
@@ -85,6 +93,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_PERIODIC_STATS 0
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
 #define ELRS_DIAG_PRINT_AFTER_LOSS 0
+#define ELRS_DIAG_LOSS_PACKET_STATS 1
 #define ELRS_DIAG_RX_LUA_UL 0
 #define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
@@ -236,6 +245,18 @@ static volatile uint8_t dataUlLastPayload0 = 0;
 static volatile uint8_t dataUlLastPayload1 = 0;
 static volatile uint8_t dataUlLastFrameType = 0;
 static volatile uint8_t dataUlLastFrameLen = 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+static volatile uint32_t telemetryBuildMaxUs = 0;
+static volatile uint32_t telemetrySendMaxUs = 0;
+static volatile uint32_t telemetryHandleMaxUs = 0;
+
+static inline void updateHotpathMax(volatile uint32_t &maxValue,
+                                    uint32_t durationUs) {
+  if (durationUs > maxValue) {
+    maxValue = durationUs;
+  }
+}
+#endif
 #if SIW917_ELRS_PREBUILD_TLM_PACKET
 static WORD_ALIGNED_ATTR OTA_Packet_s prebuiltTelemetryPacket = {};
 static StubbornSenderPreparedPayload prebuiltTelemetryPayload = {};
@@ -246,6 +267,26 @@ static uint8_t prebuiltTelemetryBurstCount = 0;
 static volatile uint32_t telemetryPrebuildCount = 0;
 static volatile uint32_t telemetryPrebuildHitCount = 0;
 static volatile uint32_t telemetryPrebuildMissCount = 0;
+#endif
+#if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+static WORD_ALIGNED_ATTR OTA_Packet_s deferredTelemetryPacket = {};
+static volatile bool deferredTelemetryPending = false;
+static volatile uint8_t deferredTelemetryNonce = 0;
+static volatile uint8_t deferredTelemetryFhss = 0;
+static volatile uint32_t telemetryDeferredQueueCount = 0;
+static volatile uint32_t telemetryDeferredSendCount = 0;
+static volatile uint32_t telemetryDeferredDropCount = 0;
+
+static inline uint32_t telemetryEnterCritical() {
+  uint32_t primask;
+  __asm volatile("mrs %0, primask" : "=r"(primask));
+  __asm volatile("cpsid i" ::: "memory");
+  return primask;
+}
+
+static inline void telemetryExitCritical(uint32_t primask) {
+  __asm volatile("msr primask, %0" ::"r"(primask) : "memory");
+}
 #endif
 #if ELRS_DIAG_TX_TURNAROUND
 static volatile uint32_t telemetryTxStartUs = 0;
@@ -1391,6 +1432,7 @@ static void maybePrintTelemetry150Snapshot(unsigned long now);
 static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now);
 static void GotConnection(unsigned long now);
 static void LostConnection(bool resumeRx);
+static void printLossPacketStats();
 static uint8_t minLqForChaos();
 static void enterBindingModeNow();
 static void updateBindingMode(unsigned long now);
@@ -1612,10 +1654,7 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
-  // In direct timer mode this runs from CT IRQ context, so keep FHSS on the
-  // synchronous LR1121 hot path instead of the SDK-backed SetRfFrequency path.
-  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
-                        SIW917_ELRS_DIRECT_TIMER_CALLBACKS);
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
 }
 
 static void ICACHE_RAM_ATTR HWtimerCallbackTick() {
@@ -1638,7 +1677,9 @@ static void ICACHE_RAM_ATTR HWtimerCallbackTock() {
   OtaNonce++;
   HandleFHSS();
   if (HandleSendDataDl()) {
+#if !SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
     telemetryTxCount++;
+#endif
   }
   updatePhaseLock();
 }
@@ -1698,6 +1739,31 @@ static void LostConnection(bool resumeRx) {
         (unsigned long)lr1121_hal_get_direct_dio_count(),
         (unsigned long)lr1121_hal_get_direct_reentrant_count(),
         (unsigned long)lr1121_hal_get_level_requeue_count());
+
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  if (lastDisconnectReason != DISC_RATE_CHANGE) {
+    DBGLN("HOTPATH tick:%lu tock:%lu dio:%lu/%lu gspi:%lu/%lu/%lu "
+          "busy:%lu/%lu tlm:%lu/%lu/%lu",
+          (unsigned long)hwTimer::getMaxTickDurationUs(),
+          (unsigned long)hwTimer::getMaxTockDurationUs(),
+          (unsigned long)lr1121_hal_get_stage_max_us(),
+          (unsigned long)lr1121_hal_get_deferred_max_us(),
+          (unsigned long)lr1121_get_raw_gspi_max_us(),
+          (unsigned long)lr1121_get_raw_gspi_count(),
+          (unsigned long)lr1121_get_raw_gspi_fail_count(),
+          (unsigned long)lr1121_get_busy_fast_max_iterations(),
+          (unsigned long)lr1121_get_busy_fast_fail_count(),
+          (unsigned long)telemetryBuildMaxUs,
+          (unsigned long)telemetrySendMaxUs,
+          (unsigned long)telemetryHandleMaxUs);
+  }
+#endif
+
+#if ELRS_DIAG_LOSS_PACKET_STATS
+  if (lastDisconnectReason != DISC_RATE_CHANGE) {
+    printLossPacketStats();
+  }
+#endif
 
 #if ELRS_DIAG_PRINT_AFTER_LOSS
   if (!InBindingMode && !InWiFiMode && lastDisconnectReason != DISC_RATE_CHANGE) {
@@ -1979,6 +2045,64 @@ static volatile uint8_t lastCrcNonceExpected = 0;
 static volatile uint8_t lastCrcNonceMatched = 0xFF;
 static volatile uint32_t crcNonceDiagHitCount = 0;
 static volatile uint32_t crcNonceDiagMissCount = 0;
+static volatile uint32_t rxLqCurrentSetSkipCount = 0;
+
+static void printLossPacketStats() {
+  uint32_t isrCount = 0;
+  uint32_t rxIrqCount = 0;
+  uint32_t txIrqCount = 0;
+  uint32_t otherIrqCount = 0;
+  uint32_t lastIrq = 0;
+  lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
+                       &lastIrq);
+
+  const uint32_t deferredQueueCount =
+#if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+      telemetryDeferredQueueCount;
+#else
+      0;
+#endif
+  const uint32_t deferredSendCount =
+#if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+      telemetryDeferredSendCount;
+#else
+      0;
+#endif
+  const uint32_t deferredDropCount =
+#if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+      telemetryDeferredDropCount;
+#else
+      0;
+#endif
+
+  DBGLN("LOSSSTAT irq:%lu/%lu/%lu/%lu/0x%08lX dio:%d rxok:%lu crc:%lu skip:%lu "
+        "ok:%lu/%lu/%lu fail:%lu/%lu/%lu last:%u exp:%u/%u sync:%u/%u "
+        "freq:%lu/%lu lq:%u/%u tlm:%lu/%u/%u def:%lu/%lu/%lu rssi:%d snr:%d "
+        "lat:%lu/%lu/%lu/%lu/%lu",
+        (unsigned long)isrCount, (unsigned long)rxIrqCount,
+        (unsigned long)txIrqCount, (unsigned long)otherIrqCount,
+        (unsigned long)lastIrq, lr1121_dio1_read(),
+        (unsigned long)pkt_capture_count, (unsigned long)crcFailCount,
+        (unsigned long)rxLqCurrentSetSkipCount,
+        (unsigned long)crcPassTypeCount[PACKET_TYPE_RCDATA],
+        (unsigned long)crcPassTypeCount[PACKET_TYPE_DATA],
+        (unsigned long)crcPassTypeCount[PACKET_TYPE_SYNC],
+        (unsigned long)crcFailTypeCount[PACKET_TYPE_RCDATA],
+        (unsigned long)crcFailTypeCount[PACKET_TYPE_DATA],
+        (unsigned long)crcFailTypeCount[PACKET_TYPE_SYNC],
+        lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
+        lastValidSyncNonce, lastValidSyncFhss, (unsigned long)Radio.currFreq,
+        (unsigned long)lastValidFreq, LQCalc.getLQRaw(), LQCalc.getCount(),
+        (unsigned long)telemetryTxCount, ExpressLRS_currTlmDenom,
+        telemetryBurstMax, (unsigned long)deferredQueueCount,
+        (unsigned long)deferredSendCount, (unsigned long)deferredDropCount,
+        Radio.LastPacketRSSI, Radio.LastPacketSNRRaw,
+        (unsigned long)lastRxDoneLatencyUs,
+        (unsigned long)lastDioToDeferredUs,
+        (unsigned long)lastDeferredToRxIsrUs,
+        (unsigned long)lastRxIsrToPacketUs,
+        (unsigned long)lastPacketToCallbackUs);
+}
 
 static inline int32_t ICACHE_RAM_ATTR absI32(int32_t value) {
   return value < 0 ? -value : value;
@@ -2148,6 +2272,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 //=============================================================================
 static bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   if (LQCalc.currentIsSet() && connectionState == connected) {
+    rxLqCurrentSetSkipCount++;
 #if ELRS_DIAG_TX_TURNAROUND
     if (telemetryAwaitingRx) {
       telemetryLqSetWhileAwaitingCount++;
@@ -2495,7 +2620,12 @@ BuildTelemetryPacket(OTA_Packet_s *otaPkt,
   return true;
 }
 
-static void ICACHE_RAM_ATTR SendTelemetryPacket(OTA_Packet_s *otaPkt) {
+static void ICACHE_RAM_ATTR SendTelemetryPacket(OTA_Packet_s *otaPkt,
+                                                uint8_t diagNonce = OtaNonce,
+                                                uint8_t diagFhss = FHSSgetCurrIndex()) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t sendStartUs = micros();
+#endif
 #if ELRS_DIAG_TX_TURNAROUND
   if (telemetryAwaitingRx) {
     telemetryTxBeforeRx++;
@@ -2511,11 +2641,78 @@ static void ICACHE_RAM_ATTR SendTelemetryPacket(OTA_Packet_s *otaPkt) {
   telemetryAwaitingRx = 0;
   telemetryStaleRxReported = 0;
   telemetryStaleRxLastAgeUs = 0;
-  telemetryTxNonce = OtaNonce;
-  telemetryTxFhss = FHSSgetCurrIndex();
+  telemetryTxNonce = diagNonce;
+  telemetryTxFhss = diagFhss;
 #endif
   Radio.TXnb((uint8_t *)otaPkt, false, nullptr, SX12XX_Radio_All);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  updateHotpathMax(telemetrySendMaxUs, micros() - sendStartUs);
+#endif
 }
+
+#if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
+static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() {
+  const uint32_t primask = telemetryEnterCritical();
+  const bool hasRoom = !deferredTelemetryPending;
+  telemetryExitCritical(primask);
+  return hasRoom;
+}
+
+static bool ICACHE_RAM_ATTR QueueTelemetryPacketForTask(OTA_Packet_s *otaPkt) {
+  bool queued = false;
+  const uint32_t primask = telemetryEnterCritical();
+  if (!deferredTelemetryPending) {
+    memcpy(&deferredTelemetryPacket, otaPkt, sizeof(deferredTelemetryPacket));
+    deferredTelemetryNonce = OtaNonce;
+    deferredTelemetryFhss = FHSSgetCurrIndex();
+    deferredTelemetryPending = true;
+    telemetryDeferredQueueCount++;
+    queued = true;
+  }
+  telemetryExitCritical(primask);
+
+  if (!queued) {
+    telemetryDeferredDropCount++;
+    return false;
+  }
+
+  elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_TIMER);
+  return true;
+}
+
+static void ServiceDeferredTelemetryTx() {
+  WORD_ALIGNED_ATTR OTA_Packet_s packet = {};
+  uint8_t diagNonce = 0;
+  uint8_t diagFhss = 0;
+
+  const uint32_t primask = telemetryEnterCritical();
+  if (!deferredTelemetryPending) {
+    telemetryExitCritical(primask);
+    return;
+  }
+
+  memcpy(&packet, &deferredTelemetryPacket, sizeof(packet));
+  diagNonce = deferredTelemetryNonce;
+  diagFhss = deferredTelemetryFhss;
+  deferredTelemetryPending = false;
+  telemetryExitCritical(primask);
+
+  SendTelemetryPacket(&packet, diagNonce, diagFhss);
+  telemetryDeferredSendCount++;
+  telemetryTxCount++;
+}
+
+static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(OTA_Packet_s *otaPkt) {
+  return QueueTelemetryPacketForTask(otaPkt);
+}
+#else
+static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() { return true; }
+static void ServiceDeferredTelemetryTx() {}
+static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(OTA_Packet_s *otaPkt) {
+  SendTelemetryPacket(otaPkt);
+  return true;
+}
+#endif
 
 #if SIW917_ELRS_PREBUILD_TLM_PACKET
 static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry() {
@@ -2548,6 +2745,9 @@ static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {}
 #endif
 
 static bool ICACHE_RAM_ATTR HandleSendDataDl() {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t handleStartUs = micros();
+#endif
   if (!isTelemetrySlotForNonce(OtaNonce)) {
     return false;
   }
@@ -2561,6 +2761,14 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
   return false;
 #endif
 
+  if (!TelemetryTxQueueHasRoom()) {
+    telemetrySuppressedCount++;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
+#endif
+    return false;
+  }
+
 #if SIW917_ELRS_PREBUILD_TLM_PACKET
   if (prebuiltTelemetryValid && prebuiltTelemetryNonce == OtaNonce) {
     prebuiltTelemetryValid = false;
@@ -2569,8 +2777,14 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
       NextTelemetryType = prebuiltNextTelemetryType;
       telemetryBurstCount = prebuiltTelemetryBurstCount;
       telemetryPrebuildHitCount++;
-      SendTelemetryPacket(&prebuiltTelemetryPacket);
-      return true;
+      if (DispatchTelemetryPacket(&prebuiltTelemetryPacket)) {
+        return true;
+      }
+      telemetrySuppressedCount++;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
+#endif
+      return false;
     }
 
     telemetryPrebuildMissCount++;
@@ -2582,16 +2796,35 @@ static bool ICACHE_RAM_ATTR HandleSendDataDl() {
   uint8_t nextTelemetryType = NextTelemetryType;
   uint8_t nextTelemetryBurstCount = telemetryBurstCount;
 
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t buildStartUs = micros();
+#endif
   if (!BuildTelemetryPacket(&otaPkt, &preparedPayload, OtaNonce,
                             &nextTelemetryType, &nextTelemetryBurstCount) ||
       !TelemetrySender.CommitPreparedPayload(preparedPayload)) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    updateHotpathMax(telemetryBuildMaxUs, micros() - buildStartUs);
+    updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
+#endif
     return false;
   }
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  updateHotpathMax(telemetryBuildMaxUs, micros() - buildStartUs);
+#endif
 
   alreadyTLMresp = true;
   NextTelemetryType = nextTelemetryType;
   telemetryBurstCount = nextTelemetryBurstCount;
-  SendTelemetryPacket(&otaPkt);
+  if (!DispatchTelemetryPacket(&otaPkt)) {
+    telemetrySuppressedCount++;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
+#endif
+    return false;
+  }
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
+#endif
   return true;
 }
 
@@ -3009,9 +3242,11 @@ void elrs_loop(void) {
   // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
+  ServiceDeferredTelemetryTx();
   maybeReportStaleTelemetryRx();
   PrepareTelemetryForNextTock();
   hwTimer::service();
+  ServiceDeferredTelemetryTx();
 
   unsigned long now = millis();
 

@@ -48,6 +48,17 @@ static volatile uint16_t last_command_opcode = 0;
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
 #endif
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+static volatile uint32_t dio1_stage_max_us = 0;
+static volatile uint32_t dio1_deferred_max_us = 0;
+
+static inline void dio1UpdateMax(volatile uint32_t &maxValue,
+                                 uint32_t durationUs) {
+  if (durationUs > maxValue) {
+    maxValue = durationUs;
+  }
+}
+#endif
 
 extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
@@ -265,10 +276,24 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     handled_hot_command = true;
   }
 #endif
+#if SIW917_ELRS_RAW_GSPI_SET_FREQ
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC) {
+    command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
+#if SIW917_ELRS_RAW_GSPI_SET_FREQ_RX
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_FREQ_SET_RX) {
+    command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
 #if SIW917_ELRS_POLLED_HOT_SPI
   if (!handled_hot_command &&
       (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX ||
-       opcode == LR11XX_RADIO_SET_RX_OC)) {
+       opcode == LR11XX_RADIO_SET_RX_OC ||
+       opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC ||
+       opcode == LR11XX_RADIO_SET_FREQ_SET_RX)) {
     command_ok = lr1121_send_command_polled_pub(opcode, tx_buffer, size);
     handled_hot_command = true;
   }
@@ -491,7 +516,13 @@ static void dio1StageIrqHandler() {
   dio1_direct_count++;
   dio1_last_deferred_us = micros();
   dio1_isr_processing = true;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  const uint32_t processStartUs = micros();
+#endif
   processDio1IrqNow();
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  dio1UpdateMax(dio1_stage_max_us, micros() - processStartUs);
+#endif
   dio1_isr_processing = false;
 
   lr1121_dio1_resume_isr();
@@ -577,6 +608,22 @@ extern "C" uint32_t lr1121_hal_get_level_requeue_count(void) {
   return dio1_level_requeue_count;
 }
 
+extern "C" uint32_t lr1121_hal_get_stage_max_us(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return dio1_stage_max_us;
+#else
+  return 0;
+#endif
+}
+
+extern "C" uint32_t lr1121_hal_get_deferred_max_us(void) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+  return dio1_deferred_max_us;
+#else
+  return 0;
+#endif
+}
+
 void LR1121Hal::dioISR_1() {
   dio1_last_edge_us = micros();
   isr_1_total_count++;
@@ -657,7 +704,13 @@ void LR1121Hal::handleDeferredISR() {
     // Call the ISR callback from task context. On SiW917, explicitly clear and
     // re-arm after RX-side IRQs so DIO1 cannot remain asserted and starve the
     // ELRS loop after the first real packet.
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    const uint32_t processStartUs = micros();
+#endif
     processDio1IrqNow();
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    dio1UpdateMax(dio1_deferred_max_us, micros() - processStartUs);
+#endif
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
