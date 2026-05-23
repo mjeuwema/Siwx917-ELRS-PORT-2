@@ -3,6 +3,7 @@
 #include "LR1121_hal.h"
 #include "logging.h"
 #include "lr1121_transceiver_F30104.h"
+#include "siw917_elrs_timing.h"
 
 // C functions from lr1121_driver.c
 extern "C" {
@@ -104,6 +105,7 @@ void ICACHE_RAM_ATTR CopyCodec::decode(uint8_t *out, uint8_t *in,
 LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
   rxContinuousActive = false;
+  txInProgress = false;
   instance = this;
   strongestReceivingRadio = SX12XX_Radio_1;
   fallBackMode = LR1121_MODE_FS;
@@ -586,12 +588,14 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
   case LR1121_MODE_SLEEP:
     // 2.1.5.1 SetSleep
     rxContinuousActive = false;
+    txInProgress = false;
     hal.WriteCommand(LR11XX_SYSTEM_SET_SLEEP_OC, buf, 5, radioNumber);
     break;
 
   case LR1121_MODE_STDBY_RC:
     // 2.1.2.1 SetStandby
     rxContinuousActive = false;
+    txInProgress = false;
     buf[0] = 0x00;
     hal.WriteCommand(LR11XX_SYSTEM_SET_STANDBY_OC, buf, 1, radioNumber);
     break;
@@ -599,6 +603,7 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
   case LR1121_MODE_STDBY_XOSC:
     // 2.1.2.1 SetStandby
     rxContinuousActive = false;
+    txInProgress = false;
     buf[0] = 0x01;
     hal.WriteCommand(LR11XX_SYSTEM_SET_STANDBY_OC, buf, 1, radioNumber);
     break;
@@ -606,6 +611,7 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
   case LR1121_MODE_FS:
     // 2.1.9.1 SetFs
     rxContinuousActive = false;
+    txInProgress = false;
     hal.WriteCommand(LR11XX_SYSTEM_SET_FS_OC, radioNumber);
     break;
 
@@ -621,12 +627,14 @@ void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
     buf[2] = 0xFF; // Continuous RX
     hal.WriteCommand(LR11XX_RADIO_SET_RX_OC, buf, 3, radioNumber);
     rxContinuousActive = true;
+    txInProgress = false;
     break;
   }
 
   case LR1121_MODE_TX:
     // Table 7-3: SetTx Command
     rxContinuousActive = false;
+    txInProgress = true;
     hal.WriteCommand(LR11XX_RADIO_SET_TX_OC, buf, 3, radioNumber);
     break;
 
@@ -736,6 +744,13 @@ void LR1121Driver::SetDioIrqParams() {
 
 uint32_t ICACHE_RAM_ATTR
 LR1121Driver::GetIrqStatus(SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_FAST_CLEAR_IRQ
+  uint32_t irqStatus = 0;
+  if (lr1121_clear_irq_status_fast(0xFFFFFFFFU, &irqStatus)) {
+    return irqStatus;
+  }
+#endif
+
   uint8_t status[6] = {0};
 
   // Upstream ELRS hack: Send ClearIrq (0x0114) with mask 0xFFFFFFFF.
@@ -759,8 +774,24 @@ LR1121Driver::GetIrqStatus(SX12XX_Radio_Number_t radioNumber) {
 
 void ICACHE_RAM_ATTR
 LR1121Driver::ClearIrqStatus(SX12XX_Radio_Number_t radioNumber) {
+  ClearIrqStatusMask(0xFFFFFFFFU, radioNumber);
+}
+
+void ICACHE_RAM_ATTR LR1121Driver::ClearIrqStatusMask(
+    uint32_t irqMask, SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_FAST_CLEAR_IRQ
+  if (lr1121_clear_irq_status_fast(irqMask, nullptr)) {
+    return;
+  }
+#endif
+
   // Clear IRQ status command (0x0114) takes 4 bytes of masks
-  uint8_t buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  uint8_t buf[4] = {
+      (uint8_t)(irqMask >> 24),
+      (uint8_t)(irqMask >> 16),
+      (uint8_t)(irqMask >> 8),
+      (uint8_t)irqMask,
+  };
   hal.WriteCommand(LR11XX_SYSTEM_CLEAR_IRQ_OC, buf, sizeof(buf), radioNumber);
 }
 
@@ -769,6 +800,7 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
   endTX = micros();
   DBGLN("TOA: %d", endTX - beginTX);
 #endif
+  txInProgress = false;
   CommitOutputPower();
   TXdoneCallback();
 }
@@ -793,6 +825,7 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnb(
     return;
   }
 
+  txInProgress = true;
   rxContinuousActive = false;
 
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
@@ -978,6 +1011,23 @@ bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
 }
 
 void LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_RX_FIRST_TXDONE
+  if (instance->txInProgress) {
+    isrCallCount++;
+    txDoneCount++;
+    lastIrqStatus = LR1121_IRQ_TX_DONE;
+    instance->processingPacketRadio = radioNumber;
+    instance->TXnbISR();
+    instance->ClearIrqStatusMask(LR1121_IRQ_TX_DONE, radioNumber);
+    if (GPIO_PIN_NSS_2 != UNDEF_PIN) {
+      const SX12XX_Radio_Number_t otherRadioNumber =
+          radioNumber == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
+      instance->ClearIrqStatusMask(LR1121_IRQ_TX_DONE, otherRadioNumber);
+    }
+    return;
+  }
+#endif
+
   uint32_t irqStatus = instance->GetIrqStatus(radioNumber);
 
   // Delegate to the version that takes pre-read status

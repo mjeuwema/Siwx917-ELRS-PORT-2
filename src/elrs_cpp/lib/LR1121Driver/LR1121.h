@@ -83,6 +83,7 @@ private:
   // LR1121_RadioOperatingModes_t currOpmode;
   bool useFSK;
   bool rxContinuousActive;
+  volatile bool txInProgress;
   bool modeSupportsFei;
   uint8_t pwrCurrentLF;
   uint8_t pwrPendingLF;
@@ -119,6 +120,7 @@ private:
 
   void SetDioIrqParams();
   void SetDioAsRfSwitch();
+  void ClearIrqStatusMask(uint32_t irqMask, SX12XX_Radio_Number_t radioNumber);
   void CorrectRegisterForSF6(uint8_t sf, SX12XX_Radio_Number_t radioNumber);
 
   static void IsrCallback(SX12XX_Radio_Number_t radioNumber);

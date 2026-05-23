@@ -65,6 +65,20 @@ extern RXtimerState_e RXtimerState;
 
 static bool dio1StageInit();
 
+static inline bool handleBusyTimeout(const char *context, uint16_t opcode,
+                                     uint8_t size) {
+  busy_timeout_count++;
+#if SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT
+  (void)context;
+  (void)opcode;
+  (void)size;
+  return true;
+#else
+  DBGLN("%s BUSY timeout (opcode=0x%04X size=%u)", context, opcode, size);
+  return false;
+#endif
+}
+
 // Static instance pointer
 LR1121Hal *LR1121Hal::instance = nullptr;
 
@@ -130,10 +144,12 @@ void LR1121Hal::init() {
 
   DBGLN("LR1121Hal DIO hot path: %s",
         SIW917_ELRS_TWO_STAGE_DIO_ISR
-            ? (dioStageReady ? "two-stage-connected-only"
-                             : "two-stage-fallback-task")
-            : (SIW917_ELRS_DIRECT_DIO_ISR ? "direct-when-connected"
-                                           : "deferred-task"));
+            ? (dioStageReady ? (SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
+                                    ? "hybrid-direct-locked"
+                                    : "two-stage-link-active")
+                              : "two-stage-fallback-task")
+            : (SIW917_ELRS_DIRECT_DIO_ISR ? "direct-when-link-active"
+                                            : "deferred-task"));
   DBGLN("LR1121Hal initialized");
 }
 
@@ -188,9 +204,8 @@ void LR1121Hal::WriteCommand(uint16_t opcode,
   }
 #endif
 
-  if (!WaitOnBusy(radioNumber)) {
-    busy_timeout_count++;
-    DBGLN("WriteCommand BUSY timeout (opcode=0x%04X)", opcode);
+  if (!WaitOnBusy(radioNumber) &&
+      !handleBusyTimeout("WriteCommand", opcode, 0)) {
     return;
   }
 
@@ -256,16 +271,43 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
   }
 #endif
 
-  if (!WaitOnBusy(radioNumber)) {
-    busy_timeout_count++;
-    DBGLN("WriteCommand BUSY timeout (opcode=0x%04X)", opcode);
+  bool command_ok = false;
+  bool handled_hot_command = false;
+
+#if SIW917_ELRS_FAST_HOT_COMMANDS
+#if SIW917_ELRS_RAW_GSPI_TX
+  if (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX) {
+    command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
+    handled_hot_command = command_ok;
+  }
+#endif
+#if SIW917_ELRS_RAW_GSPI_SET_RX
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RX_OC) {
+    command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
+    handled_hot_command = command_ok;
+  }
+#endif
+#if SIW917_ELRS_RAW_GSPI_SET_FREQ
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC) {
+    command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
+    handled_hot_command = command_ok;
+  }
+#endif
+#if SIW917_ELRS_RAW_GSPI_SET_FREQ_RX
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_FREQ_SET_RX) {
+    command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
+    handled_hot_command = command_ok;
+  }
+#endif
+#endif
+
+  if (!handled_hot_command && !WaitOnBusy(radioNumber) &&
+      !handleBusyTimeout("WriteCommand", opcode, size)) {
     return;
   }
 
-  bool command_ok = false;
-  bool handled_hot_command = false;
 #if SIW917_ELRS_RAW_GSPI_TX
-  if (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX) {
+  if (!handled_hot_command && opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX) {
     command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
     handled_hot_command = true;
   }
@@ -346,10 +388,10 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
         return;
       }
       memcpy(tx_buffer, buffer, size);
-      if (!WaitOnBusy(radioNumber)) {
-        busy_timeout_count++;
-        DBGLN("ReadCommand BUSY timeout before inline opcode=0x%04X size=%u",
-              inline_opcode, size);
+      if (!WaitOnBusy(radioNumber) &&
+          !handleBusyTimeout("ReadCommand inline", inline_opcode, size)) {
+        memset(buffer, 0, size);
+        last_command_opcode = inline_opcode;
         return;
       }
       lr1121_cs_assert();
@@ -365,6 +407,7 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
       if (!ok) {
         DBGLN("ReadCommand inline transfer failed opcode=0x%04X size=%u",
               inline_opcode, size);
+        memset(buffer, 0, size);
       }
       last_command_opcode = inline_opcode;
       return;
@@ -382,10 +425,11 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
     return;
   }
 
-  if (!WaitOnBusy(radioNumber)) {
-    busy_timeout_count++;
-    DBGLN("ReadCommand BUSY timeout after opcode=0x%04X size=%u",
-          last_command_opcode, size);
+  if (!WaitOnBusy(radioNumber) &&
+      !handleBusyTimeout("ReadCommand", last_command_opcode, size)) {
+    if (buffer != nullptr && size > 0) {
+      memset(buffer, 0, size);
+    }
     return;
   }
 
@@ -393,6 +437,7 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
       !lr1121_read_response(buffer, size)) {
     DBGLN("ReadCommand failed after opcode=0x%04X size=%u",
           last_command_opcode, size);
+    memset(buffer, 0, size);
   }
 }
 
@@ -404,12 +449,13 @@ bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
   // We only support single radio (Radio_1)
   (void)radioNumber;
 
-  if (lr1121_wait_busy_fast(SIW917_ELRS_BUSY_FAST_ITERATIONS)) {
+  if (lr1121_wait_busy_fast_us(SIW917_ELRS_BUSY_FAST_US)) {
     return true;
   }
 
 #if SIW917_ELRS_BUSY_FAST_ONLY_WHEN_CONNECTED
-  if (connectionState == connected || RXtimerState == tim_locked) {
+  if (connectionState == tentative || connectionState == connected ||
+      RXtimerState == tim_locked) {
     return false;
   }
 #endif
@@ -459,26 +505,29 @@ static inline void dio1StageExitCritical(uint32_t primask) {
 }
 #endif
 
-static inline bool dio1DirectPathAllowed() {
+static inline bool dio1StagePathAllowed() {
 #if SIW917_ELRS_DIRECT_DIO_ISR
-  return connectionState == connected;
+  return connectionState == tentative || connectionState == connected;
+#else
+  return false;
+#endif
+}
+
+static inline bool dio1GpioDirectPathAllowed() {
+#if SIW917_ELRS_DIRECT_DIO_ISR
+  return connectionState == connected && RXtimerState == tim_locked;
 #else
   return false;
 #endif
 }
 
 static void processDio1IrqNow() {
-  // Match the LR1121 driver's ISR callback path, but keep the IRQ status read
-  // in one place so direct and deferred handling cannot drift apart.
+  // Keep SiW917 on the LR1121 driver's normal ISR path. That path has a
+  // TX-in-progress fast branch which re-arms RX before the IRQ-status read,
+  // preserving the narrow 150 Hz telemetry turn-around window.
   if (LR1121Hal::instance && LR1121Hal::instance->IsrCallback_1) {
     LR1121Driver::instance = &Radio;
-    uint32_t irqStatus = Radio.GetIrqStatus(SX12XX_Radio_1);
-    LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_1, irqStatus);
-    if (irqStatus != 0 && !(irqStatus & (LR1121_IRQ_TX_DONE |
-                                         LR1121_IRQ_RX_DONE |
-                                         LR1121_IRQ_TIMEOUT))) {
-      Radio.ClearIrqStatus(SX12XX_Radio_1);
-    }
+    LR1121Hal::instance->IsrCallback_1();
   }
 }
 
@@ -492,7 +541,7 @@ static void dio1StageIrqHandler() {
   NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
   dio1_stage_irq_count++;
 
-  if (!dio1DirectPathAllowed()) {
+  if (!dio1StagePathAllowed()) {
     dio1_isr_pending = true;
     isr_1_pending = true;
     elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
@@ -531,7 +580,11 @@ static void dio1StageIrqHandler() {
     dio1_isr_pending = true;
     isr_1_pending = true;
     lr1121_dio1_pause_isr();
-    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    if (dio1StagePathAllowed()) {
+      dio1PendStageFromIsr();
+    } else {
+      elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    }
   }
 }
 
@@ -581,7 +634,7 @@ static bool dio1StageInit() {
   return true;
 }
 #else
-static bool dio1StageInit() { return false; }
+[[maybe_unused]] static bool dio1StageInit() { return false; }
 #endif
 
 extern "C" uint32_t lr1121_hal_get_last_dio1_edge_us(void) {
@@ -632,9 +685,43 @@ void LR1121Hal::dioISR_1() {
   dio1_isr_pending = true;
   isr_1_pending = true;
 
-  // The real GPIO ISR is now edge-capture only. Keep it safe to raise above
-  // FreeRTOS later by avoiding OS APIs and LR1121 SPI here.
   lr1121_dio1_pause_isr();
+#if SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
+  if (dio1_stage_irq_installed && dio1GpioDirectPathAllowed()) {
+    if (dio1_isr_processing) {
+      dio1_direct_reentrant_count++;
+      dio1PendStageFromIsr();
+      return;
+    }
+
+    dio1_isr_pending = false;
+    isr_1_pending = false;
+    dio1_direct_count++;
+    dio1_last_deferred_us = dio1_last_edge_us;
+    dio1_isr_processing = true;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    const uint32_t processStartUs = micros();
+#endif
+    processDio1IrqNow();
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    dio1UpdateMax(dio1_stage_max_us, micros() - processStartUs);
+#endif
+    dio1_isr_processing = false;
+
+    lr1121_dio1_resume_isr();
+    if (lr1121_dio1_read() != 0) {
+      dio1_level_requeue_count++;
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+      lr1121_dio1_pause_isr();
+      dio1PendStageFromIsr();
+    }
+    return;
+  }
+#endif
+
+  // Disconnected/scanning and recovery stay on the stage IRQ so the GPIO IRQ
+  // never calls FreeRTOS APIs from its higher priority.
   if (dio1_stage_irq_installed) {
     dio1PendStageFromIsr();
   } else {
@@ -643,7 +730,7 @@ void LR1121Hal::dioISR_1() {
   return;
 #endif
 
-  if (dio1DirectPathAllowed()) {
+  if (dio1GpioDirectPathAllowed()) {
     if (dio1_isr_processing) {
       dio1_direct_reentrant_count++;
       dio1_isr_pending = true;

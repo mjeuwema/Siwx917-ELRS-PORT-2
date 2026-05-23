@@ -83,13 +83,13 @@ void elrs_enter_binding_mode(void);
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM 0
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL 0
-#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 0
+#define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP 1
 #define ELRS_DIAG_CRC_NONCE_WINDOW 0
-#define ELRS_DIAG_TX_TURNAROUND 0
+#define ELRS_DIAG_TX_TURNAROUND 1
 #define ELRS_DIAG_TLM_RATE_LOG 0
 #define ELRS_DIAG_TLM_STALE_RX 0
-#define ELRS_DIAG_TLM150_SNAPSHOT 0
-#define ELRS_DIAG_RATE_CHANGE_LOG 0
+#define ELRS_DIAG_TLM150_SNAPSHOT 1
+#define ELRS_DIAG_RATE_CHANGE_LOG 1
 #define ELRS_DIAG_PERIODIC_STATS 0
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
 #define ELRS_DIAG_PRINT_AFTER_LOSS 0
@@ -170,8 +170,8 @@ LPF LPF_UplinkRSSI0(5);
 LPF LPF_UplinkRSSI1(5);
 
 // Timing variables
-uint32_t LastValidPacket = 0;
-uint32_t LastSyncPacket = 0;
+volatile uint32_t LastValidPacket = 0;
+volatile uint32_t LastSyncPacket = 0;
 static uint32_t RFmodeLastCycled = 0;
 static uint8_t RFmodeCycleMultiplier = 1;
 static bool LockRFmode = false;
@@ -208,6 +208,23 @@ enum DisconnectReason : uint8_t {
 };
 
 static volatile DisconnectReason lastDisconnectReason = DISC_NONE;
+
+static const char *disconnectReasonName(DisconnectReason reason) {
+  switch (reason) {
+  case DISC_NONE:
+    return "none";
+  case DISC_RX_LOCK_TIMEOUT:
+    return "rx-lock-timeout";
+  case DISC_PACKET_TIMEOUT:
+    return "packet-timeout";
+  case DISC_RATE_CHANGE:
+    return "rate-change";
+  case DISC_EXTERNAL:
+    return "external";
+  default:
+    return "unknown";
+  }
+}
 #if ELRS_DIAG_PRINT_AFTER_LOSS
 static volatile bool diagPrintAfterLossPending = false;
 #endif
@@ -232,6 +249,8 @@ static bool telemBurstValid = false;
 static bool alreadyTLMresp = false;
 static volatile uint32_t telemetryTxCount = 0;
 static volatile uint32_t telemetrySuppressedCount = 0;
+static volatile uint32_t telemetryRcConfirmCount = 0;
+static volatile bool telemetryLastRcConfirm = false;
 static volatile uint32_t telemetryDataUlAckCount = 0;
 static volatile bool telemetryLastDataUlAck = false;
 static volatile uint32_t dataUlChunkCount = 0;
@@ -316,6 +335,7 @@ static uint32_t telemetry150DiagArmMs = 0;
 static uint32_t telemetry150DiagArmTxCount = 0;
 static uint32_t telemetry150DiagArmRxAfterTx = 0;
 static uint32_t telemetry150DiagArmTxBeforeRx = 0;
+static uint32_t telemetry150DiagArmRcConfirm = 0;
 static uint32_t telemetry150DiagArmDataUlAck = 0;
 #endif
 #endif
@@ -1729,9 +1749,10 @@ static void LostConnection(bool resumeRx) {
     lastDisconnectReason = DISC_EXTERNAL;
   }
 
-  DBGLN("LostConnection reason=%u age=%lu pfd raw=%ld norm=%ld off=%ld dx=%ld phase=%ld "
+  DBGLN("LostConnection reason=%u/%s age=%lu pfd raw=%ld norm=%ld off=%ld dx=%ld phase=%ld "
         "fo=%ld nonce=%u fhss=%u dio:%lu/%lu/%lu",
         (unsigned)lastDisconnectReason,
+        disconnectReasonName(lastDisconnectReason),
         (unsigned long)(millis() - LastValidPacket),
         (long)pfdLastRawOffset, (long)pfdLastNormalizedOffset,
         (long)pfdLastOffset, (long)pfdLastOffsetDx, (long)pfdLastPhaseShift,
@@ -1741,7 +1762,7 @@ static void LostConnection(bool resumeRx) {
         (unsigned long)lr1121_hal_get_level_requeue_count());
 
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
-  if (lastDisconnectReason != DISC_RATE_CHANGE) {
+  if (lastDisconnectReason != DISC_RATE_CHANGE || ELRS_DIAG_RATE_CHANGE_LOG) {
     DBGLN("HOTPATH tick:%lu tock:%lu dio:%lu/%lu gspi:%lu/%lu/%lu "
           "busy:%lu/%lu tlm:%lu/%lu/%lu",
           (unsigned long)hwTimer::getMaxTickDurationUs(),
@@ -1930,6 +1951,10 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
 
   bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
   TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
+  telemetryLastRcConfirm = telemetryConfirmValue;
+  if (telemetryConfirmValue) {
+    telemetryRcConfirmCount++;
+  }
   InvalidatePrebuiltTelemetry();
 
   // Notify callback if registered
@@ -2400,6 +2425,7 @@ static void maybePrintTelemetry150Snapshot(unsigned long now) {
     telemetry150DiagArmTxCount = telemetryTxCount;
     telemetry150DiagArmRxAfterTx = telemetryRxAfterTx;
     telemetry150DiagArmTxBeforeRx = telemetryTxBeforeRx;
+    telemetry150DiagArmRcConfirm = telemetryRcConfirmCount;
     telemetry150DiagArmDataUlAck = telemetryDataUlAckCount;
   }
 
@@ -2447,7 +2473,7 @@ static void maybePrintTelemetry150Snapshot(unsigned long now) {
       (int32_t)interval - (int32_t)telemetryTxToRxnbDoneUs;
   DBGLN("TLMFAST_TX age:%lu tx:%lu interval:%lu fit:%ld den:%u burst:%u "
         "active:%u st:%u wait:%u/%u t2d:%lu d2rx:%lu tx2rx:%lu rxok:%lu "
-        "miss:%lu pend:%u overlap:%lu ok:%lu ack:%lu/%u tx:%u/%u rx:%u/%u "
+        "miss:%lu pend:%u overlap:%lu ok:%lu rcack:%lu/%u ulack:%lu/%u tx:%u/%u rx:%u/%u "
         "lq:%u/%u dio:%lu/%lu/%lu",
         (unsigned long)elapsedMs, (unsigned long)txDelta,
         (unsigned long)interval, (long)fitUs, ExpressLRS_currTlmDenom,
@@ -2461,6 +2487,8 @@ static void maybePrintTelemetry150Snapshot(unsigned long now) {
         (unsigned long)telemetryMissedAfterTx, telemetryAwaitingRx,
         (unsigned long)(telemetryTxBeforeRx - telemetry150DiagArmTxBeforeRx),
         (unsigned long)(telemetryRxAfterTx - telemetry150DiagArmRxAfterTx),
+        (unsigned long)(telemetryRcConfirmCount - telemetry150DiagArmRcConfirm),
+        telemetryLastRcConfirm ? 1 : 0,
         (unsigned long)(telemetryDataUlAckCount - telemetry150DiagArmDataUlAck),
         telemetryLastDataUlAck ? 1 : 0, telemetryTxNonce, telemetryTxFhss,
         telemetryRxNonce, telemetryRxFhss, LQCalc.getLQRaw(), LQCalc.getCount(),
@@ -3679,13 +3707,12 @@ void elrs_loop(void) {
   }
 
   // Connection timeout check
-  if (connectionState == connected) {
-    uint32_t disconnectTimeout =
-        ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs;
-    if ((now - LastValidPacket) > disconnectTimeout) {
-      lastDisconnectReason = DISC_PACKET_TIMEOUT;
-      LostConnection(true);
-    }
+  const uint32_t localLastValidPacket = LastValidPacket;
+  if ((connectionState == connected) &&
+      ((int32_t)ExpressLRS_currAirRate_RFperfParams->DisconnectTimeoutMs <
+       (int32_t)(now - localLastValidPacket))) {
+    lastDisconnectReason = DISC_PACKET_TIMEOUT;
+    LostConnection(true);
   }
 
   // Rate change handling
@@ -3696,9 +3723,11 @@ void elrs_loop(void) {
     DBGLN("Req air rate change %u->%u",
           (unsigned)ExpressLRS_currAirRate_Modparams->index,
           (unsigned)requestedRateIndex);
-    DBGLN("RATECHG_TLM tx:%lu ack:%lu/%u den:%u burst:%u state:%u wait:%u/%u "
+    DBGLN("RATECHG_TLM tx:%lu rcack:%lu/%u ulack:%lu/%u den:%u burst:%u state:%u wait:%u/%u "
           "last:%u exp:%u/%u sync:%u/%u lq:%u/%u",
           (unsigned long)telemetryTxCount,
+          (unsigned long)telemetryRcConfirmCount,
+          telemetryLastRcConfirm ? 1 : 0,
           (unsigned long)telemetryDataUlAckCount,
           telemetryLastDataUlAck ? 1 : 0, ExpressLRS_currTlmDenom,
           telemetryBurstMax, (unsigned)TelemetrySender.GetState(),
