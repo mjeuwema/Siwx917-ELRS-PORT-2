@@ -170,6 +170,26 @@
 #endif
 
 /*
+ * Disconnected scan diagnostics. These print from task context only while the
+ * receiver is not connected, so they help distinguish "no RF IRQs" from
+ * "packets received but CRC rejected" without adding connected hot-path load.
+ */
+#ifndef SIW917_ELRS_DISCONNECTED_SCAN_DIAG
+#define SIW917_ELRS_DISCONNECTED_SCAN_DIAG 0
+#endif
+
+/*
+ * The upstream scan interval can be very short for K1000-class modes
+ * (FCC915 index 0 computes to about 88 ms). On SiW917, rate reconfigure and
+ * task/IRQ handoff jitter can make that too narrow to reliably catch a sync
+ * packet, so keep high-rate scan dwell long enough to span multiple sync
+ * opportunities without slowing lower-rate scans.
+ */
+#ifndef SIW917_ELRS_SCAN_MIN_DWELL_MS
+#define SIW917_ELRS_SCAN_MIN_DWELL_MS 250U
+#endif
+
+/*
  * Keep PFD extEvent timestamping aligned with upstream RX: ProcessRFPacket()
  * samples beginProcessing after the radio IRQ path has read/handled the
  * packet, then adds PACKET_TO_TOCK_SLACK. The raw GPIO/DIO edge is useful for

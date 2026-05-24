@@ -94,7 +94,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_TLM_STALE_RX 0
 #define ELRS_DIAG_TLM150_SNAPSHOT (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_RATE_CHANGE_LOG (!SIW917_ELRS_TIMING_TEST_BUILD)
-#define ELRS_DIAG_PERIODIC_STATS 0
+#define ELRS_DIAG_PERIODIC_STATS SIW917_ELRS_DISCONNECTED_SCAN_DIAG
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
 #define ELRS_DIAG_PRINT_AFTER_LOSS 0
 #define ELRS_DIAG_LOSS_PACKET_STATS 1
@@ -371,10 +371,6 @@ static volatile uint32_t luaDiscoveryPingCount = 0;
 // Raw SNR is kept for diagnostics; OTA link stats use SnrMean like upstream.
 static int8_t lastSnrRaw = 0;
 
-// Reserved local sentinel for future "match TX power" config support. Normal
-// NVM config currently stores fixed dBm values, so existing configs are intact.
-#define ELRS_TX_POWER_MATCH_TX_DBM ((int8_t)-128)
-
 static int8_t crsfPowerToDbm(uint8_t crsfPower) {
   switch (crsfPower) {
   case 1:
@@ -398,13 +394,42 @@ static int8_t crsfPowerToDbm(uint8_t crsfPower) {
   }
 }
 
+static constexpr int8_t RX_TLM_POWER_DBM_BY_SELECTION[] = {
+    10, 14, 17, 20, 24, 27, 30, 33,
+};
+static constexpr uint8_t RX_TLM_POWER_MATCH_TX_SELECTION =
+    (uint8_t)(sizeof(RX_TLM_POWER_DBM_BY_SELECTION) /
+              sizeof(RX_TLM_POWER_DBM_BY_SELECTION[0]));
+static constexpr char RX_TLM_POWER_OPTIONS[] =
+    "10;25;50;100;250;500;1000;2000;MatchTX";
+
+static int8_t rxTlmPowerSelectionToDbm(uint8_t selection) {
+  if (selection >= RX_TLM_POWER_MATCH_TX_SELECTION) {
+    return ELRS_TX_POWER_MATCH_TX_DBM;
+  }
+
+  return RX_TLM_POWER_DBM_BY_SELECTION[selection];
+}
+
+static uint8_t rxTlmPowerDbmToSelection(int8_t dbm) {
+  if (dbm == ELRS_TX_POWER_MATCH_TX_DBM) {
+    return RX_TLM_POWER_MATCH_TX_SELECTION;
+  }
+
+  for (uint8_t i = 0; i < RX_TLM_POWER_MATCH_TX_SELECTION; ++i) {
+    if (RX_TLM_POWER_DBM_BY_SELECTION[i] == dbm) {
+      return i;
+    }
+  }
+
+  return 3; // 100 mW / 20 dBm default.
+}
+
 static void updateRxDownlinkPower(bool initialize) {
-  static int8_t appliedDbm = 127;
-  static bool appliedMatchTx = false;
-  static uint8_t appliedMatchedCrsfPower = 0;
+  static int8_t requestedDbm = 127;
 
   const elrs_config_t *cfg = elrs_config_get();
-  int8_t desiredDbm = cfg ? cfg->tx_power : 10;
+  int8_t desiredDbm = cfg ? cfg->tx_power : ELRS_TX_POWER_DEFAULT_DBM;
   const bool matchTxPower = (desiredDbm == ELRS_TX_POWER_MATCH_TX_DBM);
   uint8_t matchedCrsfPower = 0;
 
@@ -414,26 +439,23 @@ static void updateRxDownlinkPower(bool initialize) {
       if (!initialize) {
         return;
       }
-      desiredDbm = 10;
+      desiredDbm = ELRS_TX_POWER_DEFAULT_DBM;
     } else {
       desiredDbm = crsfPowerToDbm(matchedCrsfPower);
     }
   }
 
-  if (!initialize && desiredDbm == appliedDbm &&
-      matchTxPower == appliedMatchTx &&
-      matchedCrsfPower == appliedMatchedCrsfPower) {
+  if (!initialize && desiredDbm == requestedDbm) {
     return;
   }
 
-  appliedDbm = desiredDbm;
-  appliedMatchTx = matchTxPower;
-  appliedMatchedCrsfPower = matchedCrsfPower;
+  requestedDbm = desiredDbm;
 
-  // Program both LR1121 PA tables; Config()/TXnbISR commits the active band.
+  // Program both LR1121 PA tables. On SiW917 the pending value is committed
+  // just before the next telemetry TX instead of from TX_DONE.
   Radio.SetOutputPower(desiredDbm, true);
   Radio.SetOutputPower(desiredDbm, false);
-  DBGLN("RX downlink power request: %d dBm%s", desiredDbm,
+  DBGLN("RX downlink power scheduled: %d dBm%s", desiredDbm,
         matchTxPower ? " (matching TX)" : "");
 }
 
@@ -472,7 +494,8 @@ enum RxLuaParamId : uint8_t {
   RX_LUA_PARAM_MODEL_ID = 12,
   RX_LUA_PARAM_TLM_RATIO = 13,
   RX_LUA_PARAM_VERSION = 14,
-  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_VERSION,
+  RX_LUA_PARAM_TLM_POWER = 15,
+  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_TLM_POWER,
 };
 
 static char rxLuaModelIdValue[8] = "Off";
@@ -1032,6 +1055,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
           RX_LUA_PARAM_BIND_STORAGE,
           RX_LUA_PARAM_BIND,
           RX_LUA_PARAM_MODEL_ID,
+          RX_LUA_PARAM_TLM_POWER,
           RX_LUA_PARAM_TLM_RATIO,
           RX_LUA_PARAM_VERSION,
           0xFF,
@@ -1136,6 +1160,16 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     options = rxLuaModelIdOptions();
     selectionValue =
         rxLuaModelIdToSelection(cfg != nullptr ? cfg->model_id : modelMatchId);
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_TLM_POWER:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "Tlm Power";
+    options = RX_TLM_POWER_OPTIONS;
+    units = "mW";
+    selectionValue =
+        rxTlmPowerDbmToSelection(cfg != nullptr ? cfg->tx_power
+                                                : ELRS_TX_POWER_DEFAULT_DBM);
     selectionMax = selectionOptionMax(options);
     break;
   case RX_LUA_PARAM_TLM_RATIO:
@@ -1347,6 +1381,13 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
     if (cfg != nullptr) {
       cfg->model_id = rxLuaSelectionToModelId(arg);
       modelMatchId = cfg->model_id;
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_TLM_POWER:
+    if (cfg != nullptr) {
+      cfg->tx_power = rxTlmPowerSelectionToDbm(arg);
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
@@ -3043,6 +3084,10 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, uint8_t diagNonce = OtaNonce,
   telemetryTxNonce = diagNonce;
   telemetryTxFhss = diagFhss;
 #endif
+  if (Radio.HasPendingOutputPower()) {
+    Radio.SetTxIdleMode();
+    Radio.CommitOutputPowerForNextTx();
+  }
   Radio.TXnb((uint8_t *)otaPkt, false, nullptr, SX12XX_Radio_All);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   updateHotpathMax(telemetrySendMaxUs, micros() - sendStartUs);
@@ -3364,14 +3409,20 @@ static void cycleRfMode() {
 
   uint32_t now = millis();
 
-  if ((now - RFmodeLastCycled) > (cycleInterval * RFmodeCycleMultiplier)) {
+  const uint32_t requestedDwellMs = cycleInterval * RFmodeCycleMultiplier;
+  const uint32_t dwellMs =
+      requestedDwellMs < SIW917_ELRS_SCAN_MIN_DWELL_MS
+          ? SIW917_ELRS_SCAN_MIN_DWELL_MS
+          : requestedDwellMs;
+
+  if ((now - RFmodeLastCycled) > dwellMs) {
     RFmodeLastCycled = now;
     LastSyncPacket = now;
 
     const uint8_t currentScanIndex = scanIndex % RATE_MAX;
-    DBGLN("cycleRfMode begin: scan=%u interval=%lu multiplier=%u",
+    DBGLN("cycleRfMode begin: scan=%u interval=%lu dwell=%lu multiplier=%u",
           currentScanIndex, (unsigned long)cycleInterval,
-          (unsigned)RFmodeCycleMultiplier);
+          (unsigned long)dwellMs, (unsigned)RFmodeCycleMultiplier);
     SetRFLinkRate(currentScanIndex, false);
     LQCalc.reset100();
 
@@ -3689,6 +3740,7 @@ void elrs_loop(void) {
     uint32_t lastIrq = 0;
     lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
                          &lastIrq);
+    int8_t instantRssi = 0;
     if (isrCount == 0 && connectionState == disconnected) {
       uint8_t stat1 = 0;
       uint8_t stat2 = 0;
@@ -3698,9 +3750,13 @@ void elrs_loop(void) {
       lastRadioStat2 = stat2;
       lastRadioIrqByte = irq;
     }
+    if (connectionState == disconnected) {
+      Radio.StartRssiInst(SX12XX_Radio_1);
+      instantRssi = Radio.GetRssiInst(SX12XX_Radio_1);
+    }
     DBGLN("IRQ isr:%lu rx:%lu tx:%lu other:%lu dio:%d irq:0x%08lX "
           "rxok:%lu crcfail:%lu okT:%lu/%lu/%lu failT:%lu/%lu/%lu "
-          "stat:%u/%02X/%02X/%02X",
+          "stat:%u/%02X/%02X/%02X irssi:%d",
           isrCount, rxIrqCount, txIrqCount, otherIrqCount, lr1121_dio1_read(),
           lastIrq, pkt_capture_count, crcFailCount,
           (unsigned long)crcPassTypeCount[PACKET_TYPE_RCDATA],
@@ -3709,7 +3765,8 @@ void elrs_loop(void) {
           (unsigned long)crcFailTypeCount[PACKET_TYPE_RCDATA],
           (unsigned long)crcFailTypeCount[PACKET_TYPE_DATA],
           (unsigned long)crcFailTypeCount[PACKET_TYPE_SYNC],
-          lastRadioStatusOk, lastRadioStat1, lastRadioStat2, lastRadioIrqByte);
+          lastRadioStatusOk, lastRadioStat1, lastRadioStat2, lastRadioIrqByte,
+          instantRssi);
     hwTimer::service();
     DBGLN("LINK conn:%d rxst:%d rate:%d freq:%lu age:%lu nonce:%u fhss:%u "
           "pfd:%ld/%ld/%ld/%ld ph:%ld fo:%ld lq:%u/%u rssi:%d snr:%d disc:%u",

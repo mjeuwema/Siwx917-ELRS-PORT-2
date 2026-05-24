@@ -55,6 +55,13 @@ static selectionParameter luaForceTlm = {
     STR_EMPTYSPACE,
 };
 
+static selectionParameter luaTlmPower = {
+    {"Tlm Power", CRSF_TEXT_SELECTION, 0, 0},
+    3,
+    "10;25;50;100;250;500;1000;2000;MatchTX",
+    "mW",
+};
+
 static commandParameter luaWifiMode = {
     {"WiFi Mode", CRSF_COMMAND, 0, 0},
     lcsIdle,
@@ -144,6 +151,35 @@ static uint8_t modelIdToSelection(uint8_t modelId) {
 
 static uint8_t selectionToModelId(uint8_t selection) {
   return selection == 0 ? 0xFF : (uint8_t)(clampU8(selection, 1, 64) - 1);
+}
+
+static constexpr int8_t TLM_POWER_DBM_BY_SELECTION[] = {
+    10, 14, 17, 20, 24, 27, 30, 33,
+};
+static constexpr uint8_t TLM_POWER_MATCH_TX_SELECTION =
+    (uint8_t)(sizeof(TLM_POWER_DBM_BY_SELECTION) /
+              sizeof(TLM_POWER_DBM_BY_SELECTION[0]));
+
+static int8_t powerSelectionToDbm(uint8_t selection) {
+  if (selection >= TLM_POWER_MATCH_TX_SELECTION) {
+    return ELRS_TX_POWER_MATCH_TX_DBM;
+  }
+
+  return TLM_POWER_DBM_BY_SELECTION[selection];
+}
+
+static uint8_t powerDbmToSelection(int8_t dbm) {
+  if (dbm == ELRS_TX_POWER_MATCH_TX_DBM) {
+    return TLM_POWER_MATCH_TX_SELECTION;
+  }
+
+  for (uint8_t i = 0; i < TLM_POWER_MATCH_TX_SELECTION; ++i) {
+    if (TLM_POWER_DBM_BY_SELECTION[i] == dbm) {
+      return i;
+    }
+  }
+
+  return 3; // 100 mW / 20 dBm default.
 }
 
 #if RX_EP_EVENT_LOG
@@ -299,6 +335,17 @@ void SiW917RXEndpoint::registerParameters() {
     }
   });
 
+  registerParameter(&luaTlmPower, [this](propertiesCommon *, int32_t arg) {
+    elrs_config_t *cfg = elrs_config_get();
+    if (cfg != nullptr) {
+      cfg->tx_power = powerSelectionToDbm((uint8_t)arg);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("Tlm Power", cfg->tx_power);
+#endif
+      requestConfigSave();
+    }
+  });
+
   registerParameter(&luaWifiMode, [this](propertiesCommon *item, int32_t arg) {
     handleWiFiCommand(item, arg);
   });
@@ -377,6 +424,9 @@ void SiW917RXEndpoint::updateParameters() {
                                : 255);
   setTextSelectionValue(&luaForceTlm,
                         cfg != nullptr && cfg->force_tlm != 0 ? 1 : 0);
+  setTextSelectionValue(
+      &luaTlmPower,
+      cfg != nullptr ? powerDbmToSelection(cfg->tx_power) : 3);
   setTextSelectionValue(&luaTeamraceChannel,
                         cfg != nullptr ? clampU8(cfg->teamrace_channel, 0, 10)
                                        : 0);

@@ -500,6 +500,15 @@ void LR1121Driver::SetOutputPower(int8_t power, bool isSubGHz) {
   }
 }
 
+bool LR1121Driver::HasPendingOutputPower() const {
+  return pwrPendingLF != PWRPENDING_NONE ||
+         pwrPendingHF != PWRPENDING_NONE || pwrForceUpdate;
+}
+
+void ICACHE_RAM_ATTR LR1121Driver::CommitOutputPowerForNextTx() {
+  CommitOutputPower();
+}
+
 void ICACHE_RAM_ATTR LR1121Driver::CommitOutputPower() {
   if (pwrPendingLF != PWRPENDING_NONE) {
     pwrCurrentLF = pwrPendingLF;
@@ -821,7 +830,12 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
   DBGLN("TOA: %d", endTX - beginTX);
 #endif
   txInProgress = false;
+#if !defined(PLATFORM_SIW917)
   CommitOutputPower();
+#else
+  // SiW917 commits pending SetTxParams before TXnb; doing it after TX_DONE can
+  // collide with the tight RX turn-around and BUSY-timeout the SPI command.
+#endif
   TXdoneCallback();
 }
 

@@ -94,6 +94,17 @@ typedef enum {
 } elrs_bind_storage_t;
 
 /*******************************************************************************
+ * RX telemetry/downlink power options
+ *
+ * Fixed settings are stored as dBm. MatchTX uses a sentinel so existing NVM
+ * layouts stay compatible while the runtime can mirror the TX-reported power.
+ ******************************************************************************/
+#define ELRS_TX_POWER_MATCH_TX_DBM  ((int8_t)-128)
+#define ELRS_TX_POWER_MIN_DBM       ((int8_t)10)
+#define ELRS_TX_POWER_DEFAULT_DBM   ((int8_t)20)
+#define ELRS_TX_POWER_MAX_DBM       ((int8_t)33)
+
+/*******************************************************************************
  * Regulatory Domain Options
  * 
  * Citation: ExpressLRS common.h - RADIO_DOMAIN enum
@@ -140,7 +151,7 @@ typedef struct __attribute__((packed)) {
   /* Radio Settings */
   uint8_t  reg_domain_low;       /* Low-band regulatory domain */
   uint8_t  reg_domain_high;      /* High-band regulatory domain */
-  int8_t   tx_power;             /* TX power in dBm */
+  int8_t   tx_power;             /* RX telemetry TX power in dBm or MATCH_TX */
   uint8_t  rate_index;           /* Packet rate index */
   
   /* WiFi Settings */

@@ -91,7 +91,7 @@ static const elrs_config_t DEFAULT_CONFIG = {
   /* Radio defaults - dual band support for LR1121 */
   .reg_domain_low   = ELRS_DOMAIN_ISM_2400,
   .reg_domain_high  = ELRS_DOMAIN_ISM_2400,
-  .tx_power         = 20,   /* 20 dBm default */
+  .tx_power         = ELRS_TX_POWER_DEFAULT_DBM,
   .rate_index       = 17,   /* 50Hz rate (RATE_LORA_2G4_50HZ) */
   
   /* WiFi defaults */
@@ -186,6 +186,21 @@ static void normalize_config_fields(elrs_config_t* config)
     config->model_id = 255;
   }
   config->force_tlm = config->force_tlm ? 1 : 0;
+  switch (config->tx_power) {
+  case ELRS_TX_POWER_MATCH_TX_DBM:
+  case 10:
+  case 14:
+  case 17:
+  case 20:
+  case 24:
+  case 27:
+  case 30:
+  case 33:
+    break;
+  default:
+    config->tx_power = ELRS_TX_POWER_DEFAULT_DBM;
+    break;
+  }
 
   /* These fields were promoted from reserved bytes without changing the
    * structure size, so older valid configs may still contain zero defaults.
@@ -887,7 +902,11 @@ void elrs_config_print(void)
   DEBUGOUT("  Team Race:  ch=%d, pos=%d\n",
            cfg->teamrace_channel, cfg->teamrace_position);
   DEBUGOUT("  Bind Store: %d\n", cfg->bind_storage);
-  DEBUGOUT("  TX Power:   %d dBm\n", cfg->tx_power);
+  if (cfg->tx_power == ELRS_TX_POWER_MATCH_TX_DBM) {
+    DEBUGOUT("  TX Power:   Match TX\n");
+  } else {
+    DEBUGOUT("  TX Power:   %d dBm\n", cfg->tx_power);
+  }
   DEBUGOUT("  Rate Index: %d\n", cfg->rate_index);
   DEBUGOUT("  WiFi SSID:  %s\n", cfg->wifi_ssid);
   DEBUGOUT("  WiFi Ch:    %d\n", cfg->wifi_channel);

@@ -41,6 +41,8 @@ public:
   void SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
                        bool doRx = false, uint32_t rxTime = 0);
   void SetOutputPower(int8_t power, bool isSubGHz = true);
+  bool HasPendingOutputPower() const;
+  void CommitOutputPowerForNextTx();
   void startCWTest(uint32_t freq, SX12XX_Radio_Number_t radioNumber);
 
   bool GetFrequencyErrorbool(SX12XX_Radio_Number_t radioNumber);
