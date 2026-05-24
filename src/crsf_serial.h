@@ -51,7 +51,7 @@ extern "C" {
 #define CRSF_SERIAL_CHANNEL_MIN        172     /* 988us */
 #define CRSF_SERIAL_CHANNEL_MID        992     /* 1500us */
 #define CRSF_SERIAL_CHANNEL_MAX        1811    /* 2012us */
-#define CRSF_SERIAL_MAX_FRAME_SIZE     26
+#define CRSF_SERIAL_MAX_FRAME_SIZE     64
 
 /*******************************************************************************
  * Data Structures

@@ -945,31 +945,66 @@ static bool configuredSerialProtocolUsesCrsf() {
   return serialProtocolUsesCrsf(getConfiguredSerialProtocol());
 }
 
+static volatile bool serialProtocolApplyRequested = false;
+static uint8_t appliedSerialProtocol = 0xFF;
+
+static void ICACHE_RAM_ATTR requestSerialProtocolApply() {
+  serialProtocolApplyRequested = true;
+}
+
 static void applyConfiguredSerialProtocol() {
-#if ELRS_DIAG_DISABLE_CRSF_SERIAL
-  if (crsf_serial_is_ready()) {
-    crsf_serial_deinit();
-  }
-  DBGLN("CRSF serial output disabled for standalone RF timing test");
-#else
   const uint8_t protocol = getConfiguredSerialProtocol();
-  if (!serialProtocolUsesCrsf(protocol)) {
+  const bool wantsCrsf = serialProtocolUsesCrsf(protocol);
+  const bool wantsMavlink = protocol == ELRS_SERIAL_MAVLINK;
+
+#if ELRS_DIAG_DISABLE_CRSF_SERIAL
+  if (wantsCrsf) {
     if (crsf_serial_is_ready()) {
       crsf_serial_deinit();
     }
+    appliedSerialProtocol = protocol;
+    DBGLN("CRSF serial output disabled for standalone RF timing test");
+    return;
+  }
+#endif
+
+  if (!wantsCrsf && !wantsMavlink) {
+    if (crsf_serial_is_ready()) {
+      crsf_serial_deinit();
+    }
+    appliedSerialProtocol = protocol;
     DBGLN("Serial protocol %u selected; CRSF UART output inactive", protocol);
     return;
   }
 
+  if (crsf_serial_is_ready() && appliedSerialProtocol != protocol) {
+    crsf_serial_deinit();
+  }
+
   if (!crsf_serial_is_ready()) {
-    // Uses USART0 at 420000 baud, matching ELRS CRSF output.
-    if (crsf_serial_init(420000) != 0) {
-      DBGLN("WARNING: CRSF serial init failed - no FC output");
+    const uint32_t baud = wantsMavlink ? 460800U : 420000U;
+    if (crsf_serial_init(baud) != 0) {
+      DBGLN("WARNING: serial init failed for protocol %u", protocol);
     } else {
-      DBGLN("CRSF serial output initialized");
+      DBGLN("%s serial output initialized at %lu baud",
+            wantsMavlink ? "MAVLink" : "CRSF", (unsigned long)baud);
     }
   }
-#endif
+
+  appliedSerialProtocol = protocol;
+}
+
+static void processSerialProtocolApply() {
+  if (!serialProtocolApplyRequested) {
+    return;
+  }
+
+  if (TelemetrySender.IsActive() || !otaConnector.IsEmpty()) {
+    return;
+  }
+
+  serialProtocolApplyRequested = false;
+  applyConfiguredSerialProtocol();
 }
 
 static void rxLuaRefreshDynamicValues() {
@@ -1301,7 +1336,7 @@ static void rxLuaSaveConfig(bool applySerialAfterSave = false) {
   }
 
   if (applySerial) {
-    applyConfiguredSerialProtocol();
+    requestSerialProtocolApply();
   }
 }
 
@@ -1994,9 +2029,26 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   TxOtaProtocol = (otaSync->otaProtocol == TX_MAVLINK_MODE)
                       ? TX_MAVLINK_MODE
                       : TX_NORMAL_MODE;
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg != nullptr) {
+    const uint8_t previousProtocol = getProtocolSelectionFromConfig(cfg);
+    uint8_t desiredProtocol = previousProtocol;
+    if (TxOtaProtocol == TX_MAVLINK_MODE) {
+      desiredProtocol = ELRS_SERIAL_MAVLINK;
+    } else if (previousProtocol == ELRS_SERIAL_MAVLINK) {
+      desiredProtocol = ELRS_SERIAL_CRSF;
+    }
+
+    if (desiredProtocol != previousProtocol) {
+      cfg->serial_protocol = desiredProtocol;
+      requestSerialProtocolApply();
+      DBGLN("TX OTA protocol selected serial protocol %u", desiredProtocol);
+    }
+  }
+
   if ((TxOtaProtocol == TX_MAVLINK_MODE) && !warnedUnsupportedTxProtocol) {
     warnedUnsupportedTxProtocol = true;
-    DBGLN("TX requested MAVLink OTA mode; CRSF RC output remains unsupported");
+    DBGLN("TX requested MAVLink OTA mode");
   } else if ((TxOtaProtocol == TX_NORMAL_MODE) && warnedUnsupportedTxProtocol) {
     warnedUnsupportedTxProtocol = false;
     DBGLN("TX returned to normal OTA mode");
@@ -3332,7 +3384,7 @@ static void DataUlReceiveComplete() {
     }
     break;
   default:
-    if (TxOtaProtocol == TX_NORMAL_MODE) {
+    {
       const crsf_header_t *receivedHeader =
           reinterpret_cast<const crsf_header_t *>(DataUlBuffer);
       const uint32_t frameLen =
@@ -3347,39 +3399,41 @@ static void DataUlReceiveComplete() {
         case CRSF_FRAMETYPE_PARAMETER_WRITE:
         case CRSF_FRAMETYPE_COMMAND:
 #if ELRS_DIAG_CRSF_OTA_VERBOSE
-          {
-            const auto *extHeader =
-                reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
-            const uint8_t *payload =
-                reinterpret_cast<const uint8_t *>(receivedHeader) +
-                sizeof(crsf_ext_header_t);
-            const uint8_t payloadLen =
-                receivedHeader->frame_size >= CRSF_FRAME_LENGTH_EXT_TYPE_CRC
-                    ? (uint8_t)(receivedHeader->frame_size -
-                                CRSF_FRAME_LENGTH_EXT_TYPE_CRC)
-                    : 0;
-            DBGLN("[DATA_UL] CRSF type=0x%02X len=%lu dest=0x%02X orig=0x%02X p0=%u p1=%u",
-                  receivedHeader->type, (unsigned long)frameLen,
-                  extHeader->dest_addr, extHeader->orig_addr,
-                  payloadLen > 0 ? payload[0] : 0,
-                  payloadLen > 1 ? payload[1] : 0);
-          }
+        {
+          const auto *extHeader =
+              reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
+          const uint8_t *payload =
+              reinterpret_cast<const uint8_t *>(receivedHeader) +
+              sizeof(crsf_ext_header_t);
+          const uint8_t payloadLen =
+              receivedHeader->frame_size >= CRSF_FRAME_LENGTH_EXT_TYPE_CRC
+                  ? (uint8_t)(receivedHeader->frame_size -
+                              CRSF_FRAME_LENGTH_EXT_TYPE_CRC)
+                  : 0;
+          DBGLN("[DATA_UL] CRSF type=0x%02X len=%lu dest=0x%02X orig=0x%02X p0=%u p1=%u",
+                receivedHeader->type, (unsigned long)frameLen,
+                extHeader->dest_addr, extHeader->orig_addr,
+                payloadLen > 0 ? payload[0] : 0,
+                payloadLen > 1 ? payload[1] : 0);
+        }
 #endif
 #if ELRS_DIAG_LUA_DISCOVERY
-          if (receivedHeader->type == CRSF_FRAMETYPE_DEVICE_PING) {
-            const auto *extHeader =
-                reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
-            const uint32_t pingCount = ++luaDiscoveryPingCount;
-            DBGLN("LUA_DISC ping #%lu len=%lu dest=0x%02X orig=0x%02X den=%u active=%u",
-                  (unsigned long)pingCount, (unsigned long)frameLen,
-                  extHeader->dest_addr, extHeader->orig_addr,
-                  ExpressLRS_currTlmDenom, TelemetrySender.IsActive() ? 1 : 0);
-          }
+        if (receivedHeader->type == CRSF_FRAMETYPE_DEVICE_PING) {
+          const auto *extHeader =
+              reinterpret_cast<const crsf_ext_header_t *>(receivedHeader);
+          const uint32_t pingCount = ++luaDiscoveryPingCount;
+          DBGLN("LUA_DISC ping #%lu len=%lu dest=0x%02X orig=0x%02X den=%u active=%u",
+                (unsigned long)pingCount, (unsigned long)frameLen,
+                extHeader->dest_addr, extHeader->orig_addr,
+                ExpressLRS_currTlmDenom, TelemetrySender.IsActive() ? 1 : 0);
+        }
 #endif
+          // Lua/device-management frames are still CRSF in MAVLink OTA mode.
           crsfRouter.processMessage(&otaConnector, receivedHeader);
           break;
         default:
-          if (crsf_serial_is_ready() && configuredSerialProtocolUsesCrsf()) {
+          if (TxOtaProtocol == TX_NORMAL_MODE && crsf_serial_is_ready() &&
+              configuredSerialProtocolUsesCrsf()) {
             (void)crsf_serial_send_frame(DataUlBuffer, frameLen);
           }
           break;
@@ -4177,8 +4231,9 @@ void elrs_loop(void) {
   crsfReceiver.processPending(TelemetrySender.IsActive() ||
                               !otaConnector.IsEmpty());
   if (crsfReceiver.consumeSerialApplyRequest()) {
-    applyConfiguredSerialProtocol();
+    requestSerialProtocolApply();
   }
+  processSerialProtocolApply();
   maybePrintLuaProgress(now);
   maybePrintLinkProgress(now);
 
