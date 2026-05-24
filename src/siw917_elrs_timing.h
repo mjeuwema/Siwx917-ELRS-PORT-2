@@ -17,6 +17,32 @@
 #endif
 
 /*
+ * Timing-test profile: keep ELRS behavior upstream-shaped, but remove serial
+ * and timestamp diagnostics that add avoidable jitter while chasing 150 Hz.
+ * Flip this to 0 when you need the detailed HOTPATH/TLMFAST/RATECHG traces.
+ */
+#ifndef SIW917_ELRS_TIMING_TEST_BUILD
+#define SIW917_ELRS_TIMING_TEST_BUILD SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
+ * Put ELRS hot functions marked ICACHE_RAM_ATTR/IRAM_ATTR into RAM. This gives
+ * the SiW917 port the same "ISR/hot-path in internal RAM" intent that ESP32
+ * targets get from IRAM_ATTR, without changing the ELRS call ordering.
+ */
+#ifndef SIW917_ELRS_RAM_HOTPATH_CODE
+#define SIW917_ELRS_RAM_HOTPATH_CODE SIW917_ELRS_TIMING_LEAN
+#endif
+
+#ifndef SIW917_ELRS_RAMFUNC_ATTR
+#if SIW917_ELRS_RAM_HOTPATH_CODE
+#define SIW917_ELRS_RAMFUNC_ATTR __attribute__((section(".ramfunc")))
+#else
+#define SIW917_ELRS_RAMFUNC_ATTR
+#endif
+#endif
+
+/*
  * The Silicon Labs config-timer ISR is generic: it checks every CT event type,
  * writes a callback flag, then indirect-calls the registered callback. ELRS only
  * needs Counter 0 peak interrupts, so in timing mode we vector CT_IRQn directly
@@ -69,6 +95,24 @@
 #endif
 
 /*
+ * Diagnostic only: reserve telemetry slots but do not key the LR1121 TX path.
+ * If Lua requests stop dropping the link with this enabled, the failure is in
+ * the telemetry TX/TX_DONE/return-to-RX turnaround rather than Lua parsing.
+ */
+#ifndef SIW917_ELRS_DISABLE_DOWNLINK_TLM
+#define SIW917_ELRS_DISABLE_DOWNLINK_TLM 0
+#endif
+
+/*
+ * Standalone RF timing profile: do not initialize the flight-controller CRSF
+ * UART. Handset Lua/telemetry still goes over OTA; this only removes local FC
+ * serial output load when testing without an attached flight controller.
+ */
+#ifndef SIW917_ELRS_DISABLE_CRSF_SERIAL
+#define SIW917_ELRS_DISABLE_CRSF_SERIAL SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
  * Do not send telemetry from RX_DONE. Upstream ELRS sends telemetry only from
  * the timer/tock callback after OtaNonce++ and HandleFHSS(). Keep this disabled
  * unless deliberately running a non-upstream timing experiment.
@@ -96,7 +140,53 @@
  * bottleneck is found to remove the timestamp-read overhead.
  */
 #ifndef SIW917_ELRS_HOTPATH_TIMING_DIAG
-#define SIW917_ELRS_HOTPATH_TIMING_DIAG 1
+#define SIW917_ELRS_HOTPATH_TIMING_DIAG (!SIW917_ELRS_TIMING_TEST_BUILD)
+#endif
+
+/*
+ * Low-rate Lua/downlink progress trace. This runs from the ELRS task only, not
+ * from RF IRQ context, so it should not disturb the timer/DIO hot path while we
+ * diagnose long Lua parameter downloads.
+ */
+#ifndef SIW917_ELRS_LUA_PROGRESS_DIAG
+#define SIW917_ELRS_LUA_PROGRESS_DIAG 0
+#endif
+
+#ifndef SIW917_ELRS_LUA_PROGRESS_INTERVAL_MS
+#define SIW917_ELRS_LUA_PROGRESS_INTERVAL_MS 1000U
+#endif
+
+/*
+ * Low-rate connected-state heartbeat for "telemetry died but RC stayed linked"
+ * tests. This is task-context only and should stay slow enough to avoid
+ * changing RF timing while still showing whether downlink telemetry slots stop.
+ */
+#ifndef SIW917_ELRS_LINK_PROGRESS_DIAG
+#define SIW917_ELRS_LINK_PROGRESS_DIAG 0
+#endif
+
+#ifndef SIW917_ELRS_LINK_PROGRESS_INTERVAL_MS
+#define SIW917_ELRS_LINK_PROGRESS_INTERVAL_MS 5000U
+#endif
+
+/*
+ * Keep PFD extEvent timestamping aligned with upstream RX: ProcessRFPacket()
+ * samples beginProcessing after the radio IRQ path has read/handled the
+ * packet, then adds PACKET_TO_TOCK_SLACK. The raw GPIO/DIO edge is useful for
+ * latency diagnostics, but feeding it to PFD biases the loop early by the
+ * LR1121 IRQ/SPI handling time and drives the timer off-frequency.
+ */
+#ifndef SIW917_ELRS_DIO_PFD_TIMESTAMP
+#define SIW917_ELRS_DIO_PFD_TIMESTAMP 0
+#endif
+
+/*
+ * Keep the timing build quiet when Lua parameter downloads request temporary
+ * telemetry boost. These prints happen at the exact moment the link switches to
+ * dense telemetry and can steal enough time to disturb 100/150 Hz operation.
+ */
+#ifndef SIW917_ELRS_TLM_RATE_DIAG
+#define SIW917_ELRS_TLM_RATE_DIAG 0
 #endif
 
 /*
@@ -192,12 +282,23 @@
 #endif
 
 /*
- * Match upstream ESP32 LR1121_hal.cpp's 2000 us WaitOnBusy budget. Keep the
- * older iteration knob only for low-level A/B experiments; ELRS uses the
- * microsecond budget so the wait is stable across compiler/register changes.
+ * Connected radio hot-path profile. At 150 Hz the half-slot is only 3333 us.
+ * A 2000 us BUSY wait is too large for the SiW917 timing island, but 250 us can
+ * send commands while LR1121 BUSY is still asserted during dense telemetry. Cap
+ * the bare-metal wait at a slot-budget-safe value that still respects BUSY.
  */
 #ifndef SIW917_ELRS_BUSY_FAST_US
-#define SIW917_ELRS_BUSY_FAST_US 2000U
+#define SIW917_ELRS_BUSY_FAST_US 500U
+#endif
+
+/*
+ * SetRx is the one hot command we issue immediately after telemetry TX_DONE.
+ * If LR1121 is still BUSY there, clocking SetRx too early can leave the radio
+ * out of receive for several uplink slots. Give only SetRx a larger upstream-
+ * style wait budget while keeping frequency/TX commands on the tighter budget.
+ */
+#ifndef SIW917_ELRS_SET_RX_BUSY_FAST_US
+#define SIW917_ELRS_SET_RX_BUSY_FAST_US 1500U
 #endif
 
 /*
@@ -208,6 +309,16 @@
  */
 #ifndef SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT
 #define SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
+ * Strict timing profile: once linked, hot LR1121 commands must use the bounded
+ * fast register path only. Falling back into generic SDK/raw helpers after a
+ * fast-path miss can rescue a slow slot, but it makes 150 Hz noisy and cannot
+ * scale to 1000 Hz FSK.
+ */
+#ifndef SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
+#define SIW917_ELRS_STRICT_BARE_METAL_HOTPATH SIW917_ELRS_TIMING_LEAN
 #endif
 
 #ifndef SIW917_ELRS_BUSY_FAST_ITERATIONS
@@ -251,6 +362,14 @@
  */
 #ifndef SIW917_ELRS_RAW_GSPI_SET_FREQ_RX
 #define SIW917_ELRS_RAW_GSPI_SET_FREQ_RX SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
+ * A/B test for the 100/150 Hz RX_DONE collapse: force FHSS hops to use the
+ * LR1121 helper that retunes and re-enters continuous RX in one command.
+ */
+#ifndef SIW917_ELRS_FHSS_SET_FREQ_RX
+#define SIW917_ELRS_FHSS_SET_FREQ_RX 0
 #endif
 
 /*
@@ -308,13 +427,10 @@
 #endif
 
 /*
- * 150 Hz telemetry leaves only a few hundred microseconds between TX_DONE and
- * the next uplink. ESP32 can clear/read IRQ status and re-arm RX inside that
- * window; SiW917 cannot always do both before the uplink starts. When the
- * driver knows it is in a TX, handle that DIO as TX_DONE, re-arm RX first, then
- * clear just the TX_DONE IRQ bit. RX_DONE that arrives during the clear remains
- * latched and is picked up by the level requeue path.
+ * Keep TX_DONE IRQ ordering upstream-shaped by default: clear/read LR1121 IRQ
+ * status before TXdoneCallback() re-arms RX. DIO is level-held until cleared,
+ * so re-arming RX while TX_DONE is still asserted can starve later DIO edges.
  */
 #ifndef SIW917_ELRS_RX_FIRST_TXDONE
-#define SIW917_ELRS_RX_FIRST_TXDONE SIW917_ELRS_TIMING_LEAN
+#define SIW917_ELRS_RX_FIRST_TXDONE 0
 #endif

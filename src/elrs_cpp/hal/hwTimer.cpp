@@ -181,12 +181,23 @@ extern "C" bool elrs_hw_timer_has_pending_event(void) {
 // Tick/Tock callbacks directly from CT so RF hop/telemetry scheduling is not
 // delayed by the FreeRTOS task wakeup path. The queued fallback is kept for
 // bring-up and for quickly backing out if a platform command is not ISR-safe.
+static inline uint32_t timerEventTimestampUs() {
+  /*
+   * Match upstream ESP32 RX behavior: HWtimerCallbackTock() calls
+   * PFDloop.intEvent(micros()) from inside the timer ISR.  Using the scheduled
+   * CT edge timestamp here hides any real CT-vs-micros drift from the PFD loop,
+   * which can leave FHSS retunes phase-shifted even though the offset log looks
+   * small.
+   */
+  return micros();
+}
+
 static void hwTimerTickBridge(void) {
   if (hwTimer::running) {
 #if SIW917_ELRS_DIRECT_TIMER_CALLBACKS || SIW917_ELRS_DIRECT_TIMER_TICK
-    processTimerEvent(TIMER_EVENT_TICK, hw_timer_get_last_edge_micros());
+    processTimerEvent(TIMER_EVENT_TICK, timerEventTimestampUs());
 #else
-    enqueueTimerEvent(TIMER_EVENT_TICK, hw_timer_get_last_edge_micros());
+    enqueueTimerEvent(TIMER_EVENT_TICK, timerEventTimestampUs());
 #endif
   }
 }
@@ -194,9 +205,9 @@ static void hwTimerTickBridge(void) {
 static void hwTimerTockBridge(void) {
   if (hwTimer::running) {
 #if SIW917_ELRS_DIRECT_TIMER_CALLBACKS
-    processTimerEvent(TIMER_EVENT_TOCK, hw_timer_get_last_edge_micros());
+    processTimerEvent(TIMER_EVENT_TOCK, timerEventTimestampUs());
 #else
-    enqueueTimerEvent(TIMER_EVENT_TOCK, hw_timer_get_last_edge_micros());
+    enqueueTimerEvent(TIMER_EVENT_TOCK, timerEventTimestampUs());
 #endif
   }
 }

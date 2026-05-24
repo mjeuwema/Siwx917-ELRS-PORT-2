@@ -520,7 +520,7 @@ bool lr1121_elrs_set_freq_set_rx(uint32_t freq_hz, bool use_soft_command);
  *     4 = DATA_AVAIL (data available for read)
  *
  * stat2 format:
- *   Bits [6:4] = chip_mode:
+ *   Bits [3:1] = chip_mode:
  *     0 = SLEEP
  *     1 = STANDBY_RC
  *     2 = STANDBY_XOSC
@@ -529,7 +529,7 @@ bool lr1121_elrs_set_freq_set_rx(uint32_t freq_hz, bool use_soft_command);
  *     5 = TX
  *
  * @param stat1 Status byte 1 (command status) - use (stat1 >> 1) & 0x07
- * @param stat2 Status byte 2 (chip mode) - use (stat2 >> 4) & 0x07
+ * @param stat2 Status byte 2 (chip mode) - use (stat2 >> 1) & 0x07
  * @param irq_status IRQ status bits
  * @return true on success
  */
@@ -568,7 +568,7 @@ bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
  * @param stat2 Raw status byte 2 from GetStatus
  * @return Chip mode (0-5)
  */
-#define LR1121_GET_CHIP_MODE(stat2) (((stat2) >> 4) & 0x07)
+#define LR1121_GET_CHIP_MODE(stat2) (((stat2) >> 1) & 0x07)
 
 /*******************************************************************************
  * Raw SPI Functions for Single-Phase Commands
@@ -720,6 +720,21 @@ lr1121_status_t lr1121_dio1_init(void);
  * @return 1 if HIGH, 0 if LOW
  */
 int lr1121_dio1_read(void);
+
+/**
+ * @brief Return DIO1 NVIC enable state for diagnostics
+ */
+uint32_t lr1121_dio1_irq_enabled(void);
+
+/**
+ * @brief Return DIO1 NVIC pending state for diagnostics
+ */
+uint32_t lr1121_dio1_irq_pending(void);
+
+/**
+ * @brief Return raw GPIO interrupt status for the DIO1 channel
+ */
+uint32_t lr1121_dio1_gpio_intr_status(void);
 
 /**
  * @brief Set DIO1 interrupt callback

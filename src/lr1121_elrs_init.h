@@ -53,7 +53,7 @@ extern "C" {
  *   1 = 2.4 GHz (CalibImage 0x94..0x98, internal RFIO_HF, no ext switch)
  */
 #ifndef LR1121_BAND_24GHZ
-#define LR1121_BAND_24GHZ 1
+#define LR1121_BAND_24GHZ 0
 #endif
 
 /*******************************************************************************

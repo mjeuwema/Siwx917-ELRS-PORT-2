@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "LR1121.h"
 #include "LR1121_hal.h"
+#include "../../include/common.h"
 #include "logging.h"
 #include "lr1121_transceiver_F30104.h"
 #include "siw917_elrs_timing.h"
@@ -84,21 +85,23 @@ public:
   void decode(uint8_t *out, uint8_t *in, uint32_t len) override;
 } copyCodec;
 
-void ICACHE_RAM_ATTR FECCodec::encode(uint8_t *out, uint8_t *in, uint32_t len) {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+FECCodec::encode(uint8_t *out, uint8_t *in, uint32_t len) {
   memset(out, 0, len); // ensure that the buffer is zeroed to start
   FECEncode(in, out);
 }
 
-void ICACHE_RAM_ATTR FECCodec::decode(uint8_t *out, uint8_t *in, uint32_t len) {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+FECCodec::decode(uint8_t *out, uint8_t *in, uint32_t len) {
   FECDecode(in, out);
 }
 
-void ICACHE_RAM_ATTR CopyCodec::encode(uint8_t *out, uint8_t *in,
-                                       const uint32_t len) {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+CopyCodec::encode(uint8_t *out, uint8_t *in, const uint32_t len) {
   memcpy(out, in, len);
 }
-void ICACHE_RAM_ATTR CopyCodec::decode(uint8_t *out, uint8_t *in,
-                                       const uint32_t len) {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+CopyCodec::decode(uint8_t *out, uint8_t *in, const uint32_t len) {
   memcpy(out, in, len);
 }
 
@@ -106,6 +109,13 @@ LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
   rxContinuousActive = false;
   txInProgress = false;
+  pwrCurrentLF = 0;
+  pwrPendingLF = PWRPENDING_NONE;
+  pwrCurrentHF = 0;
+  pwrPendingHF = PWRPENDING_NONE;
+  pwrForceUpdate = false;
+  radio1isSubGHz = true;
+  radio2isSubGHz = true;
   instance = this;
   strongestReceivingRadio = SX12XX_Radio_1;
   fallBackMode = LR1121_MODE_FS;
@@ -580,8 +590,8 @@ LR1121Driver::SetPaConfig(bool isSubGHz, SX12XX_Radio_Number_t radioNumber) {
                    radioNumber);
 }
 
-void LR1121Driver::SetMode(lr11xx_RadioOperatingModes_t OPmode,
-                           SX12XX_Radio_Number_t radioNumber) {
+void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::SetMode(
+    lr11xx_RadioOperatingModes_t OPmode, SX12XX_Radio_Number_t radioNumber) {
   WORD_ALIGNED_ATTR uint8_t buf[5] = {0};
 
   switch (OPmode) {
@@ -686,7 +696,7 @@ void LR1121Driver::SetPacketParamsLoRa(
                    radioNumber);
 }
 
-void ICACHE_RAM_ATTR
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
                               bool doRx, uint32_t rxTime) {
   const uint32_t timeout = rxTime != 0 ? rxTime : 0xFFFFFFU;
@@ -742,13 +752,18 @@ void LR1121Driver::SetDioIrqParams() {
   DBGLN("SetDioIrqParams: TX_DONE|RX_DONE routed to DIO1 (via Dio1Mask)");
 }
 
-uint32_t ICACHE_RAM_ATTR
+uint32_t SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 LR1121Driver::GetIrqStatus(SX12XX_Radio_Number_t radioNumber) {
 #if SIW917_ELRS_FAST_CLEAR_IRQ
   uint32_t irqStatus = 0;
   if (lr1121_clear_irq_status_fast(0xFFFFFFFFU, &irqStatus)) {
     return irqStatus;
   }
+#if SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
+  if (connectionState != disconnected) {
+    return 0;
+  }
+#endif
 #endif
 
   uint8_t status[6] = {0};
@@ -772,17 +787,22 @@ LR1121Driver::GetIrqStatus(SX12XX_Radio_Number_t radioNumber) {
          (uint32_t)status[4] << 8 | (uint32_t)status[5];
 }
 
-void ICACHE_RAM_ATTR
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 LR1121Driver::ClearIrqStatus(SX12XX_Radio_Number_t radioNumber) {
   ClearIrqStatusMask(0xFFFFFFFFU, radioNumber);
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::ClearIrqStatusMask(
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::ClearIrqStatusMask(
     uint32_t irqMask, SX12XX_Radio_Number_t radioNumber) {
 #if SIW917_ELRS_FAST_CLEAR_IRQ
   if (lr1121_clear_irq_status_fast(irqMask, nullptr)) {
     return;
   }
+#if SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
+  if (connectionState != disconnected) {
+    return;
+  }
+#endif
 #endif
 
   // Clear IRQ status command (0x0114) takes 4 bytes of masks
@@ -795,7 +815,7 @@ void ICACHE_RAM_ATTR LR1121Driver::ClearIrqStatusMask(
   hal.WriteCommand(LR11XX_SYSTEM_CLEAR_IRQ_OC, buf, sizeof(buf), radioNumber);
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
 #ifdef DEBUG_LR1121_OTA_TIMING
   endTX = micros();
   DBGLN("TOA: %d", endTX - beginTX);
@@ -805,7 +825,7 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
   TXdoneCallback();
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::TXnb(
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
     uint8_t *data, const bool sendGeminiBuffer, uint8_t *dataGemini,
     const SX12XX_Radio_Number_t radioNumber) {
   transmittingRadio = radioNumber;
@@ -848,14 +868,20 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnb(
     }
   }
 
-  WORD_ALIGNED_ATTR uint8_t outBuffer[32] = {0};
+  WORD_ALIGNED_ATTR uint8_t outBuffer[32];
   const uint8_t length =
       PayloadLength + 3; // 3 extra zero bytes for the 24-bit timeout
   codec->encode(outBuffer, data, PayloadLength);
+  outBuffer[PayloadLength] = 0;
+  outBuffer[PayloadLength + 1] = 0;
+  outBuffer[PayloadLength + 2] = 0;
   if (sendGeminiBuffer) {
     hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBuffer, length,
                      SX12XX_Radio_1);
     codec->encode(outBuffer, dataGemini, PayloadLength);
+    outBuffer[PayloadLength] = 0;
+    outBuffer[PayloadLength + 1] = 0;
+    outBuffer[PayloadLength + 2] = 0;
     hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBuffer, length,
                      SX12XX_Radio_2);
   } else {
@@ -867,7 +893,7 @@ void ICACHE_RAM_ATTR LR1121Driver::TXnb(
 #endif
 }
 
-inline void ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
+inline void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
     SX12XX_Radio_Number_t radioNumber, const uint8_t *buf) {
   // RssiPkt defines the average RSSI over the last packet received. RSSI value
   // in dBm is –RssiPkt/2.
@@ -897,7 +923,8 @@ inline void ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
 #endif
 }
 
-bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
+bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   siw917_rxnbisr_entry_us = micros();
   const uint8_t effectivePayloadLength =
       PayloadLength != 0 ? PayloadLength : siw917_last_payload_length;
@@ -919,7 +946,7 @@ bool ICACHE_RAM_ATTR LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   return packetAccepted;
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::RXnb() {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::RXnb() {
   // Match upstream ELRS: TX_DONE returns via fallback mode, then SetRx only.
   SetMode(LR1121_MODE_RX_CONT, SX12XX_Radio_All);
 }
@@ -960,7 +987,8 @@ void ICACHE_RAM_ATTR LR1121Driver::CheckForSecondPacket() {
   }
 }
 
-void ICACHE_RAM_ATTR LR1121Driver::GetLastPacketStats() {
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Driver::GetLastPacketStats() {
   const SX12XX_Radio_Number_t radioNumber =
       processingPacketRadio == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
 
@@ -992,9 +1020,13 @@ void ICACHE_RAM_ATTR LR1121Driver::GetLastPacketStats() {
   }
 }
 
-void LR1121Driver::IsrCallback_1() { IsrCallback(SX12XX_Radio_1); }
+void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallback_1() {
+  IsrCallback(SX12XX_Radio_1);
+}
 
-void LR1121Driver::IsrCallback_2() { IsrCallback(SX12XX_Radio_2); }
+void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallback_2() {
+  IsrCallback(SX12XX_Radio_2);
+}
 
 // Debug counters for ISR tracking
 static volatile uint32_t isrCallCount = 0;
@@ -1010,7 +1042,8 @@ bool lr1121_spi_transfer(const uint8_t *tx_data, uint8_t *rx_data,
                          uint16_t length);
 }
 
-void LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
+void SIW917_ELRS_RAMFUNC_ATTR
+LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
 #if SIW917_ELRS_RX_FIRST_TXDONE
   if (instance->txInProgress) {
     isrCallCount++;
@@ -1034,8 +1067,8 @@ void LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
   IsrCallbackWithStatus(radioNumber, irqStatus);
 }
 
-void LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_Number_t radioNumber,
-                                         uint32_t irqStatus) {
+void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
+    SX12XX_Radio_Number_t radioNumber, uint32_t irqStatus) {
   isrCallCount++;
   instance->processingPacketRadio = radioNumber;
   const SX12XX_Radio_Number_t otherRadioNumber =

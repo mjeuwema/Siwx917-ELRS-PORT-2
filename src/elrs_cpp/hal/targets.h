@@ -28,6 +28,9 @@
 // Include Arduino compatibility layer
 #include "Arduino.h"
 
+// Include SiW917 timing profile before defining hot-path placement attributes.
+#include "siw917_elrs_timing.h"
+
 // Include hardware pin definitions
 #include "hardware.h"
 
@@ -40,7 +43,10 @@
 #define WORD_PADDED(size) (((size)+3) & ~3)
 #endif
 
-// IRAM attributes (no-op on SiW917 - no separate IRAM)
+// Keep upstream ELRS annotations parse-compatible. SiW917 RAM placement is
+// applied with SIW917_ELRS_RAMFUNC_ATTR on targeted non-inline hot functions;
+// using ICACHE_RAM_ATTR globally also marks inline header helpers and triggers
+// C++ section conflicts.
 #ifndef ICACHE_RAM_ATTR
 #define ICACHE_RAM_ATTR
 #endif

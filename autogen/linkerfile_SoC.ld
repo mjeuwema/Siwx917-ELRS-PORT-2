@@ -104,6 +104,10 @@ SECTIONS
 		/* _sdata is used in startup code */
 		_sdata = __data_start__;
 		KEEP(*(.ramVector))	
+		. = ALIGN(4);
+		*(.ramfunc)
+		*(.ramfunc.*)
+		. = ALIGN(4);
 		KEEP(*(.init))
 		KEEP(*(.fini))
 		*(.data*)

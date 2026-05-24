@@ -273,30 +273,40 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
 
   bool command_ok = false;
   bool handled_hot_command = false;
+  bool attempted_fast_hot_command = false;
 
 #if SIW917_ELRS_FAST_HOT_COMMANDS
 #if SIW917_ELRS_RAW_GSPI_TX
   if (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX) {
+    attempted_fast_hot_command = true;
     command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
     handled_hot_command = command_ok;
   }
 #endif
 #if SIW917_ELRS_RAW_GSPI_SET_RX
   if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RX_OC) {
+    attempted_fast_hot_command = true;
     command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
     handled_hot_command = command_ok;
   }
 #endif
 #if SIW917_ELRS_RAW_GSPI_SET_FREQ
   if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC) {
+    attempted_fast_hot_command = true;
     command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
     handled_hot_command = command_ok;
   }
 #endif
 #if SIW917_ELRS_RAW_GSPI_SET_FREQ_RX
   if (!handled_hot_command && opcode == LR11XX_RADIO_SET_FREQ_SET_RX) {
+    attempted_fast_hot_command = true;
     command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
     handled_hot_command = command_ok;
+  }
+#endif
+#if SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
+  if (attempted_fast_hot_command && connectionState != disconnected) {
+    return;
   }
 #endif
 #endif
@@ -521,10 +531,10 @@ static inline bool dio1GpioDirectPathAllowed() {
 #endif
 }
 
-static void processDio1IrqNow() {
-  // Keep SiW917 on the LR1121 driver's normal ISR path. That path has a
-  // TX-in-progress fast branch which re-arms RX before the IRQ-status read,
-  // preserving the narrow 150 Hz telemetry turn-around window.
+static void SIW917_ELRS_RAMFUNC_ATTR processDio1IrqNow() {
+  // Keep SiW917 on the LR1121 driver's normal ISR path. That path mirrors
+  // upstream LR1121 handling: atomically clear/read IRQ status before TX_DONE
+  // calls back into RX re-arm, so the level-held DIO line is deasserted first.
   if (LR1121Hal::instance && LR1121Hal::instance->IsrCallback_1) {
     LR1121Driver::instance = &Radio;
     LR1121Hal::instance->IsrCallback_1();
@@ -532,12 +542,12 @@ static void processDio1IrqNow() {
 }
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
-static void dio1PendStageFromIsr() {
+static void SIW917_ELRS_RAMFUNC_ATTR dio1PendStageFromIsr() {
   dio1_stage_pend_count++;
   NVIC_SetPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
 }
 
-static void dio1StageIrqHandler() {
+static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
   dio1_stage_irq_count++;
 

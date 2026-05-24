@@ -33,15 +33,15 @@
 
 #include "hw_timer.h"
 #include "clock_update.h"
-#include "cmsis_os2.h"
-#include "rsi_ct.h" /* For RSI_CT_Config(), RSI_CT_Reset() */
+#include "rsi_ct.h" /* CT register bit definitions */
 #include "rsi_pll.h"
 #include "rsi_rom_clks.h" /* For RSI_CLK_GetBaseClock(), RSI_CLK_SetCtClock() */
 #include "siw917_elrs_timing.h"
-#include "sl_si91x_config_timer.h"
 #include "system_si91x.h"
 #include <stdio.h> /* For printf debug output */
 #include <string.h>
+
+#define CT CT0
 
 /* ========================================================================== */
 /*                              CONFIGURATION                                 */
@@ -55,9 +55,8 @@
  * This makes the code portable across different clock configurations.
  *
  * 16-BIT MODE:
- *   The unified SDK only supports 16-bit mode, but the hardware supports
- * The SDK path validates and writes Counter 0 as a 16-bit timer. ELRS RX
- * half-intervals fit in that range at the target 2 MHz timer base.
+ *   Counter 0 is programmed directly as a 16-bit timer. ELRS RX
+ *   half-intervals fit in that range at the target 2 MHz timer base.
  *
  * Target: 2 MHz CT clock
  *   - 1 µs = 2 ticks (simple math!)
@@ -67,15 +66,10 @@
  * Formula: div_factor = system_clk / (2 * TARGET_TIMER_FREQ)
  * Example: 180 MHz / (2 * 2 MHz) = 45
  *          160 MHz / (2 * 2 MHz) = 40
- *
- * Note: rsi_ct.h's comment says cfg=0 is 32-bit, but its implementation clears
- * COUNTER32_BITMODE. That matches the SL_COUNTER_16BIT APIs used below.
  */
 #define CT_TARGET_FREQ_HZ 2000000U /* 2 MHz target */
 #define CT_TIMER_SOURCE CT_SOCPLLCLK
 #define CT_MATCH_MAX 0xFFFFU
-#define CT_CALIBRATION_MS 10U
-#define CT_MIN_VALID_CALIBRATION_TICKS 10U
 /* Upstream ESP32 RX timer uses 5 timer ticks/us for freq offset units. */
 #define ELRS_FREQ_OFFSET_UNITS_PER_US 5
 #define CT_TARGET_TICKS_PER_US 2U  /* At 2 MHz: 1 µs = 2 ticks */
@@ -137,9 +131,6 @@ typedef struct {
 /** Global timer state */
 static hw_timer_state_t hw_timer = {0};
 
-/** Interrupt flag for callback routing */
-static volatile uint32_t ct_interrupt_flag = 0;
-
 /* ========================================================================== */
 /*                           FORWARD DECLARATIONS                             */
 /* ========================================================================== */
@@ -155,11 +146,10 @@ static int32_t hw_timer_consume_freq_adjust_us(void);
 static void hw_timer_note_edge_from_isr(void);
 static uint32_t hw_timer_get_ct_source_hz(CT_CLK_SRC_SEL_T source);
 static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source);
-static uint32_t hw_timer_calibrate_ct_frequency(uint32_t register_ct_freq);
 static uint32_t hw_timer_read_counter0(void);
 static void hw_timer_write_match(uint32_t match_value, bool use_buffer);
+static void hw_timer_configure_counter0_direct(void);
 static sl_status_t hw_timer_enable_ct_clock(void);
-static sl_status_t hw_timer_apply_counter0_config(void);
 static void hw_timer_reset_counter0(void);
 static void hw_timer_force_stop_counter0(void);
 
@@ -199,8 +189,7 @@ static inline void hw_timer_exit_critical(uint32_t primask) {
  * based on the actual system clock. Target is 2 MHz (2 ticks per µs).
  *
  * The configured CT frequency is used for conversion, then clamped to the
- * Counter 0 16-bit range. The FreeRTOS-based calibration pass is diagnostic
- * only because scheduler/tick latency is too coarse for ELRS RF slot timing.
+ * Counter 0 16-bit range.
  */
 static uint32_t us_to_match_value(uint32_t us) {
   /*
@@ -281,10 +270,7 @@ static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source) {
 }
 
 static uint32_t hw_timer_read_counter0(void) {
-  uint32_t count = 0;
-  (void)sl_si91x_config_timer_get_count(SL_COUNTER_16BIT, SL_COUNTER_0,
-                                        &count);
-  return count & CT_MATCH_MAX;
+  return CT->CT_COUNTER_REG_b.COUNTER0 & CT_MATCH_MAX;
 }
 
 static void hw_timer_write_match(uint32_t match_value, bool use_buffer) {
@@ -301,6 +287,60 @@ static void hw_timer_write_match(uint32_t match_value, bool use_buffer) {
     CT->CT_MATCH_REG_b.COUNTER_0_MATCH = (uint16_t)match_value;
     CT->CT_MATCH_BUF_REG_b.COUNTER_0_MATCH_BUF = (uint16_t)match_value;
   }
+  __DSB();
+}
+
+static inline void hw_timer_ack_pending_ct_irq(void) {
+  const uint32_t pending = CT->CT_INTR_STS;
+  if (pending != 0U) {
+    CT->CT_INTR_ACK = pending;
+  }
+}
+
+static inline void hw_timer_enable_counter0_peak_irq(void) {
+  /*
+   * Mirrors RSI_CT_InterruptEnable(): route CT interrupt sources into the
+   * M4 multi-channel VIC, then unmask the Counter 0 peak flag. Without this
+   * selector write the counter runs, but CT_IRQn never fires.
+   */
+  M4SS_CT_INTR_SEL = 0xFFFFFFFFU;
+  CT->CT_INTER_UNMASK = RSI_CT_EVENT_COUNTER_0_IS_PEAK_l;
+}
+
+static inline void hw_timer_disable_counter0_peak_irq(void) {
+  CT->CT_INTR_MASK = RSI_CT_EVENT_COUNTER_0_IS_PEAK_l;
+}
+
+static inline void hw_timer_stop_counter0_direct(void) {
+  CT->CT_GEN_CTRL_RESET_REG = COUNTER0_TRIG;
+  __DSB();
+}
+
+static inline void hw_timer_reset_counter0_direct(void) {
+  CT->CT_GEN_CTRL_SET_REG = SOFTRESET_COUNTER_0;
+  __DSB();
+}
+
+static inline void hw_timer_start_counter0_direct(void) {
+  CT->CT_GEN_CTRL_SET_REG = COUNTER0_TRIG;
+  __DSB();
+}
+
+static void hw_timer_configure_counter0_direct(void) {
+  /*
+   * Keep this equivalent to the previous SDK path:
+   *   RSI_CT_Config(CT, 0) clears 32-bit mode.
+   *   sl_si91x_config_timer_set_configuration() then OR-sets periodic,
+   *   buffered, up-count mode.
+   *
+   * Do not clear periodic/buffer/direction immediately before setting them;
+   * the CT control register is write-one-to-set/write-one-to-clear, and the
+   * former SDK path never performed that extra clear.
+   */
+  CT->CT_GEN_CTRL_RESET_REG = COUNTER32_BITMODE | COUNTER0_TRIG |
+                              COUNTER0_SYNC_TRIG;
+  CT->CT_GEN_CTRL_SET_REG = PERIODIC_ENCOUNTER_0 | COUNTER0_UP | BUF_REG0EN;
+  __DSB();
 }
 
 static sl_status_t hw_timer_enable_ct_clock(void) {
@@ -314,114 +354,32 @@ static sl_status_t hw_timer_enable_ct_clock(void) {
   return SL_STATUS_FAIL;
 }
 
-static sl_status_t hw_timer_apply_counter0_config(void) {
-  RSI_CT_Config(CT, 0); /* SDK implementation selects Counter 0 16-bit mode. */
-
-  sl_config_timer_config_t ct_config = {
-      .is_counter_mode_32bit_enabled = false,
-      .is_counter0_soft_reset_enabled = false,
-      .is_counter0_periodic_enabled = true,
-      .is_counter0_trigger_enabled = false,
-      .is_counter0_sync_trigger_enabled = false,
-      .is_counter0_buffer_enabled = true,
-      .is_counter1_soft_reset_enabled = false,
-      .is_counter1_periodic_enabled = false,
-      .is_counter1_trigger_enabled = false,
-      .is_counter1_sync_trigger_enabled = false,
-      .is_counter1_buffer_enabled = false,
-      .counter0_direction = SL_COUNTER0_UP,
-      .counter1_direction = SL_COUNTER1_UP,
-  };
-
-  sl_status_t status = sl_si91x_config_timer_set_configuration(&ct_config);
-  if (status != SL_STATUS_OK) {
-    return status;
-  }
-
-  status = sl_si91x_config_timer_set_match_count(SL_COUNTER_16BIT,
-                                                 SL_COUNTER_0,
-                                                 hw_timer.match_value);
-  if (status != SL_STATUS_OK) {
-    return status;
-  }
-
-  hw_timer_write_match(hw_timer.match_value, false);
-  return SL_STATUS_OK;
-}
-
 static void hw_timer_reset_counter0(void) {
-  RSI_CT_ClearControl(CT, COUNTER0_TRIG);
-  (void)sl_si91x_config_timer_reset_counter(SL_COUNTER_0);
   NVIC_DisableIRQ(CT_IRQn);
+  hw_timer_disable_counter0_peak_irq();
+  hw_timer_stop_counter0_direct();
+  hw_timer_reset_counter0_direct();
+  hw_timer_ack_pending_ct_irq();
   NVIC_ClearPendingIRQ(CT_IRQn);
 }
 
 static void hw_timer_force_stop_counter0(void) {
   hw_timer_reset_counter0();
   /*
-   * Do not gate CT_CLK here. Some SDK helpers and diagnostics can touch CT
-   * registers while ELRS is disconnected/rate-scanning, and those accesses may
-   * hang when the peripheral clock is disabled. Treat "stopped" as a logical
-   * state: IRQs are masked, pending IRQs are cleared, and the ISR ignores any
-   * late callback until hw_timer_start() marks the timer running again.
+   * Do not gate CT_CLK here. Treat "stopped" as a logical state:
+   * IRQs are masked, pending IRQs are cleared, and the ISR ignores any late
+   * callback until hw_timer_start() marks the timer running again.
    */
-}
-
-static uint32_t hw_timer_calibrate_ct_frequency(uint32_t register_ct_freq) {
-  if (osKernelGetState() != osKernelRunning) {
-    printf("hw_timer: calibration skipped (kernel not running)\n");
-    return register_ct_freq;
-  }
-
-  hw_timer_reset_counter0();
-  hw_timer_write_match(CT_MATCH_MAX, false);
-
-  const uint32_t start_ms = osKernelGetTickCount();
-  (void)sl_si91x_config_timer_start_on_software_trigger(SL_COUNTER_0);
-  osDelay(CT_CALIBRATION_MS);
-  const uint32_t elapsed_ms = osKernelGetTickCount() - start_ms;
-  const uint32_t count = hw_timer_read_counter0();
-  hw_timer_force_stop_counter0();
-
-  if (elapsed_ms == 0U || count < CT_MIN_VALID_CALIBRATION_TICKS) {
-    printf("hw_timer: calibration invalid count=%lu elapsed=%lu ms, using "
-           "register rate\n",
-           (unsigned long)count, (unsigned long)elapsed_ms);
-    return register_ct_freq;
-  }
-
-  const uint32_t measured_hz =
-      (uint32_t)(((uint64_t)count * 1000ULL) / (uint64_t)elapsed_ms);
-
-  printf("hw_timer: calibrated CT count=%lu over %lu ms => %lu Hz\n",
-         (unsigned long)count, (unsigned long)elapsed_ms,
-         (unsigned long)measured_hz);
-
-  if (register_ct_freq != 0U) {
-    const uint32_t high =
-        register_ct_freq > measured_hz ? register_ct_freq : measured_hz;
-    const uint32_t low =
-        register_ct_freq > measured_hz ? measured_hz : register_ct_freq;
-
-    if (low != 0U && high > (low * 101U / 100U)) {
-      printf("hw_timer: measured CT diagnostic=%lu Hz differs from register "
-             "base=%lu Hz; using register base\n",
-             (unsigned long)measured_hz, (unsigned long)register_ct_freq);
-    } else {
-      printf("hw_timer: using register CT base=%lu Hz (measured=%lu Hz)\n",
-             (unsigned long)register_ct_freq, (unsigned long)measured_hz);
-    }
-    return register_ct_freq;
-  }
-
-  return measured_hz;
 }
 
 /**
  * @brief Update the CT match value for interval changes
  * @param interval_us New half-interval in microseconds
  *
- * Uses the buffer register for glitch-free updates when enabled.
+ * Applies the update directly to the active match register. The SiWx917 CT
+ * match buffer does not visibly steer the live periodic cadence in our ELRS
+ * RX ISR path, which lets the PFD frequency offset rail while callbacks remain
+ * at the old interval.
  */
 static void hw_timer_update_match(uint32_t interval_us) {
   /* Guard: Don't access CT hardware if not initialized */
@@ -441,8 +399,7 @@ static void hw_timer_update_match(uint32_t interval_us) {
   hw_timer.match_value = new_match;
   hw_timer.programmed_half_interval_us = interval_us;
 
-  /* Buffering is enabled, so update Counter 0 through its match buffer. */
-  hw_timer_write_match(new_match, true);
+  hw_timer_write_match(new_match, false);
 }
 
 /* ========================================================================== */
@@ -537,11 +494,11 @@ static void hw_timer_ct_callback(void *callback_flag) {
 static uint32_t hw_timer_ram_vector_table[SI91X_VECTOR_TABLE_ENTRIES]
     __attribute__((aligned(512)));
 
-static void hw_timer_direct_ct_irq(void) {
+static void SIW917_ELRS_RAMFUNC_ATTR hw_timer_direct_ct_irq(void) {
   const uint32_t status = CT->CT_INTR_STS;
 
-  if (status & SL_CT_COUNTER_0_IS_PEAK_FLAG) {
-    CT->CT_INTR_ACK = SL_CT_COUNTER_0_IS_PEAK_FLAG;
+  if (status & RSI_CT_EVENT_COUNTER_0_IS_PEAK_l) {
+    CT->CT_INTR_ACK = RSI_CT_EVENT_COUNTER_0_IS_PEAK_l;
     hw_timer_ct_callback(NULL);
     return;
   }
@@ -728,57 +685,12 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   printf("hw_timer: [2/7] actual CT base=%lu Hz, ticks/us=%lu\n",
          actual_ct_freq, ct_ticks_per_us);
 
-  /* Step 5: Keep the hardware in the SDK's Counter 0 16-bit path. */
-  printf("hw_timer: [3/7] RSI_CT_Config(CT, 0) for explicit 16-bit...\n");
-  RSI_CT_Config(CT, 0); /* SDK implementation clears COUNTER32_BITMODE. */
+  /* Step 5: Configure Counter 0 directly in the CT peripheral. */
+  printf("hw_timer: [3/7] direct CT Counter0 config (16-bit periodic)...\n");
+  hw_timer_configure_counter0_direct();
   printf("hw_timer: [3/7] DONE\n");
 
-  /* Configure CT for periodic up-count mode with buffer. */
-  sl_config_timer_config_t ct_config = {
-      .is_counter_mode_32bit_enabled = false,
-      .is_counter0_soft_reset_enabled = false,
-      .is_counter0_periodic_enabled = true, /* Periodic mode - auto reload */
-      .is_counter0_trigger_enabled = false, /* We use software trigger */
-      .is_counter0_sync_trigger_enabled = false,
-      .is_counter0_buffer_enabled =
-          true, /* Enable buffer for glitch-free updates */
-      .is_counter1_soft_reset_enabled = false,
-      .is_counter1_periodic_enabled = false,
-      .is_counter1_trigger_enabled = false,
-      .is_counter1_sync_trigger_enabled = false,
-      .is_counter1_buffer_enabled = false,
-      .counter0_direction = SL_COUNTER0_UP, /* Up counter */
-      .counter1_direction = SL_COUNTER1_UP,
-  };
-
-  printf("hw_timer: [4/7] sl_si91x_config_timer_set_configuration...\n");
-  status = sl_si91x_config_timer_set_configuration(&ct_config);
-  printf("hw_timer: [4/7] status=0x%04lX\n", (unsigned long)status);
-  if (status != SL_STATUS_OK) {
-    printf("hw_timer: FAILED at set_configuration!\n");
-    return status;
-  }
-
-  actual_ct_freq = hw_timer_calibrate_ct_frequency(actual_ct_freq);
-  if (actual_ct_freq != 0U) {
-    ct_freq_hz = actual_ct_freq;
-    ct_ticks_per_us = (actual_ct_freq + 500000U) / 1000000U;
-    if (ct_ticks_per_us == 0U) {
-      ct_ticks_per_us = 1U;
-    }
-  }
-
-  status = hw_timer_enable_ct_clock();
-  if (status != SL_STATUS_OK) {
-    printf("hw_timer: FAILED re-enabling CT clock after calibration!\n");
-    return status;
-  }
-
-  status = sl_si91x_config_timer_set_configuration(&ct_config);
-  if (status != SL_STATUS_OK) {
-    printf("hw_timer: FAILED re-applying counter config after calibration!\n");
-    return status;
-  }
+  printf("hw_timer: [4/7] CT config path=bare-metal registers\n");
 
   hw_timer.match_value = us_to_match_value(hw_timer.half_interval_us);
   hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
@@ -788,32 +700,14 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
          (unsigned long)hw_timer.match_value, (unsigned long)CT_MATCH_MAX);
 
   /* Set initial match value (counter 0) */
-  printf("hw_timer: [5/7] sl_si91x_config_timer_set_match_count(16BIT, CNT0, "
-         "%lu)...\n",
+  printf("hw_timer: [5/7] direct CT match write CNT0=%lu...\n",
          hw_timer.match_value);
-  status = sl_si91x_config_timer_set_match_count(SL_COUNTER_16BIT, SL_COUNTER_0,
-                                                 hw_timer.match_value);
-  printf("hw_timer: [5/7] status=0x%04lX\n", (unsigned long)status);
-  if (status != SL_STATUS_OK) {
-    printf("hw_timer: FAILED at set_match_count!\n");
-    return status;
-  }
   hw_timer_write_match(hw_timer.match_value, false);
+  printf("hw_timer: [5/7] DONE\n");
 
-  /* Configure interrupt flags - enable peak (match) interrupt for counter 0 */
-  sl_config_timer_interrupt_flags_t int_flags = {
-      .is_counter0_event_interrupt_enabled = false,
-      .is_counter0_fifo_full_interrupt_enabled = false,
-      .is_counter0_hit_zero_interrupt_enabled = false,
-      .is_counter0_hit_peak_interrupt_enabled = true, /* Fire on match */
-      .is_counter1_event_interrupt_enabled = false,
-      .is_counter1_fifo_full_interrupt_enabled = false,
-      .is_counter1_hit_zero_interrupt_enabled = false,
-      .is_counter1_hit_peak_interrupt_enabled = false,
-  };
-
-  /* Clear any pending CT interrupt before registering callback */
+  /* Clear any pending CT interrupt before enabling the direct vector. */
   printf("hw_timer: [6/7] Clearing pending CT IRQ...\n");
+  hw_timer_ack_pending_ct_irq();
   NVIC_ClearPendingIRQ(CT_IRQn);
 
   /* Keep CT at the highest FreeRTOS-safe priority. The timer ISR only queues
@@ -823,24 +717,26 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   printf("hw_timer: [6/7] DONE (priority=%u, FreeRTOS-safe)\n",
          (unsigned)SIW917_ELRS_CT_IRQ_PRIORITY);
 
-  /* Unregister any existing callback first (in case of re-init) */
-  printf("hw_timer: [7/7] Unregistering existing callback (if any)...\n");
-  sl_si91x_config_timer_unregister_callback(&int_flags);
+#if !SIW917_ELRS_DIRECT_CT_IRQ
+#error "ELRS radio timer requires SIW917_ELRS_DIRECT_CT_IRQ for bare-metal CT"
+#endif
 
-  /* Register callback for CT interrupts */
-  printf("hw_timer: [8/8] sl_si91x_config_timer_register_callback...\n");
-  status = sl_si91x_config_timer_register_callback(
-      hw_timer_ct_callback, (void *)&ct_interrupt_flag, &int_flags);
-  printf("hw_timer: [8/8] status=0x%04lX\n", (unsigned long)status);
+  bool direct_ct_vector_installed = false;
+  printf("hw_timer: [7/7] Installing direct CT vector...\n");
+  direct_ct_vector_installed = hw_timer_install_direct_ct_vector();
+  if (direct_ct_vector_installed) {
+    printf("hw_timer: [8/8] direct CT IRQ enable path (bare-metal only)\n");
+    hw_timer_ack_pending_ct_irq();
+    hw_timer_enable_counter0_peak_irq();
+    status = SL_STATUS_OK;
+  } else {
+    printf("hw_timer: direct CT vector install failed\n");
+    status = SL_STATUS_FAIL;
+  }
 
   if (status != SL_STATUS_OK) {
-    printf("hw_timer: FAILED at register_callback!");
+    printf("hw_timer: FAILED at CT IRQ setup!");
   } else {
-#if SIW917_ELRS_DIRECT_CT_IRQ
-    if (!hw_timer_install_direct_ct_vector()) {
-      printf("hw_timer: direct CT IRQ install failed; using SDK handler\n");
-    }
-#endif
     hw_timer.is_initialized = true;
     hw_timer_force_stop_counter0();
     printf("hw_timer: init COMPLETE OK (counter stopped)\n");
@@ -884,13 +780,8 @@ sl_status_t hw_timer_start(void) {
     return status;
   }
 
-  status = hw_timer_apply_counter0_config();
-  if (status != SL_STATUS_OK) {
-    hw_timer_force_stop_counter0();
-    return status;
-  }
-
   hw_timer_reset_counter0();
+  hw_timer_configure_counter0_direct();
   hw_timer_write_match(hw_timer.match_value, false);
   hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
 
@@ -898,17 +789,13 @@ sl_status_t hw_timer_start(void) {
   hw_timer.is_paused = false;
   hw_timer.is_tock = true; /* First callback will be TOCK */
 
+  hw_timer_ack_pending_ct_irq();
   NVIC_ClearPendingIRQ(CT_IRQn);
+  hw_timer_enable_counter0_peak_irq();
   NVIC_EnableIRQ(CT_IRQn);
 
-  /* Start counter 0 via software trigger */
-  status = sl_si91x_config_timer_start_on_software_trigger(SL_COUNTER_0);
-  if (status != SL_STATUS_OK) {
-    hw_timer.is_running = false;
-    hw_timer.is_paused = false;
-    hw_timer_force_stop_counter0();
-  }
-  return status;
+  hw_timer_start_counter0_direct();
+  return SL_STATUS_OK;
 }
 
 /**
@@ -926,7 +813,7 @@ sl_status_t hw_timer_stop(void) {
 /**
  * @brief Deinitialize the hardware timer
  *
- * Stops the timer and unregisters the callback. Call this during shutdown.
+ * Stops the timer and clears callbacks. Call this during shutdown.
  */
 void hw_timer_deinit(void) {
   /* Stop timer if running */
@@ -934,12 +821,6 @@ void hw_timer_deinit(void) {
     hw_timer_stop();
     hw_timer.is_running = false;
   }
-
-  /* Unregister callback */
-  sl_config_timer_interrupt_flags_t int_flags = {
-      .is_counter0_hit_peak_interrupt_enabled = true,
-  };
-  sl_si91x_config_timer_unregister_callback(&int_flags);
 
   /* Clear callbacks */
   hw_timer.tick_callback = NULL;
@@ -960,7 +841,11 @@ void hw_timer_deinit(void) {
  */
 void hw_timer_pause(void) {
   if (hw_timer.is_running && !hw_timer.is_paused) {
-    sl_si91x_config_timer_select_action_event(HALT, SL_NO_EVENT, SL_NO_EVENT);
+    NVIC_DisableIRQ(CT_IRQn);
+    hw_timer_disable_counter0_peak_irq();
+    hw_timer_stop_counter0_direct();
+    hw_timer_ack_pending_ct_irq();
+    NVIC_ClearPendingIRQ(CT_IRQn);
     hw_timer.is_paused = true;
   }
 }
@@ -975,10 +860,17 @@ void hw_timer_resume(void) {
   if (hw_timer.is_running && hw_timer.is_paused) {
     /* Reset to known state - start with TOCK */
     hw_timer.is_tock = true;
+    hw_timer_reset_counter0();
+    hw_timer_configure_counter0_direct();
+    hw_timer_write_match(hw_timer.match_value, false);
+    hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
+    hw_timer_ack_pending_ct_irq();
+    NVIC_ClearPendingIRQ(CT_IRQn);
 
-    /* Resume from halt */
-    sl_si91x_config_timer_resume_halt_event(SL_COUNTER_0);
     hw_timer.is_paused = false;
+    hw_timer_enable_counter0_peak_irq();
+    NVIC_EnableIRQ(CT_IRQn);
+    hw_timer_start_counter0_direct();
   }
 }
 
@@ -1009,7 +901,7 @@ uint32_t hw_timer_get_micros(void) {
 
   /* Reading CT registers while the peripheral clock is gated can hang. */
   if (ct_clock_enabled && hw_timer.is_running && !hw_timer.is_paused) {
-    sl_si91x_config_timer_get_count(SL_COUNTER_16BIT, SL_COUNTER_0, &count);
+    count = hw_timer_read_counter0();
   }
 
   /* Capture the counter atomically with the timer read */
@@ -1185,7 +1077,12 @@ uint32_t hw_timer_get_total_half_ticks(void) {
   return hw_timer.total_half_ticks;
 }
 
-uint32_t hw_timer_get_match_value(void) { return hw_timer.match_value; }
+uint32_t hw_timer_get_match_value(void) {
+  if (ct_clock_enabled && hw_timer.is_running && !hw_timer.is_paused) {
+    return CT->CT_MATCH_REG_b.COUNTER_0_MATCH & CT_MATCH_MAX;
+  }
+  return hw_timer.match_value;
+}
 
 uint32_t hw_timer_get_ct_freq_hz(void) { return ct_freq_hz; }
 

@@ -50,7 +50,7 @@ uint32_t logo_image = 0;
 firmware_options_t firmwareOptions = {
     ._magic_ = {'E', 'L', 'R', 'S', 'O', 'P', 'T', 'S'},
     ._version_ = 1,
-    .domain = ISM2G4,  // Force 2.4GHz startup for SiW917/LR1121 bring-up
+    .domain = FCC915,
     .hasUID = 0,
     .uid = {0, 0, 0, 0, 0, 0},
     .flash_discriminator = 0,
@@ -69,8 +69,7 @@ firmware_options_t firmwareOptions = {
 
 bool options_init()
 {
-    // Keep runtime behavior on 2.4GHz for bring-up so we avoid the 900MHz path.
-    firmwareOptions.domain = ISM2G4;
+    firmwareOptions.domain = FCC915;
 
     // Load UID from NVM3 persistent config
     // elrs_config_init() must be called before this function
@@ -149,7 +148,7 @@ void setOptions(String &options)
 void options_SetTrueDefaults()
 {
     // Reset to compiled defaults
-    firmwareOptions.domain = ISM2G4;
+    firmwareOptions.domain = FCC915;
     firmwareOptions.hasUID = 0;
     memset(firmwareOptions.uid, 0, sizeof(firmwareOptions.uid));
     firmwareOptions.flash_discriminator = 0;
