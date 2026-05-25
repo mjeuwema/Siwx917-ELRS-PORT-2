@@ -1948,7 +1948,7 @@ static void LinkStatsToOta(OTA_LinkStats_s *ls) {
   ls->antenna = antenna;
   ls->modelMatch = connectionHasModelMatch;
   ls->lq = linkStats.uplink_Link_quality;
-  ls->trueDiversityAvailable = 0;
+  ls->trueDiversityAvailable = isDualRadio() ? 1 : 0;
   if (SnrMean.getCount()) {
     ls->SNR = SnrMean.mean();
   } else {
@@ -2260,7 +2260,9 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
     DBGLN("TX returned to normal OTA mode");
   }
 
-  geminiMode = otaSync->geminiMode;
+  // A single-LR1121 RX must not mirror the TX's Gemini request locally. The
+  // link-stat trueDiversityAvailable bit tells a Gemini TX to step down.
+  geminiMode = isDualRadio() ? otaSync->geminiMode : 0;
 
   // Will change the packet air rate in loop() if this changes
   ExpressLRS_nextAirRateIndex =
