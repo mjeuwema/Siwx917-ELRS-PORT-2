@@ -9,10 +9,13 @@
 #include <cstring>
 
 #define RX_EP_DIAG 0
-#define RX_EP_EVENT_LOG 1
+#define RX_EP_EVENT_LOG 0
 
 extern "C" void elrs_cpp_request_wifi_mode(void);
 extern "C" void elrs_enter_binding_mode(void);
+extern "C" int elrs_config_save_with_rf_rearm(void);
+extern "C" void elrs_apply_bind_storage_change(uint8_t bindStorage);
+extern "C" bool elrs_is_on_loan(void);
 extern "C" void siw917_rx_set_model_match_id(uint8_t modelId);
 extern "C" uint8_t siw917_rx_get_active_serial_protocol(void);
 
@@ -96,7 +99,7 @@ static selectionParameter luaBindStorage = {
 };
 
 static commandParameter luaBindMode = {
-    {STR_EMPTYSPACE, CRSF_COMMAND, 0, 0},
+    {"Enter Bind Mode", CRSF_COMMAND, 0, 0},
     lcsIdle,
     STR_EMPTYSPACE,
 };
@@ -126,6 +129,21 @@ static uint8_t clampU8(uint8_t value, uint8_t minValue, uint8_t maxValue) {
     return maxValue;
   }
   return value;
+}
+
+static uint8_t currentBindStorage() {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr || cfg->bind_storage > ELRS_BIND_STORAGE_ADMINISTERED) {
+    return ELRS_BIND_STORAGE_PERSISTENT;
+  }
+  return cfg->bind_storage;
+}
+
+static const char *currentBindModeName() {
+  if (currentBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+    return "Bind Admin Only";
+  }
+  return elrs_is_on_loan() ? "Return Model" : "Enter Bind Mode";
 }
 
 static void initModelOptions() {
@@ -379,7 +397,8 @@ void SiW917RXEndpoint::registerParameters() {
   registerParameter(&luaBindStorage, [this](propertiesCommon *, int32_t arg) {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
-      cfg->bind_storage = clampU8((uint8_t)arg, 0, 3);
+      elrs_apply_bind_storage_change((uint8_t)arg);
+      updateParameters();
 #if RX_EP_EVENT_LOG
       logParameterWrite("Bind Storage", cfg->bind_storage);
 #endif
@@ -451,7 +470,7 @@ void SiW917RXEndpoint::updateParameters() {
       siw917_rx_get_active_serial_protocol() == ELRS_SERIAL_MAVLINK;
   LUA_FIELD_VISIBLE(luaSourceSysId, mavlinkFieldsVisible);
   LUA_FIELD_VISIBLE(luaTargetSysId, mavlinkFieldsVisible);
-  luaBindMode.common.name = "Enter Bind Mode";
+  luaBindMode.common.name = currentBindModeName();
 }
 
 void SiW917RXEndpoint::requestConfigSave(bool applySerialAfterSave) {
@@ -493,6 +512,17 @@ void SiW917RXEndpoint::handleWiFiCommand(propertiesCommon *item, int32_t arg) {
 }
 
 void SiW917RXEndpoint::handleBindCommand(propertiesCommon *item, int32_t arg) {
+  if (currentBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+#if RX_EP_EVENT_LOG
+    DBGLN("[RX_LUA] BIND_COMMAND_BLOCKED administered=1");
+#endif
+#if RX_EP_DIAG
+    DBGLN("[RX_EP] bind cmd blocked by administered storage");
+#endif
+    sendCommandResponse((commandParameter *)item, lcsIdle, "Admin only");
+    return;
+  }
+
   if (arg == lcsQuery) {
     bindPending = true;
     pendingActionAtMs = millis();
@@ -516,16 +546,21 @@ void SiW917RXEndpoint::processPending(bool telemetryBusy) {
 
   if (configSavePending &&
       (uint32_t)(now - configSaveAtMs) < 0x80000000UL && !telemetryBusy) {
-    configSavePending = false;
     const bool applySerial = serialApplyPending;
-    serialApplyPending = false;
-    const int saveResult = elrs_config_save();
+    const int saveResult = elrs_config_save_with_rf_rearm();
+
+    if (saveResult == 1) {
+      configSaveAtMs = now + 1000U;
+    } else {
+      configSavePending = false;
+      serialApplyPending = false;
 #if RX_EP_EVENT_LOG
-    DBGLN("[RX_LUA] CONFIG_SAVE_DONE result=%d serialApply=%u", saveResult,
-          applySerial ? 1 : 0);
+      DBGLN("[RX_LUA] CONFIG_SAVE_DONE result=%d serialApply=%u", saveResult,
+            applySerial ? 1 : 0);
 #endif
-    if (saveResult == 0 && applySerial) {
-      serialApplyRequested = true;
+      if (saveResult == 0 && applySerial) {
+        serialApplyRequested = true;
+      }
     }
   }
 

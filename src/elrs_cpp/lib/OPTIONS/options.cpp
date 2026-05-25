@@ -41,6 +41,19 @@ const char *wifi_ap_ssid = "ExpressLRS RX";
 const char *wifi_ap_password = "expresslrs";
 const char *wifi_ap_address = "10.0.0.1";
 
+#ifndef OPTIONS_UID_DIAG
+#define OPTIONS_UID_DIAG 0
+#endif
+
+static constexpr uint8_t FLASHED_UID[6] = {0xBE, 0x93, 0x67,
+                                           0x27, 0xD6, 0x9C};
+
+static void loadFlashedUid()
+{
+    firmwareOptions.hasUID = 1;
+    memcpy(firmwareOptions.uid, FLASHED_UID, sizeof(firmwareOptions.uid));
+}
+
 // Device name storage
 char device_name[ELRSOPTS_DEVICENAME_SIZE] = "SiW917 RX";
 char product_name[ELRSOPTS_PRODUCTNAME_SIZE] = "ExpressLRS SiW917";
@@ -70,31 +83,22 @@ firmware_options_t firmwareOptions = {
 bool options_init()
 {
     firmwareOptions.domain = FCC915;
+    loadFlashedUid();
 
-    // Load UID from NVM3 persistent config
-    // elrs_config_init() must be called before this function
+    // firmwareOptions.uid is the flashed/home UID. Runtime binding is loaded
+    // from elrs_config by rx_main, matching upstream Returnable Bind Storage.
+#if OPTIONS_UID_DIAG
     elrs_config_t* cfg = elrs_config_get();
-    
     if (cfg != nullptr) {
-        // Copy UID from persistent config
-        memcpy(firmwareOptions.uid, cfg->uid, 6);
-        firmwareOptions.hasUID = 1;
-        
-        DBGLN("Loaded UID from NVM3: %02X:%02X:%02X:%02X:%02X:%02X",
-              firmwareOptions.uid[0], firmwareOptions.uid[1],
-              firmwareOptions.uid[2], firmwareOptions.uid[3],
-              firmwareOptions.uid[4], firmwareOptions.uid[5]);
-    } else {
-        // Fallback to hardcoded UID if config not available
-        DBGLN("WARNING: Config not available, using hardcoded UID");
-        firmwareOptions.uid[0] = 0xBE;
-        firmwareOptions.uid[1] = 0x93;
-        firmwareOptions.uid[2] = 0x67;
-        firmwareOptions.uid[3] = 0x27;
-        firmwareOptions.uid[4] = 0xD6;
-        firmwareOptions.uid[5] = 0x9C;
-        firmwareOptions.hasUID = 1;
+        DBGLN("Config UID in NVM3: %02X:%02X:%02X:%02X:%02X:%02X",
+              cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3],
+              cfg->uid[4], cfg->uid[5]);
     }
+    DBGLN("Flashed UID: %02X:%02X:%02X:%02X:%02X:%02X",
+          firmwareOptions.uid[0], firmwareOptions.uid[1],
+          firmwareOptions.uid[2], firmwareOptions.uid[3],
+          firmwareOptions.uid[4], firmwareOptions.uid[5]);
+#endif
 
     DBGLN("Options initialized - domain=%d, baud=%lu",
           firmwareOptions.domain, firmwareOptions.uart_baud);
@@ -124,9 +128,6 @@ void saveOptions()
     // Save options to NVM3 persistent storage
     elrs_config_t* cfg = elrs_config_get();
     if (cfg) {
-        // Copy UID to config
-        memcpy(cfg->uid, firmwareOptions.uid, 6);
-        
         // Save to flash
         int result = elrs_config_save();
         if (result == 0) {
@@ -149,8 +150,7 @@ void options_SetTrueDefaults()
 {
     // Reset to compiled defaults
     firmwareOptions.domain = FCC915;
-    firmwareOptions.hasUID = 0;
-    memset(firmwareOptions.uid, 0, sizeof(firmwareOptions.uid));
+    loadFlashedUid();
     firmwareOptions.flash_discriminator = 0;
     firmwareOptions.fan_min_runtime = 0;
     firmwareOptions.wifi_auto_on_interval = -1;

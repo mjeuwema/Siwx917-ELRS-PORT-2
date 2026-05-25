@@ -143,12 +143,22 @@ static const uint32_t ConsiderConnGoodMillis = 1000;
 connectionState_e connectionState = disconnected;
 uint8_t UID[UID_LEN] = {0};
 bool connectionHasModelMatch = false;
-bool teamraceHasModelMatch = true; // Always true for basic RX
+bool teamraceHasModelMatch = true;
 static bool lastConnectionHadModelMatch = false;
 bool InBindingMode = false;
 static bool bindingModeRequest = false;
 bool InWiFiMode = false; // WiFi configuration mode
 uint8_t ExpressLRS_currTlmDenom = 1;
+
+enum teamraceOutputInhibitState_e : uint8_t {
+  troiPass = 0,
+  troiDisableAwaitConfirm,
+  troiInhibit,
+  troiEnableAwaitConfirm,
+};
+
+static teamraceOutputInhibitState_e teamraceOutputInhibitState = troiPass;
+static uint8_t lastTeamracePosition = 0;
 
 expresslrs_mod_settings_s *ExpressLRS_currAirRate_Modparams = nullptr;
 expresslrs_rf_pref_params_s *ExpressLRS_currAirRate_RFperfParams = nullptr;
@@ -580,6 +590,17 @@ enum RxLuaParamId : uint8_t {
   RX_LUA_PARAM_COUNT = RX_LUA_PARAM_TLM_POWER,
 };
 
+static uint8_t getConfiguredBindStorage();
+extern "C" bool elrs_is_on_loan(void);
+extern "C" void elrs_apply_bind_storage_change(uint8_t bindStorage);
+
+static const char *rxLuaBindCommandName() {
+  if (getConfiguredBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+    return "Bind Admin Only";
+  }
+  return elrs_is_on_loan() ? "Return Model" : "Enter Bind Mode";
+}
+
 static char rxLuaModelIdValue[8] = "Off";
 static char rxLuaTlmRatioValue[8] = "1:1";
 static uint8_t rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
@@ -836,6 +857,13 @@ static void rxLuaHandleCommandWrite(uint8_t arg, uint8_t *step,
 }
 
 static void rxLuaHandleBindCommandWrite(uint8_t arg) {
+  if (getConfiguredBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+    rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
+    rxLuaBindCommandInfo = "Admin only";
+    rxLuaBindPending = false;
+    return;
+  }
+
   // Mirrors upstream RXParameters: bind enters only after the TX polls QUERY.
   if (arg == RX_LUA_CMD_QUERY) {
     rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
@@ -1409,9 +1437,12 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     break;
   case RX_LUA_PARAM_BIND:
     paramType = CRSF_COMMAND;
-    name = "Enter Bind Mode";
+    name = rxLuaBindCommandName();
     commandStep = rxLuaBindCommandStep;
-    commandInfo = rxLuaBindCommandInfo;
+    commandInfo =
+        getConfiguredBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED
+            ? "Admin only"
+            : rxLuaBindCommandInfo;
     break;
   case RX_LUA_PARAM_MODEL_ID:
     paramType = CRSF_TEXT_SELECTION;
@@ -1627,9 +1658,10 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
     break;
   case RX_LUA_PARAM_BIND_STORAGE:
     if (cfg != nullptr) {
-      cfg->bind_storage = clampU8(arg, 0, 3);
+      elrs_apply_bind_storage_change(arg);
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
+      rxLuaQueueParameter(origin, RX_LUA_PARAM_BIND, 0);
     }
     break;
   case RX_LUA_PARAM_BIND:
@@ -1869,6 +1901,159 @@ static uint8_t getConfiguredFailsafeMode() {
   return cfg->failsafe_mode;
 }
 
+static uint8_t getConfiguredBindStorage() {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr || cfg->bind_storage > ELRS_BIND_STORAGE_ADMINISTERED) {
+    return ELRS_BIND_STORAGE_PERSISTENT;
+  }
+  return cfg->bind_storage;
+}
+
+extern "C" bool elrs_is_on_loan(void) {
+  elrs_config_t *cfg = elrs_config_get();
+  return cfg != nullptr && cfg->bind_storage == ELRS_BIND_STORAGE_RETURNABLE &&
+         firmwareOptions.hasUID && elrs_config_is_bound() &&
+         memcmp(cfg->uid, firmwareOptions.uid, UID_LEN) != 0;
+}
+
+static bool returnLoanIfNeeded(bool refreshRuntime = true) {
+  if (!elrs_is_on_loan()) {
+    return false;
+  }
+
+  uint8_t returnUid[UID_LEN] = {};
+  if (firmwareOptions.hasUID) {
+    memcpy(returnUid, firmwareOptions.uid, UID_LEN);
+  }
+
+  (void)elrs_config_set_uid(returnUid);
+  memcpy(UID, returnUid, UID_LEN);
+  if (refreshRuntime) {
+    uidRefreshPending = true;
+  }
+
+  if (firmwareOptions.hasUID) {
+    DBGLN("Returnable bind returned to flashed UID");
+  } else {
+    DBGLN("Returnable bind returned to unbound state");
+  }
+  return true;
+}
+
+extern "C" void elrs_apply_bind_storage_change(uint8_t bindStorage) {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr) {
+    return;
+  }
+
+  const uint8_t newBindStorage =
+      clampU8(bindStorage, ELRS_BIND_STORAGE_PERSISTENT,
+              ELRS_BIND_STORAGE_ADMINISTERED);
+  if (cfg->bind_storage == newBindStorage) {
+    return;
+  }
+
+  // Upstream SetBindStorage() calls ReturnLoan() before changing the mode.
+  (void)returnLoanIfNeeded(true);
+  cfg->bind_storage = newBindStorage;
+}
+
+static uint8_t getConfiguredTeamracePosition() {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr || cfg->teamrace_position > 7) {
+    return 0;
+  }
+  return cfg->teamrace_position;
+}
+
+static uint8_t getConfiguredTeamraceChannel() {
+  elrs_config_t *cfg = elrs_config_get();
+  const uint8_t selection =
+      (cfg != nullptr && cfg->teamrace_channel <= 10) ? cfg->teamrace_channel
+                                                      : 0;
+  return (uint8_t)(AUX2 + selection);
+}
+
+static bool teamraceIsEnabled() { return getConfiguredTeamracePosition() != 0; }
+
+static uint8_t teamraceChannelToConfigValue() {
+  const uint8_t channel = getConfiguredTeamraceChannel();
+  if (channel >= CRSF_NUM_CHANNELS) {
+    return 0;
+  }
+
+  const uint8_t switchPosition =
+      CRSF_to_SWITCH3b((uint16_t)ChannelData[channel]);
+  switch (switchPosition) {
+  case 0:
+  case 1:
+  case 2:
+    return (uint8_t)(switchPosition + 1);
+  case 3:
+  case 4:
+  case 5:
+    return (uint8_t)(switchPosition + 2);
+  case 7:
+    return 4;
+  default:
+    return 0;
+  }
+}
+
+static void resetTeamraceModelMatch() {
+  teamraceOutputInhibitState = troiPass;
+  lastTeamracePosition = 0;
+  teamraceHasModelMatch = true;
+}
+
+static bool updateTeamraceModelMatch() {
+  const uint8_t configuredPosition = getConfiguredTeamracePosition();
+  if (configuredPosition == 0) {
+    resetTeamraceModelMatch();
+    return connectionHasModelMatch;
+  }
+
+  if (!connectionHasModelMatch) {
+    teamraceHasModelMatch = false;
+    return false;
+  }
+
+  const bool shouldForwardChannels = teamraceOutputInhibitState < troiInhibit;
+  const uint8_t newTeamracePosition = teamraceChannelToConfigValue();
+
+  switch (teamraceOutputInhibitState) {
+  case troiPass:
+    if (newTeamracePosition != configuredPosition) {
+      teamraceOutputInhibitState = troiDisableAwaitConfirm;
+    }
+    break;
+
+  case troiDisableAwaitConfirm:
+    if (newTeamracePosition == lastTeamracePosition) {
+      teamraceOutputInhibitState =
+          (newTeamracePosition != configuredPosition) ? troiInhibit : troiPass;
+    }
+    break;
+
+  case troiInhibit:
+    if (newTeamracePosition == configuredPosition) {
+      teamraceOutputInhibitState = troiEnableAwaitConfirm;
+    }
+    break;
+
+  case troiEnableAwaitConfirm:
+    if (newTeamracePosition == lastTeamracePosition) {
+      teamraceOutputInhibitState =
+          (newTeamracePosition == configuredPosition) ? troiPass : troiInhibit;
+    }
+    break;
+  }
+
+  lastTeamracePosition = newTeamracePosition;
+  teamraceHasModelMatch = teamraceOutputInhibitState == troiPass;
+  return shouldForwardChannels;
+}
+
 static bool shouldOutputCrsfRcFrames() {
   if (InBindingMode || InWiFiMode || !crsf_serial_is_ready() ||
       !configuredSerialProtocolUsesCrsf() ||
@@ -1877,7 +2062,8 @@ static bool shouldOutputCrsfRcFrames() {
   }
 
   if (connectionState == connected) {
-    return connectionHasModelMatch;
+    return connectionHasModelMatch &&
+           (!teamraceIsEnabled() || teamraceHasModelMatch);
   }
 
   const uint8_t failsafeMode = getConfiguredFailsafeMode();
@@ -1899,6 +2085,15 @@ static bool shouldOutputCrsfRcFrames() {
 uint32_t uidMacSeedGet() {
   return ((uint32_t)UID[2] << 24) | ((uint32_t)UID[3] << 16) |
          ((uint32_t)UID[4] << 8) | (UID[5] ^ OTA_VERSION_ID);
+}
+
+static bool uidIsBound(const uint8_t uid[UID_LEN]) {
+  for (unsigned i = 0; i < UID_LEN; ++i) {
+    if (uid[i] != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static bool use2G4Domain(void) { return firmwareOptions.domain >= 8; }
@@ -2089,17 +2284,18 @@ static void LinkStatsToOta(OTA_LinkStats_s *ls) {
 }
 
 static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
+  const uint8_t bindStorage = getConfiguredBindStorage();
+  if (bindStorage == ELRS_BIND_STORAGE_ADMINISTERED) {
+    DBGLN("MSP bind ignored - Bind Storage is Administered");
+    return;
+  }
+
   UID[0] = 0;
   UID[1] = 0;
   for (unsigned i = 0; i < 4; i++) {
     UID[i + 2] = newUid4[i];
   }
 
-  memcpy(firmwareOptions.uid, UID, UID_LEN);
-
-  elrs_config_t *cfg = elrs_config_get();
-  const uint8_t bindStorage =
-      cfg != nullptr ? cfg->bind_storage : (uint8_t)ELRS_BIND_STORAGE_PERSISTENT;
   if (bindStorage == ELRS_BIND_STORAGE_VOLATILE) {
     uidSavePending = false;
     uidRefreshPending = true;
@@ -2107,6 +2303,11 @@ static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
   } else {
     memcpy(pendingUid, UID, UID_LEN);
     uidSavePending = true;
+    if (bindStorage == ELRS_BIND_STORAGE_RETURNABLE &&
+        firmwareOptions.hasUID &&
+        memcmp(UID, firmwareOptions.uid, UID_LEN) != 0) {
+      DBGLN("Returnable bind loan UID queued");
+    }
   }
   bindCompletePending = true;
 
@@ -2212,6 +2413,7 @@ static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
   PFDloop.reset();
   setConnectionState(tentative);
   connectionHasModelMatch = false;
+  resetTeamraceModelMatch();
   lastDisconnectReason = DISC_NONE;
   RXtimerState = tim_disconnected;
   PfdPrevRawOffset = 0;
@@ -2293,11 +2495,12 @@ static void LostConnection(bool resumeRx) {
   PfdPrevRawOffset = 0;
   GotConnectionMillis = 0;
   uplinkLQ = 0;
-  lastConnectionHadModelMatch = connectionHasModelMatch;
+  lastConnectionHadModelMatch = connectionHasModelMatch && teamraceHasModelMatch;
   if (getConfiguredFailsafeMode() == ELRS_FAILSAFE_SET) {
     ChannelDataReset();
   }
   connectionHasModelMatch = false;
+  resetTeamraceModelMatch();
   LQCalc.reset();
   LPF_Offset.init(0);
   LPF_OffsetDx.init(0);
@@ -2324,6 +2527,18 @@ static void LostConnection(bool resumeRx) {
     SetRFLinkRate(getStartupOrBindingRateIndex(), true);
     Radio.RXnb();
   }
+}
+
+extern "C" int elrs_config_save_with_rf_rearm(void) {
+  if (InBindingMode || connectionState >= NO_CONFIG_SAVE_STATES) {
+    return 1;
+  }
+
+  lastDisconnectReason = DISC_EXTERNAL;
+  LostConnection(false);
+  const int saveResult = elrs_config_save();
+  Radio.RXnb();
+  return saveResult;
 }
 
 //=============================================================================
@@ -2512,8 +2727,8 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
   }
   InvalidatePrebuiltTelemetry();
 
-  // Notify callback if registered
-  if (connectionHasModelMatch && channelCallback) {
+  const bool shouldForwardChannels = updateTeamraceModelMatch();
+  if (connectionHasModelMatch && shouldForwardChannels && channelCallback) {
     channelCallback(ChannelData, CRSF_NUM_CHANNELS);
   }
 }
@@ -3940,9 +4155,18 @@ static void enterBindingModeNow() {
 
   bindingModeRequest = false;
 
+  if (getConfiguredBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+    DBGLN("Binding mode blocked - Bind Storage is Administered");
+    return;
+  }
+
   if ((connectionState != disconnected) || hwTimer::isRunning()) {
     lastDisconnectReason = DISC_EXTERNAL;
     LostConnection(false);
+  }
+
+  if (returnLoanIfNeeded(false)) {
+    (void)elrs_config_save();
   }
 
   TelemetrySender.ResetState();
@@ -3951,6 +4175,7 @@ static void enterBindingModeNow() {
   dataUlReady = false;
   alreadyTLMresp = false;
   connectionHasModelMatch = false;
+  resetTeamraceModelMatch();
   lastConnectionHadModelMatch = false;
 
   OtaCrcInitializer = OTA_VERSION_ID;
@@ -3998,10 +4223,20 @@ bool elrs_init(void) {
     return false;
   }
 
-  // Copy UID from firmware options
-  memcpy(UID, firmwareOptions.uid, UID_LEN);
+  // Runtime UID comes from config; firmwareOptions.uid remains the flashed UID
+  // so Returnable Bind Storage can detect and return loaned receivers.
+  memset(UID, 0, UID_LEN);
+  if (elrs_config_is_bound()) {
+    (void)elrs_config_get_uid(UID);
+  }
   DBGLN("UID: %02X:%02X:%02X:%02X:%02X:%02X", UID[0], UID[1], UID[2], UID[3],
         UID[4], UID[5]);
+  const bool startInVolatileBindMode =
+      getConfiguredBindStorage() == ELRS_BIND_STORAGE_VOLATILE &&
+      !uidIsBound(UID);
+  if (startInVolatileBindMode) {
+    DBGLN("Bind Storage Volatile - starting in bind mode");
+  }
 
   // Initialize channel data
   ChannelDataReset();
@@ -4080,17 +4315,22 @@ bool elrs_init(void) {
 
   hwTimer::init(HWtimerCallbackTick, HWtimerCallbackTock);
 
-  // Start on the configured rate, matching upstream's scan-start behavior.
-  scanIndex = getStartupOrBindingRateIndex();
-  SetRFLinkRate(scanIndex, false);
   RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow / 2;
 
-  // Start receiving
-  Radio.RXnb();
-  DBGLN("Radio.RXnb() called - LR1121 should be in continuous RX mode");
+  if (startInVolatileBindMode) {
+    enterBindingModeNow();
+  } else {
+    // Start on the configured rate, matching upstream's scan-start behavior.
+    scanIndex = getStartupOrBindingRateIndex();
+    SetRFLinkRate(scanIndex, false);
 
-  // Record start time for rate cycling
-  RFmodeLastCycled = millis();
+    // Start receiving
+    Radio.RXnb();
+    DBGLN("Radio.RXnb() called - LR1121 should be in continuous RX mode");
+
+    // Record start time for rate cycling
+    RFmodeLastCycled = millis();
+  }
 
   activeSerialProtocol = getDesiredActiveSerialProtocol();
   applyConfiguredSerialProtocol();
@@ -4452,15 +4692,19 @@ void elrs_loop(void) {
     uidSavePending = false;
     (void)elrs_config_set_uid(pendingUid);
     (void)elrs_config_save();
-    OtaUpdateCrcInitFromUid();
-    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    if (!InBindingMode) {
+      OtaUpdateCrcInitFromUid();
+      FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    }
     DBGLN("Persisted UID from MSP bind");
   }
 
   if (uidRefreshPending) {
     uidRefreshPending = false;
-    OtaUpdateCrcInitFromUid();
-    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    if (!InBindingMode) {
+      OtaUpdateCrcInitFromUid();
+      FHSSrandomiseFHSSsequence(uidMacSeedGet());
+    }
   }
 
   if (bindCompletePending && !uidSavePending && !uidRefreshPending) {
@@ -4594,8 +4838,9 @@ void elrs_loop(void) {
     }
   }
 
-  crsfReceiver.processPending(TelemetrySender.IsActive() ||
-                              !otaConnector.IsEmpty());
+  const bool telemetryBusy = TelemetrySender.IsActive() ||
+                             !otaConnector.IsEmpty();
+  crsfReceiver.processPending(telemetryBusy);
   if (crsfReceiver.consumeSerialApplyRequest()) {
     requestSerialProtocolApply();
   }
@@ -4768,6 +5013,11 @@ void elrs_enter_binding_mode(void) {
     return;
   }
 
+  if (getConfiguredBindStorage() == ELRS_BIND_STORAGE_ADMINISTERED) {
+    DBGLN("Binding mode request ignored - Bind Storage is Administered");
+    return;
+  }
+
   if (connectionState == connected || connectionState == tentative ||
       hwTimer::isRunning()) {
     bindingModeRequest = true;
@@ -4845,7 +5095,6 @@ bool elrs_set_uid(const uint8_t new_uid[6]) {
 
   // Update runtime UID
   memcpy(UID, new_uid, UID_LEN);
-  memcpy(firmwareOptions.uid, new_uid, UID_LEN);
 
   // Save to persistent storage
   elrs_config_set_uid(new_uid);

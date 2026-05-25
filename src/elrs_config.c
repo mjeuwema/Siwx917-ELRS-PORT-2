@@ -32,6 +32,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef ELRS_CONFIG_SAVE_DIAG
+#define ELRS_CONFIG_SAVE_DIAG 0
+#endif
+
+#if ELRS_CONFIG_SAVE_DIAG
+#define CONFIG_SAVE_DEBUGOUT(...) DEBUGOUT(__VA_ARGS__)
+#define CONFIG_SAVE_FLUSH() fflush(stdout)
+#else
+#define CONFIG_SAVE_DEBUGOUT(...) do { } while (0)
+#define CONFIG_SAVE_FLUSH() do { } while (0)
+#endif
+
 /*******************************************************************************
  * Local Variables
  ******************************************************************************/
@@ -170,6 +182,20 @@ static void update_config_crc(elrs_config_t* config)
   config->crc = calc_crc16((const uint8_t*)config, crc_len);
 }
 
+static bool config_uid_is_bound(const uint8_t uid[6])
+{
+  if (uid == NULL) {
+    return false;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    if (uid[i] != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void normalize_config_fields(elrs_config_t* config)
 {
   if (config == NULL) {
@@ -219,6 +245,12 @@ static void normalize_config_fields(elrs_config_t* config)
   }
   if (config->bind_storage > ELRS_BIND_STORAGE_ADMINISTERED) {
     config->bind_storage = ELRS_BIND_STORAGE_PERSISTENT;
+  }
+
+  if (config_uid_is_bound(config->uid)) {
+    config->flags |= ELRS_CONFIG_FLAG_BOUND;
+  } else {
+    config->flags &= ~ELRS_CONFIG_FLAG_BOUND;
   }
 }
 
@@ -391,23 +423,23 @@ int elrs_config_save(void)
 {
   Ecode_t status;
   
-  DEBUGOUT("[Config] elrs_config_save() called\n");
-  fflush(stdout);
+  CONFIG_SAVE_DEBUGOUT("[Config] elrs_config_save() called\n");
+  CONFIG_SAVE_FLUSH();
   
   if (!g_initialized) {
     DEBUGOUT("[Config] ERROR: Config not initialized\n");
     fflush(stdout);
     return -1;
   }
-  DEBUGOUT("[Config] g_initialized=true, proceeding...\n");
-  fflush(stdout);
+  CONFIG_SAVE_DEBUGOUT("[Config] g_initialized=true, proceeding...\n");
+  CONFIG_SAVE_FLUSH();
 
   normalize_config_fields(&g_config);
 
   /* Update CRC before saving */
-  DEBUGOUT("[Config] Updating CRC...\n");
+  CONFIG_SAVE_DEBUGOUT("[Config] Updating CRC...\n");
   update_config_crc(&g_config);
-  DEBUGOUT("[Config] CRC updated to 0x%04X\n", g_config.crc);
+  CONFIG_SAVE_DEBUGOUT("[Config] CRC updated to 0x%04X\n", g_config.crc);
   
   /* Write to NVM3 
    * 
@@ -417,41 +449,41 @@ int elrs_config_save(void)
    * Add small delay to let WiFi stack settle before flash access.
    * This helps avoid NWP/M4 flash access contention.
    */
-  DEBUGOUT("[Config] Calling nvm3_writeData() - handle=%p, key=0x%lX, size=%u...\n",
-           (void*)nvm3_defaultHandle, (unsigned long)NVM3_KEY_ELRS_CONFIG, 
-           (unsigned int)sizeof(g_config));
-  fflush(stdout);
+  CONFIG_SAVE_DEBUGOUT("[Config] Calling nvm3_writeData() - handle=%p, key=0x%lX, size=%u...\n",
+                       (void*)nvm3_defaultHandle, (unsigned long)NVM3_KEY_ELRS_CONFIG,
+                       (unsigned int)sizeof(g_config));
+  CONFIG_SAVE_FLUSH();
   
   /* Small delay to let WiFi/NWP settle before flash write */
   extern void osDelay(uint32_t ticks);
   osDelay(50);  /* 50ms delay */
   
-  DEBUGOUT("[Config] Executing nvm3_writeData()...\n");
-  fflush(stdout);
+  CONFIG_SAVE_DEBUGOUT("[Config] Executing nvm3_writeData()...\n");
+  CONFIG_SAVE_FLUSH();
   
   status = nvm3_writeData(nvm3_defaultHandle, NVM3_KEY_ELRS_CONFIG,
                           &g_config, sizeof(g_config));
   
-  DEBUGOUT("[Config] nvm3_writeData() returned: 0x%lX\n", (unsigned long)status);
-  fflush(stdout);
+  CONFIG_SAVE_DEBUGOUT("[Config] nvm3_writeData() returned: 0x%lX\n", (unsigned long)status);
+  CONFIG_SAVE_FLUSH();
   
   if (status != ECODE_NVM3_OK) {
     DEBUGOUT("[Config] ERROR: nvm3_writeData failed: 0x%lX\n", (unsigned long)status);
     return -2;
   }
   
-  DEBUGOUT("[Config] Configuration saved to NVM3 (CRC=0x%04X)\n", g_config.crc);
+  CONFIG_SAVE_DEBUGOUT("[Config] Configuration saved to NVM3 (CRC=0x%04X)\n", g_config.crc);
   
   /* Trigger repack if needed */
-  DEBUGOUT("[Config] Checking if repack needed...\n");
+  CONFIG_SAVE_DEBUGOUT("[Config] Checking if repack needed...\n");
   if (nvm3_repackNeeded(nvm3_defaultHandle)) {
-    DEBUGOUT("[Config] NVM3 repack needed, repacking...\n");
+    CONFIG_SAVE_DEBUGOUT("[Config] NVM3 repack needed, repacking...\n");
     status = nvm3_repack(nvm3_defaultHandle);
     if (status != ECODE_NVM3_OK) {
       DEBUGOUT("[Config] WARNING: nvm3_repack failed: 0x%lX\n", (unsigned long)status);
     }
   }
-  DEBUGOUT("[Config] elrs_config_save() complete, returning 0\n");
+  CONFIG_SAVE_DEBUGOUT("[Config] elrs_config_save() complete, returning 0\n");
   
   return 0;
 }
@@ -484,14 +516,7 @@ int elrs_config_set_uid(const uint8_t uid[6])
   
   memcpy(g_config.uid, uid, 6);
   
-  /* Check if UID is non-zero (bound) */
-  bool is_bound = false;
-  for (int i = 0; i < 6; i++) {
-    if (uid[i] != 0) {
-      is_bound = true;
-      break;
-    }
-  }
+  bool is_bound = config_uid_is_bound(uid);
   
   if (is_bound) {
     g_config.flags |= ELRS_CONFIG_FLAG_BOUND;
@@ -517,7 +542,11 @@ int elrs_config_get_uid(uint8_t uid_out[6])
 
 bool elrs_config_is_bound(void)
 {
-  return (g_config.flags & ELRS_CONFIG_FLAG_BOUND) != 0;
+  if (g_config.bind_storage == ELRS_BIND_STORAGE_VOLATILE) {
+    return false;
+  }
+
+  return config_uid_is_bound(g_config.uid);
 }
 
 int elrs_config_set_wifi(const char* ssid, const char* password, uint8_t channel)
