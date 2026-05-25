@@ -2374,8 +2374,6 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
                (desiredProtocol == ELRS_SERIAL_MAVLINK) &&
                (appliedSerialProtocol != ELRS_SERIAL_MAVLINK)) {
       requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
-      otaProtocolSelectionChanged = true;
-      DBGLN("TX OTA protocol confirmed serial protocol %u", desiredProtocol);
     }
   }
 
