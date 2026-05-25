@@ -104,12 +104,14 @@
 #endif
 
 /*
- * Standalone RF timing profile: do not initialize the flight-controller CRSF
- * UART. Handset Lua/telemetry still goes over OTA; this only removes local FC
- * serial output load when testing without an attached flight controller.
+ * Timing profile: do not initialize the flight-controller CRSF UART during RF
+ * acquisition. Handset Lua/telemetry still goes over OTA, and MAVLink serial
+ * still starts once the TX explicitly negotiates MAVLink OTA mode. Starting
+ * the local 420k CRSF UART before lock adds enough load on SiW917 to disturb
+ * telemetry negotiation.
  */
 #ifndef SIW917_ELRS_DISABLE_CRSF_SERIAL
-#define SIW917_ELRS_DISABLE_CRSF_SERIAL 0
+#define SIW917_ELRS_DISABLE_CRSF_SERIAL SIW917_ELRS_TIMING_LEAN
 #endif
 
 /*

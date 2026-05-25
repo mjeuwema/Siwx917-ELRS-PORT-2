@@ -1100,7 +1100,7 @@ static void applyConfiguredSerialProtocol() {
       crsf_serial_deinit();
     }
     appliedSerialProtocol = protocol;
-    DBGLN("CRSF serial output disabled for standalone RF timing test");
+    DBGLN("CRSF serial output deferred during RF acquisition profile");
     return;
   }
 #endif
