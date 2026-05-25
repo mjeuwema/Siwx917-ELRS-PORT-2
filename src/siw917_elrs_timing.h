@@ -109,7 +109,7 @@
  * serial output load when testing without an attached flight controller.
  */
 #ifndef SIW917_ELRS_DISABLE_CRSF_SERIAL
-#define SIW917_ELRS_DISABLE_CRSF_SERIAL SIW917_ELRS_TIMING_LEAN
+#define SIW917_ELRS_DISABLE_CRSF_SERIAL 0
 #endif
 
 /*
@@ -176,6 +176,15 @@
  */
 #ifndef SIW917_ELRS_DISCONNECTED_SCAN_DIAG
 #define SIW917_ELRS_DISCONNECTED_SCAN_DIAG 0
+#endif
+
+/*
+ * Verbose RF-rate/radio reconfiguration trace. Leave this off for normal use:
+ * scan mode can reconfigure rapidly, and these prints add serial load exactly
+ * while the receiver is trying to catch SYNC.
+ */
+#ifndef SIW917_ELRS_RF_RATE_DIAG
+#define SIW917_ELRS_RF_RATE_DIAG SIW917_ELRS_DISCONNECTED_SCAN_DIAG
 #endif
 
 /*

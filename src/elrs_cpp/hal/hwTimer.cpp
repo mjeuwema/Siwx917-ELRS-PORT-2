@@ -344,7 +344,9 @@ void hwTimer::updateInterval(uint32_t newTimerInterval) {
   // Update the C timer's interval
   hw_timer_set_interval(newTimerInterval);
 
+#if SIW917_ELRS_RF_RATE_DIAG
   DBGLN("hwTimer interval: %lu us", (unsigned long)newTimerInterval);
+#endif
 }
 
 void hwTimer::resetFreqOffset() {

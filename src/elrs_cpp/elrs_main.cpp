@@ -95,9 +95,10 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_TLM150_SNAPSHOT (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_RATE_CHANGE_LOG (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_PERIODIC_STATS SIW917_ELRS_DISCONNECTED_SCAN_DIAG
+#define ELRS_DIAG_RF_RATE_LOG SIW917_ELRS_RF_RATE_DIAG
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
 #define ELRS_DIAG_PRINT_AFTER_LOSS 0
-#define ELRS_DIAG_LOSS_PACKET_STATS 1
+#define ELRS_DIAG_LOSS_PACKET_STATS 0
 #define ELRS_DIAG_RX_LUA_UL 0
 #define ELRS_DIAG_RX_LUA_UL_VERBOSE 0
 #define ELRS_DIAG_RX_LUA_UL_PRINT_LIMIT 24
@@ -1830,7 +1831,9 @@ static void maybePrintTelemetry150Snapshot(unsigned long now);
 static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now);
 static void GotConnection(unsigned long now);
 static void LostConnection(bool resumeRx);
+#if ELRS_DIAG_LOSS_PACKET_STATS
 static void printLossPacketStats();
+#endif
 static uint8_t minLqForChaos();
 static void enterBindingModeNow();
 static void updateBindingMode(unsigned long now);
@@ -2846,6 +2849,7 @@ static void maybePrintLinkProgress(unsigned long now) {
 static inline void maybePrintLinkProgress(unsigned long) {}
 #endif
 
+#if ELRS_DIAG_LOSS_PACKET_STATS
 static void printLossPacketStats() {
   uint32_t isrCount = 0;
   uint32_t rxIrqCount = 0;
@@ -2917,6 +2921,7 @@ static void printLossPacketStats() {
         (unsigned long)lastRxIsrToPacketUs,
         (unsigned long)lastPacketToCallbackUs);
 }
+#endif
 
 static inline int32_t ICACHE_RAM_ATTR absI32(int32_t value) {
   return value < 0 ? -value : value;
@@ -3301,7 +3306,9 @@ static void maybePrintTelemetry150Snapshot(unsigned long now) { (void)now; }
 // RF Link rate setting
 //=============================================================================
 static void SetRFLinkRate(uint8_t index, bool bindMode) {
+#if ELRS_DIAG_RF_RATE_LOG
   DBGLN("SetRFLinkRate begin: index=%d bind=%d", index, bindMode ? 1 : 0);
+#endif
 
   expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
   expresslrs_rf_pref_params_s *const RFperf = get_elrs_RFperfParams(index);
@@ -3315,10 +3322,11 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   bool invertIQ = bindMode || (UID[5] & 0x01);
 
   uint32_t interval = ModParams->interval;
-  const uint8_t defaultTlmDenom = TLMratioEnumToValue(ModParams->TLMinterval);
   hwTimer::updateInterval(interval);
+#if ELRS_DIAG_RF_RATE_LOG
   DBGLN("SetRFLinkRate timer updated: interval=%lu",
         (unsigned long)interval);
+#endif
 
   // Configure FHSS band selection
   FHSSusePrimaryFreqBand =
@@ -3327,9 +3335,11 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   FHSSuseDualBand = false; // No dual band support
 
   uint32_t initFreq = FHSSgetInitialFreq();
+#if ELRS_DIAG_RF_RATE_LOG
   DBGLN("SetRFLinkRate: index=%d, radio_type=%d, primaryBand=%d, initFreq=%u",
         index, ModParams->radio_type, FHSSusePrimaryFreqBand,
         (unsigned int)initFreq);
+#endif
 
   updateRxDownlinkPower(false);
 
@@ -3343,7 +3353,9 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
       (RFperf->DynpowerSnrThreshUp == DYNPOWER_SNR_THRESH_NONE)
           ? 0
           : (RFperf->DynpowerSnrThreshDn - RFperf->DynpowerSnrThreshUp);
+#if ELRS_DIAG_RF_RATE_LOG
   DBGLN("SetRFLinkRate radio configured");
+#endif
 
   // Update OTA serializers
   OtaUpdateSerializers(smWideOr8ch, ModParams->PayloadLength);
@@ -3363,8 +3375,11 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   InvalidatePrebuiltTelemetry();
   armTelemetry150Snapshot(ModParams, bindMode);
 
+#if ELRS_DIAG_RF_RATE_LOG
+  const uint8_t defaultTlmDenom = TLMratioEnumToValue(ModParams->TLMinterval);
   DBGLN("Set RF rate index %d, interval %lu us, default TLM 1:%u", index,
         interval, defaultTlmDenom);
+#endif
 }
 
 static bool ICACHE_RAM_ATTR isTelemetrySlotForNonce(uint8_t nonce) {
@@ -3810,9 +3825,11 @@ static void cycleRfMode() {
     LastSyncPacket = now;
 
     const uint8_t currentScanIndex = scanIndex % RATE_MAX;
+#if ELRS_DIAG_RF_RATE_LOG
     DBGLN("cycleRfMode begin: scan=%u interval=%lu dwell=%lu multiplier=%u",
           currentScanIndex, (unsigned long)cycleInterval,
           (unsigned long)dwellMs, (unsigned)RFmodeCycleMultiplier);
+#endif
     SetRFLinkRate(currentScanIndex, false);
     LQCalc.reset100();
 
@@ -3821,10 +3838,14 @@ static void cycleRfMode() {
     } while (!isSupportedRFRate(scanIndex));
 
     Radio.RXnb();
+#if ELRS_DIAG_RF_RATE_LOG
     DBGLN("cycleRfMode RX re-armed");
+#endif
     RFmodeCycleMultiplier = 1;
 
+#if ELRS_DIAG_RF_RATE_LOG
     DBGLN("Cycling to rate index %d", currentScanIndex);
+#endif
 
     // Enable per-iteration diagnostics in elrs_loop to catch hang
     rateCyclingStarted = true;

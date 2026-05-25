@@ -249,10 +249,12 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
                           uint8_t _PayloadLength, bool setFSKModulation,
                           uint8_t fskSyncWord1, uint8_t fskSyncWord2,
                           SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_RF_RATE_DIAG
   DBGLN("Config: freq=%u, bw=%d, sf=%d, cr=%d, FSK=%d, Pre=%d, InvIQ=%d, "
         "Payload=%d",
         (unsigned int)regfreq, (int)bw, (int)sf, (int)cr, (int)setFSKModulation,
         (int)PreambleLength, (int)InvertIQ, (int)_PayloadLength);
+#endif
   PayloadLength = _PayloadLength;
 
   bool isSubGHz = regfreq < 1000000000;
@@ -291,7 +293,9 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
 
   codec = &copyCodec;
   if (useFSK) {
+#if SIW917_ELRS_RF_RATE_DIAG
     DBGLN("Config FSK");
+#endif
     uint32_t bitrate = (uint32_t)bw * 10000;
     uint8_t bwf = sf;
     uint32_t fdev = (uint32_t)cr * 1000;
@@ -306,7 +310,9 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
     SetPacketParamsFSK(PreambleLength, PayloadLength, radioNumber);
     SetFSKSyncWord(fskSyncWord1, fskSyncWord2, radioNumber);
   } else {
+#if SIW917_ELRS_RF_RATE_DIAG
     DBGLN("Config LoRa");
+#endif
     ConfigModParamsLoRa(bw, sf, cr, radioNumber);
 
 #if defined(DEBUG_FREQ_CORRECTION) // TODO Check if this available with the
@@ -337,7 +343,9 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
       true; // force an update of the output power because the band may have
             // changed, and we need to configure the power for the band.
   CommitOutputPower();
+#if SIW917_ELRS_RF_RATE_DIAG
   DBGLN("Config complete");
+#endif
 }
 
 void LR1121Driver::ConfigModParamsFSK(uint32_t Bitrate, uint8_t BWF,
