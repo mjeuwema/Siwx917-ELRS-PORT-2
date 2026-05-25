@@ -1013,8 +1013,45 @@ static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
   return cfg->serial_protocol <= ELRS_SERIAL_GPS ? cfg->serial_protocol : 0;
 }
 
-static uint8_t getConfiguredSerialProtocol() {
+static uint8_t activeSerialProtocol = ELRS_SERIAL_CRSF;
+
+extern "C" uint8_t siw917_rx_get_active_serial_protocol(void) {
+  return activeSerialProtocol;
+}
+
+static uint8_t getStoredSerialProtocol() {
   return getProtocolSelectionFromConfig(elrs_config_get());
+}
+
+static uint8_t getConfiguredSerialProtocol() {
+  return activeSerialProtocol;
+}
+
+static uint8_t getNormalOtaSerialProtocol(uint8_t storedProtocol) {
+  if (storedProtocol == ELRS_SERIAL_MAVLINK) {
+    return ELRS_SERIAL_CRSF;
+  }
+
+  return storedProtocol <= ELRS_SERIAL_GPS ? storedProtocol
+                                           : (uint8_t)ELRS_SERIAL_CRSF;
+}
+
+static uint8_t getDesiredActiveSerialProtocol() {
+  if (TxOtaProtocol == TX_MAVLINK_MODE) {
+    return ELRS_SERIAL_MAVLINK;
+  }
+
+  return getNormalOtaSerialProtocol(getStoredSerialProtocol());
+}
+
+static bool updateActiveSerialProtocol() {
+  const uint8_t desiredProtocol = getDesiredActiveSerialProtocol();
+  if (activeSerialProtocol == desiredProtocol) {
+    return false;
+  }
+
+  activeSerialProtocol = desiredProtocol;
+  return true;
 }
 
 static bool serialProtocolUsesCrsf(uint8_t protocol) {
@@ -1030,7 +1067,6 @@ static volatile bool serialProtocolApplyRequested = false;
 static volatile bool serialProtocolApplyRequiresConnected = false;
 static uint32_t serialProtocolApplyDueMs = 0;
 static uint8_t appliedSerialProtocol = 0xFF;
-static uint8_t startupStoredSerialProtocol = 0;
 static uint32_t mavlinkSerialPendingSinceMs = 0;
 
 static constexpr uint32_t SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS = 100;
@@ -1137,6 +1173,7 @@ static void processSerialProtocolApply() {
   serialProtocolApplyRequested = false;
   serialProtocolApplyRequiresConnected = false;
   serialProtocolApplyDueMs = 0;
+  (void)updateActiveSerialProtocol();
   applyConfiguredSerialProtocol();
 }
 
@@ -1307,7 +1344,8 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     intMax = 255;
     intDefault = 1;
     units = "";
-    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK;
+    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK &&
+             getConfiguredSerialProtocol() != ELRS_SERIAL_MAVLINK;
     break;
   case RX_LUA_PARAM_SOURCE_SYS_ID:
     paramType = CRSF_UINT8;
@@ -1317,7 +1355,8 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     intMax = 255;
     intDefault = 255;
     units = "";
-    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK;
+    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK &&
+             getConfiguredSerialProtocol() != ELRS_SERIAL_MAVLINK;
     break;
   case RX_LUA_PARAM_FORCE_TLM:
     paramType = CRSF_TEXT_SELECTION;
@@ -1890,37 +1929,6 @@ static uint8_t getStartupOrBindingRateIndex(void) {
   return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
 }
 
-static void repairPersistedStartupConfig() {
-  elrs_config_t *cfg = elrs_config_get();
-  if (cfg == nullptr) {
-    return;
-  }
-
-  bool changed = false;
-  const uint8_t safe900StartupRate =
-      enumRatetoIndex(RATE_LORA_900_50HZ_DVDA);
-  const uint8_t lora900200HzRate = enumRatetoIndex(RATE_LORA_900_200HZ);
-
-  if (!use2G4Domain() && cfg->rate_index == lora900200HzRate &&
-      safe900StartupRate < RATE_MAX && isSupportedRFRate(safe900StartupRate)) {
-    cfg->rate_index = safe900StartupRate;
-    changed = true;
-  }
-
-  if (cfg->serial_protocol == ELRS_SERIAL_MAVLINK) {
-    cfg->serial_protocol = ELRS_SERIAL_CRSF;
-    changed = true;
-  }
-
-  if (!changed) {
-    return;
-  }
-
-  const int saveResult = elrs_config_save();
-  DBGLN("Recovered startup config: serial=%u rate=%u save=%d",
-        cfg->serial_protocol, cfg->rate_index, saveResult);
-}
-
 static void scheduleStartupRateSave(uint32_t now) {
 #if !SIW917_ELRS_PERSIST_STARTUP_RATE
   (void)now;
@@ -1960,16 +1968,7 @@ static void processStartupRateSave(uint32_t now) {
   }
 
   startupRateSavePending = false;
-  elrs_config_t *cfg = elrs_config_get();
-  const uint8_t runtimeSerialProtocol =
-      cfg != nullptr ? cfg->serial_protocol : startupStoredSerialProtocol;
-  if (cfg != nullptr) {
-    cfg->serial_protocol = startupStoredSerialProtocol;
-  }
   const int saveResult = elrs_config_save();
-  if (cfg != nullptr) {
-    cfg->serial_protocol = runtimeSerialProtocol;
-  }
 
   if (saveResult == 0) {
     DBGLN("Startup RF rate saved: index=%u", startupRateSaveIndex);
@@ -2355,26 +2354,15 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
                       ? TX_MAVLINK_MODE
                       : TX_NORMAL_MODE;
   bool otaProtocolSelectionChanged = false;
-  elrs_config_t *cfg = elrs_config_get();
-  if (cfg != nullptr) {
-    const uint8_t previousProtocol = getProtocolSelectionFromConfig(cfg);
-    uint8_t desiredProtocol = previousProtocol;
-    if (TxOtaProtocol == TX_MAVLINK_MODE) {
-      desiredProtocol = ELRS_SERIAL_MAVLINK;
-    } else if (previousProtocol == ELRS_SERIAL_MAVLINK) {
-      desiredProtocol = ELRS_SERIAL_CRSF;
-    }
-
-    if (desiredProtocol != previousProtocol) {
-      cfg->serial_protocol = desiredProtocol;
-      requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
-      otaProtocolSelectionChanged = true;
-      DBGLN("TX OTA protocol selected serial protocol %u", desiredProtocol);
-    } else if ((TxOtaProtocol == TX_MAVLINK_MODE) &&
-               (desiredProtocol == ELRS_SERIAL_MAVLINK) &&
-               (appliedSerialProtocol != ELRS_SERIAL_MAVLINK)) {
-      requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
-    }
+  if (updateActiveSerialProtocol()) {
+    requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
+    otaProtocolSelectionChanged = true;
+    DBGLN("TX OTA protocol selected active serial protocol %u",
+          activeSerialProtocol);
+  } else if ((TxOtaProtocol == TX_MAVLINK_MODE) &&
+             (activeSerialProtocol == ELRS_SERIAL_MAVLINK) &&
+             (appliedSerialProtocol != ELRS_SERIAL_MAVLINK)) {
+    requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
   }
 
   if ((TxOtaProtocol == TX_MAVLINK_MODE) && !warnedUnsupportedTxProtocol) {
@@ -3983,8 +3971,6 @@ bool elrs_init(void) {
     return false;
   }
 
-  repairPersistedStartupConfig();
-
   // Copy UID from firmware options
   memcpy(UID, firmwareOptions.uid, UID_LEN);
   DBGLN("UID: %02X:%02X:%02X:%02X:%02X:%02X", UID[0], UID[1], UID[2], UID[3],
@@ -4079,7 +4065,7 @@ bool elrs_init(void) {
   // Record start time for rate cycling
   RFmodeLastCycled = millis();
 
-  startupStoredSerialProtocol = getConfiguredSerialProtocol();
+  activeSerialProtocol = getDesiredActiveSerialProtocol();
   applyConfiguredSerialProtocol();
 
   // Load model match ID from config (0xFF = disabled)

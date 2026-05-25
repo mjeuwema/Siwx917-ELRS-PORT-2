@@ -14,6 +14,7 @@
 extern "C" void elrs_cpp_request_wifi_mode(void);
 extern "C" void elrs_enter_binding_mode(void);
 extern "C" void siw917_rx_set_model_match_id(uint8_t modelId);
+extern "C" uint8_t siw917_rx_get_active_serial_protocol(void);
 
 extern uint8_t ExpressLRS_currTlmDenom;
 
@@ -445,8 +446,11 @@ void SiW917RXEndpoint::updateParameters() {
   }
 
   snprintf(tlmRatioString, sizeof(tlmRatioString), "1:%u", ExpressLRS_currTlmDenom);
-  LUA_FIELD_VISIBLE(luaSourceSysId, protocol == ELRS_SERIAL_MAVLINK);
-  LUA_FIELD_VISIBLE(luaTargetSysId, protocol == ELRS_SERIAL_MAVLINK);
+  const bool mavlinkFieldsVisible =
+      protocol == ELRS_SERIAL_MAVLINK ||
+      siw917_rx_get_active_serial_protocol() == ELRS_SERIAL_MAVLINK;
+  LUA_FIELD_VISIBLE(luaSourceSysId, mavlinkFieldsVisible);
+  LUA_FIELD_VISIBLE(luaTargetSysId, mavlinkFieldsVisible);
   luaBindMode.common.name = "Enter Bind Mode";
 }
 
