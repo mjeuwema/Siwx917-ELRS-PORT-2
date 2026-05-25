@@ -112,6 +112,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_LUA_DISCOVERY 0
 #define ELRS_DIAG_TX_POWER 0
 #define ELRS_DIAG_DYNPOWER_STATS 0
+#define STARTUP_RATE_SAVE_DELAY_MS 5000U
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -203,6 +204,9 @@ static volatile uint8_t pendingUplinkTxPowerNonce = 0;
 // Rate/mode scanning
 static uint8_t scanIndex = 0;
 uint8_t ExpressLRS_nextAirRateIndex = 0;
+static bool startupRateSavePending = false;
+static uint8_t startupRateSaveIndex = 0;
+static uint32_t startupRateSaveAtMs = 0;
 
 // Timer state
 RXtimerState_e RXtimerState = tim_disconnected;
@@ -1858,6 +1862,47 @@ static uint8_t getStartupOrBindingRateIndex(void) {
   return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
 }
 
+static void scheduleStartupRateSave(uint32_t now) {
+  if (InBindingMode || ExpressLRS_currAirRate_Modparams == nullptr) {
+    return;
+  }
+
+  const uint8_t rateIndex = ExpressLRS_currAirRate_Modparams->index;
+  if (rateIndex >= RATE_MAX || !isSupportedRFRate(rateIndex)) {
+    return;
+  }
+
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr || cfg->rate_index == rateIndex) {
+    return;
+  }
+
+  cfg->rate_index = rateIndex;
+  startupRateSaveIndex = rateIndex;
+  startupRateSaveAtMs = now + STARTUP_RATE_SAVE_DELAY_MS;
+  startupRateSavePending = true;
+}
+
+static void processStartupRateSave(uint32_t now) {
+  if (!startupRateSavePending ||
+      (uint32_t)(now - startupRateSaveAtMs) >= 0x80000000UL) {
+    return;
+  }
+
+  if (connectionState != connected || RXtimerState != tim_locked ||
+      TelemetrySender.IsActive() || !otaConnector.IsEmpty()) {
+    return;
+  }
+
+  startupRateSavePending = false;
+  const int saveResult = elrs_config_save();
+  if (saveResult == 0) {
+    DBGLN("Startup RF rate saved: index=%u", startupRateSaveIndex);
+  } else {
+    DBGLN("WARNING: startup RF rate save failed: %d", saveResult);
+  }
+}
+
 static uint8_t getFirstSupportedRFRateIndex(void) {
   for (uint8_t i = 0; i < RATE_MAX; i++) {
     if (isSupportedRFRate(i)) {
@@ -2109,6 +2154,7 @@ static void GotConnection(unsigned long now) {
   setConnectionState(connected);
   RXtimerState = tim_tentative;
   GotConnectionMillis = now;
+  scheduleStartupRateSave(now);
 }
 
 static void LostConnection(bool resumeRx) {
@@ -4459,6 +4505,7 @@ void elrs_loop(void) {
     requestSerialProtocolApply();
   }
   processSerialProtocolApply();
+  processStartupRateSave(now);
   maybePrintLuaProgress(now);
   maybePrintLinkProgress(now);
 
