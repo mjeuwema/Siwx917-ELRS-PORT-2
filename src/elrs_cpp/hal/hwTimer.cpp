@@ -281,8 +281,8 @@ void hwTimer::resume() {
   if (running)
     return;
 
-  // Match upstream RX behavior: enabling the timer schedules an immediate TOCK,
-  // but that TOCK does not interrupt the currently running radio callback.
+  // Match upstream RX behavior: enabling the timer throws an immediate TOCK.
+  // At K1000 a deferred nonce/FHSS advance can miss the first post-SYNC packet.
   isTick = false;
   PhaseShift = 0;
   activeEventMicros = 0;
@@ -302,8 +302,13 @@ void hwTimer::resume() {
   running = true;
   isTick = false;
   hw_timer_note_immediate_tock();
+#if SIW917_ELRS_DIRECT_TIMER_CALLBACKS
+  immediateTockDeliveredCount++;
+  processTimerEvent(TIMER_EVENT_TOCK, resumeMicros);
+#else
   immediateTockMicros = resumeMicros;
   immediateTockPending = true;
+#endif
 
   DBGLN("hwTimer resumed, interval=%lu us", HWtimerInterval);
 }

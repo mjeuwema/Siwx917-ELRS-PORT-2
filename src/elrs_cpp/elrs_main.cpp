@@ -88,7 +88,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM SIW917_ELRS_DISABLE_DOWNLINK_TLM
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL SIW917_ELRS_DISABLE_CRSF_SERIAL
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP SIW917_ELRS_DIO_PFD_TIMESTAMP
-#define ELRS_DIAG_CRC_NONCE_WINDOW 0
+#define ELRS_DIAG_CRC_NONCE_WINDOW 64
 #define ELRS_DIAG_TX_TURNAROUND (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_TLM_RATE_LOG SIW917_ELRS_TLM_RATE_DIAG
 #define ELRS_DIAG_TLM_STALE_RX 0
@@ -110,6 +110,8 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_RX_LUA_BIND_POST_DELAY_MS 250U
 #define ELRS_DIAG_CRSF_OTA_VERBOSE 0
 #define ELRS_DIAG_LUA_DISCOVERY 0
+#define ELRS_DIAG_TX_POWER 0
+#define ELRS_DIAG_DYNPOWER_STATS 0
 ///////////////////
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
@@ -185,6 +187,18 @@ static bool LockRFmode = false;
 static int8_t SwitchModePending = 0;
 static tx_transmission_mode_e TxOtaProtocol = TX_NORMAL_MODE;
 static bool warnedUnsupportedTxProtocol = false;
+static uint32_t lastObservedUplinkTxPowerDecodeCount = 0;
+static uint8_t lastDecodedUplinkTxPower = 0;
+static uint8_t lastDecodedUplinkTxPowerSource = 0;
+static uint8_t lastDecodedUplinkTxPowerSwitchMode = 0xFF;
+static uint8_t lastDecodedUplinkTxPowerRate = 0xFF;
+static volatile bool uplinkTxPowerChangePending = false;
+static volatile uint8_t pendingUplinkTxPower = 0;
+static volatile uint8_t pendingUplinkTxPowerSource = 0;
+static volatile uint8_t pendingUplinkTxPowerFullRes = 0;
+static volatile uint8_t pendingUplinkTxPowerSwitchMode = 0;
+static volatile uint8_t pendingUplinkTxPowerRate = 0;
+static volatile uint8_t pendingUplinkTxPowerNonce = 0;
 
 // Rate/mode scanning
 static uint8_t scanIndex = 0;
@@ -457,6 +471,68 @@ static void updateRxDownlinkPower(bool initialize) {
   Radio.SetOutputPower(desiredDbm, false);
   DBGLN("RX downlink power scheduled: %d dBm%s", desiredDbm,
         matchTxPower ? " (matching TX)" : "");
+}
+
+static void ICACHE_RAM_ATTR noteDecodedUplinkTxPower() {
+  const uint32_t decodeCount = OtaUplinkPowerDecodeCount;
+  if (decodeCount == lastObservedUplinkTxPowerDecodeCount) {
+    return;
+  }
+  lastObservedUplinkTxPowerDecodeCount = decodeCount;
+
+  const uint8_t decodedPower = linkStats.uplink_TX_Power;
+  const uint8_t decodeSource = OtaLastUplinkPowerDecodeSource;
+  const uint8_t fullRes = OtaIsFullRes ? 1U : 0U;
+  const uint8_t switchMode = (uint8_t)OtaSwitchModeCurrent;
+  const uint8_t rate = ExpressLRS_currAirRate_Modparams
+                           ? ExpressLRS_currAirRate_Modparams->index
+                           : 0xFFU;
+
+  if (decodedPower == 0) {
+    return;
+  }
+
+  const bool newContext =
+      decodedPower != lastDecodedUplinkTxPower ||
+      decodeSource != lastDecodedUplinkTxPowerSource ||
+      switchMode != lastDecodedUplinkTxPowerSwitchMode ||
+      rate != lastDecodedUplinkTxPowerRate;
+  if (!newContext) {
+    return;
+  }
+
+  lastDecodedUplinkTxPower = decodedPower;
+  lastDecodedUplinkTxPowerSource = decodeSource;
+  lastDecodedUplinkTxPowerSwitchMode = switchMode;
+  lastDecodedUplinkTxPowerRate = rate;
+  pendingUplinkTxPower = decodedPower;
+  pendingUplinkTxPowerSource = decodeSource;
+  pendingUplinkTxPowerFullRes = fullRes;
+  pendingUplinkTxPowerSwitchMode = switchMode;
+  pendingUplinkTxPowerRate = rate;
+  pendingUplinkTxPowerNonce = OtaNonce;
+  uplinkTxPowerChangePending = true;
+}
+
+static void processDecodedUplinkTxPower() {
+  if (!uplinkTxPowerChangePending) {
+    return;
+  }
+
+  const uint8_t power = pendingUplinkTxPower;
+  const uint8_t source = pendingUplinkTxPowerSource;
+  const uint8_t fullRes = pendingUplinkTxPowerFullRes;
+  const uint8_t switchMode = pendingUplinkTxPowerSwitchMode;
+  const uint8_t rate = pendingUplinkTxPowerRate;
+  const uint8_t nonce = pendingUplinkTxPowerNonce;
+  uplinkTxPowerChangePending = false;
+
+#if ELRS_DIAG_TX_POWER
+  DBGLN("TXPWR decoded enum=%u dbm=%d src=%u full=%u switch=%u rate=%u nonce=%u",
+        power, crsfPowerToDbm(power), source, fullRes, switchMode, rate, nonce);
+#endif
+
+  updateRxDownlinkPower(false);
 }
 
 //=============================================================================
@@ -946,10 +1022,28 @@ static bool configuredSerialProtocolUsesCrsf() {
 }
 
 static volatile bool serialProtocolApplyRequested = false;
+static volatile bool serialProtocolApplyRequiresConnected = false;
+static uint32_t serialProtocolApplyDueMs = 0;
 static uint8_t appliedSerialProtocol = 0xFF;
+static uint32_t mavlinkSerialPendingSinceMs = 0;
+
+static constexpr uint32_t SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS = 100;
+static constexpr uint8_t MAVLINK_SERIAL_PAYLOAD_MAX =
+    ELRS_DATA_UL_BUFFER - CRSF_FRAME_NOT_COUNTED_BYTES;
+static constexpr uint8_t MAVLINK_SERIAL_MIN_CHUNK = 24;
+static constexpr uint32_t MAVLINK_SERIAL_MAX_WAIT_MS = 4;
 
 static void ICACHE_RAM_ATTR requestSerialProtocolApply() {
   serialProtocolApplyRequested = true;
+  serialProtocolApplyRequiresConnected = false;
+  serialProtocolApplyDueMs = 0;
+}
+
+static void ICACHE_RAM_ATTR
+requestSerialProtocolApplyAfter(uint32_t nowMs, uint32_t delayMs) {
+  serialProtocolApplyRequested = true;
+  serialProtocolApplyRequiresConnected = true;
+  serialProtocolApplyDueMs = nowMs + delayMs;
 }
 
 static void applyConfiguredSerialProtocol() {
@@ -991,6 +1085,12 @@ static void applyConfiguredSerialProtocol() {
     }
   }
 
+  if (crsf_serial_is_ready()) {
+    if (crsf_serial_set_rx_enabled(wantsMavlink) != 0) {
+      DBGLN("WARNING: serial RX enable failed for protocol %u", protocol);
+    }
+  }
+
   appliedSerialProtocol = protocol;
 }
 
@@ -999,12 +1099,81 @@ static void processSerialProtocolApply() {
     return;
   }
 
+  if (serialProtocolApplyDueMs != 0 &&
+      (int32_t)(millis() - serialProtocolApplyDueMs) < 0) {
+    return;
+  }
+
+  // Upstream defers reconfigureSerial() after a SYNC-driven OTA protocol
+  // change. On SiW917, keep that heavy UART reconfigure out of the RF lock
+  // window entirely; the MAVLink UART is not needed until the link is valid.
+  if (serialProtocolApplyRequiresConnected && connectionState != connected) {
+    return;
+  }
+
+  if (!serialProtocolApplyRequiresConnected && connectionState == tentative) {
+    return;
+  }
+
   if (TelemetrySender.IsActive() || !otaConnector.IsEmpty()) {
     return;
   }
 
   serialProtocolApplyRequested = false;
+  serialProtocolApplyRequiresConnected = false;
+  serialProtocolApplyDueMs = 0;
   applyConfiguredSerialProtocol();
+}
+
+static bool queueMavlinkSerialPayload(uint32_t nowMs) {
+  if (TxOtaProtocol != TX_MAVLINK_MODE ||
+      getConfiguredSerialProtocol() != ELRS_SERIAL_MAVLINK ||
+      !crsf_serial_is_ready()) {
+    mavlinkSerialPendingSinceMs = 0;
+    return false;
+  }
+
+  uint32_t available = crsf_serial_rx_available();
+  if (available == 0) {
+    mavlinkSerialPendingSinceMs = 0;
+    return false;
+  }
+
+  if (mavlinkSerialPendingSinceMs == 0) {
+    mavlinkSerialPendingSinceMs = nowMs;
+  }
+
+  if (available < MAVLINK_SERIAL_PAYLOAD_MAX &&
+      available < MAVLINK_SERIAL_MIN_CHUNK &&
+      (uint32_t)(nowMs - mavlinkSerialPendingSinceMs) <
+          MAVLINK_SERIAL_MAX_WAIT_MS) {
+    return false;
+  }
+
+  if (available > MAVLINK_SERIAL_PAYLOAD_MAX) {
+    available = MAVLINK_SERIAL_PAYLOAD_MAX;
+  }
+
+  TelemetryBuffer[0] = MSP_ELRS_MAVLINK_TLM;
+  const uint32_t copied =
+      crsf_serial_read(&TelemetryBuffer[CRSF_FRAME_NOT_COUNTED_BYTES],
+                       available);
+  if (copied == 0) {
+    return false;
+  }
+
+  TelemetryBuffer[1] = (uint8_t)copied;
+  TelemetrySender.SetDataToTransmit(
+      TelemetryBuffer, (uint8_t)(copied + CRSF_FRAME_NOT_COUNTED_BYTES));
+  InvalidatePrebuiltTelemetry();
+
+  if (crsf_serial_rx_available() == 0) {
+    mavlinkSerialPendingSinceMs = 0;
+  } else {
+    mavlinkSerialPendingSinceMs = nowMs;
+  }
+
+  return true;
 }
 
 static void rxLuaRefreshDynamicValues() {
@@ -1744,6 +1913,31 @@ static uint8_t minLqForChaos() {
   return interval * ((interval * numfhss + 99) / (interval * numfhss));
 }
 
+#if ELRS_DIAG_DYNPOWER_STATS
+static void printDynpowerStatsDiag(int8_t snrMean) {
+  static uint32_t lastPrintMs = 0;
+  const uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - lastPrintMs) < 1000U) {
+    return;
+  }
+  lastPrintMs = nowMs;
+
+  const expresslrs_mod_settings_s *mod = ExpressLRS_currAirRate_Modparams;
+  const expresslrs_rf_pref_params_s *perf = ExpressLRS_currAirRate_RFperfParams;
+  const int8_t upThresh =
+      perf ? perf->DynpowerSnrThreshUp : DYNPOWER_SNR_THRESH_NONE;
+  const int8_t downThresh =
+      perf ? perf->DynpowerSnrThreshDn : DYNPOWER_SNR_THRESH_NONE;
+
+  DBGLN("DYNSTAT rate=%u enum=%u radio=%u lq=%u rssi=-%u snrRaw=%d snrDb=%d "
+        "lastRaw=%d up=%d dn=%d den=%u",
+        mod ? mod->index : 0xFFU, mod ? (uint8_t)mod->enum_rate : 0xFFU,
+        mod ? mod->radio_type : 0xFFU, uplinkLQ, linkStats.uplink_RSSI_1,
+        snrMean, snrMean / RADIO_SNR_SCALE, lastSnrRaw, upThresh, downThresh,
+        ExpressLRS_currTlmDenom);
+}
+#endif
+
 static void LinkStatsToOta(OTA_LinkStats_s *ls) {
   if (ls == nullptr) {
     return;
@@ -1753,13 +1947,17 @@ static void LinkStatsToOta(OTA_LinkStats_s *ls) {
   ls->uplink_RSSI_2 = linkStats.uplink_RSSI_2;
   ls->antenna = antenna;
   ls->modelMatch = connectionHasModelMatch;
-  ls->lq = uplinkLQ;
+  ls->lq = linkStats.uplink_Link_quality;
   ls->trueDiversityAvailable = 0;
   if (SnrMean.getCount()) {
     ls->SNR = SnrMean.mean();
   } else {
     ls->SNR = SnrMean.previousMean();
   }
+
+#if ELRS_DIAG_DYNPOWER_STATS
+  printDynpowerStatsDiag(ls->SNR);
+#endif
 }
 
 static void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t *newUid4) {
@@ -1892,7 +2090,13 @@ static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
   GotConnectionMillis = 0;
   LPF_Offset.init(0);
   LPF_OffsetDx.init(0);
+  SnrMean.reset();
   alreadyTLMresp = false;
+  lastDecodedUplinkTxPower = 0;
+  lastDecodedUplinkTxPowerSource = 0;
+  lastDecodedUplinkTxPowerSwitchMode = 0xFF;
+  lastDecodedUplinkTxPowerRate = 0xFF;
+  uplinkTxPowerChangePending = false;
   RFmodeLastCycled = now;
 }
 
@@ -2029,6 +2233,7 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   TxOtaProtocol = (otaSync->otaProtocol == TX_MAVLINK_MODE)
                       ? TX_MAVLINK_MODE
                       : TX_NORMAL_MODE;
+  bool otaProtocolSelectionChanged = false;
   elrs_config_t *cfg = elrs_config_get();
   if (cfg != nullptr) {
     const uint8_t previousProtocol = getProtocolSelectionFromConfig(cfg);
@@ -2041,7 +2246,8 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
 
     if (desiredProtocol != previousProtocol) {
       cfg->serial_protocol = desiredProtocol;
-      requestSerialProtocolApply();
+      requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
+      otaProtocolSelectionChanged = true;
       DBGLN("TX OTA protocol selected serial protocol %u", desiredProtocol);
     }
   }
@@ -2145,6 +2351,12 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   uint8_t modelXor = (~modelMatchId) & MODELMATCH_MASK;
   bool modelMatched = otaSync->UID5 == (UID[5] ^ modelXor);
 
+  if (otaProtocolSelectionChanged && connectionState == disconnected) {
+    RFmodeLastCycled = now;
+    DBGLN("TX OTA protocol changed; waiting for next SYNC before lock");
+    return false;
+  }
+
   if (connectionState == disconnected || OtaNonce != otaSync->nonce ||
       FHSSgetCurrIndex() != otaSync->fhssIndex ||
       connectionHasModelMatch != modelMatched) {
@@ -2168,6 +2380,7 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
   }
 
   bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
+  noteDecodedUplinkTxPower();
   TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
   telemetryLastRcConfirm = telemetryConfirmValue;
   if (telemetryConfirmValue) {
@@ -2550,6 +2763,7 @@ static void printLossPacketStats() {
         "tmr:%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu "
         "rxok:%lu crc:%lu skip:%lu "
         "ok:%lu/%lu/%lu fail:%lu/%lu/%lu last:%u exp:%u/%u sync:%u/%u "
+        "crcN:%d/%u/%u/%u/%lu/%lu "
         "freq:%lu/%lu lq:%u/%u tlm:%lu/%u/%u def:%lu/%lu/%lu rssi:%d snr:%d "
         "lat:%lu/%lu/%lu/%lu/%lu",
         (unsigned long)isrCount, (unsigned long)rxIrqCount,
@@ -2573,7 +2787,10 @@ static void printLossPacketStats() {
         (unsigned long)crcFailTypeCount[PACKET_TYPE_DATA],
         (unsigned long)crcFailTypeCount[PACKET_TYPE_SYNC],
         lastValidPacketType, lastValidExpectedNonce, lastValidExpectedFhss,
-        lastValidSyncNonce, lastValidSyncFhss, (unsigned long)Radio.currFreq,
+        lastValidSyncNonce, lastValidSyncFhss,
+        (int)lastCrcNonceDelta, lastCrcNonceExpected, lastCrcNonceMatched,
+        lastCrcNonceType, (unsigned long)crcNonceDiagHitCount,
+        (unsigned long)crcNonceDiagMissCount, (unsigned long)Radio.currFreq,
         (unsigned long)lastValidFreq, LQCalc.getLQRaw(), LQCalc.getCount(),
         (unsigned long)telemetryTxCount, ExpressLRS_currTlmDenom,
         telemetryBurstMax, (unsigned long)deferredQueueCount,
@@ -3036,7 +3253,11 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 }
 
 static bool ICACHE_RAM_ATTR isTelemetrySlotForNonce(uint8_t nonce) {
-  return (connectionState != disconnected) && (ExpressLRS_currTlmDenom != 1) &&
+  // The SiW917/LR1121 path is very sensitive during K1000 tentative lock,
+  // especially when MAVLink asks for 1:2 telemetry. Keep RF receive-only until
+  // the local timer is locked, then allow the normal downlink schedule.
+  return (connectionState == connected) && (RXtimerState == tim_locked) &&
+         (ExpressLRS_currTlmDenom != 1) &&
          !alreadyTLMresp && teamraceHasModelMatch &&
          ((nonce % ExpressLRS_currTlmDenom) == 0);
 }
@@ -4225,6 +4446,8 @@ void elrs_loop(void) {
 #endif
       TelemetrySender.SetDataToTransmit(TelemetryBuffer, nextPayloadSize);
       InvalidatePrebuiltTelemetry();
+    } else {
+      (void)queueMavlinkSerialPayload(now);
     }
   }
 
@@ -4264,6 +4487,7 @@ void elrs_loop(void) {
 #endif
 
   updateSwitchMode();
+  processDecodedUplinkTxPower();
   updateRxDownlinkPower(false);
 
   // Send CRSF RC channels, honoring the configured failsafe mode after RF loss.

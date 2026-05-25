@@ -25,6 +25,17 @@ static volatile bool g_tx_in_progress = false;
 static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE];
 static ARM_DRIVER_USART *g_usart = NULL;
 
+#define CRSF_SERIAL_RX_RING_SIZE 1024U
+#define CRSF_SERIAL_RX_RING_MASK (CRSF_SERIAL_RX_RING_SIZE - 1U)
+
+static uint8_t g_rx_ring[CRSF_SERIAL_RX_RING_SIZE];
+static volatile uint16_t g_rx_head = 0;
+static volatile uint16_t g_rx_tail = 0;
+static volatile bool g_rx_enabled = false;
+static volatile bool g_rx_armed = false;
+static volatile uint32_t g_rx_overrun_count = 0;
+static uint8_t g_rx_byte = 0;
+
 /* CRC lookup table (polynomial 0xD5) */
 static uint8_t crc8_table[256];
 static bool crc_table_initialized = false;
@@ -40,6 +51,13 @@ extern ARM_DRIVER_USART Driver_USART0;
 #endif
 
 #define CRSF_DBG(fmt, ...) DEBUGOUT("[CRSF] " fmt, ##__VA_ARGS__)
+
+#ifndef ARM_USART_EVENT_RX_TIMEOUT
+#define ARM_USART_EVENT_RX_TIMEOUT 0U
+#endif
+#ifndef ARM_USART_EVENT_RX_OVERFLOW
+#define ARM_USART_EVENT_RX_OVERFLOW 0U
+#endif
 
 /*******************************************************************************
  * CRC Calculation
@@ -69,6 +87,40 @@ static uint8_t crsf_crc8(const uint8_t *data, uint8_t len)
 }
 
 /*******************************************************************************
+ * RX Ring Buffer
+ ******************************************************************************/
+
+static void rx_ring_reset(void)
+{
+    g_rx_head = 0;
+    g_rx_tail = 0;
+    g_rx_overrun_count = 0;
+}
+
+static void rx_ring_push_from_isr(uint8_t byte)
+{
+    uint16_t next = (uint16_t)((g_rx_head + 1U) & CRSF_SERIAL_RX_RING_MASK);
+
+    if (next == g_rx_tail) {
+        g_rx_overrun_count++;
+        g_rx_tail = (uint16_t)((g_rx_tail + 1U) & CRSF_SERIAL_RX_RING_MASK);
+    }
+
+    g_rx_ring[g_rx_head] = byte;
+    g_rx_head = next;
+}
+
+static void rx_arm_receive_from_isr(void)
+{
+    if (!g_rx_enabled || g_usart == NULL) {
+        g_rx_armed = false;
+        return;
+    }
+
+    g_rx_armed = (g_usart->Receive(&g_rx_byte, 1) == ARM_DRIVER_OK);
+}
+
+/*******************************************************************************
  * USART Callback (required by driver)
  ******************************************************************************/
 
@@ -76,6 +128,21 @@ static void usart_callback(uint32_t event)
 {
     if (event & (ARM_USART_EVENT_SEND_COMPLETE | ARM_USART_EVENT_TX_COMPLETE)) {
         g_tx_in_progress = false;
+    }
+
+    if (event & ARM_USART_EVENT_RECEIVE_COMPLETE) {
+        g_rx_armed = false;
+        rx_ring_push_from_isr(g_rx_byte);
+        rx_arm_receive_from_isr();
+    }
+
+    if (event & (ARM_USART_EVENT_RX_OVERFLOW | ARM_USART_EVENT_RX_TIMEOUT)) {
+        g_rx_overrun_count++;
+        g_rx_armed = false;
+        if (g_usart != NULL) {
+            (void)g_usart->Control(ARM_USART_ABORT_RECEIVE, 0);
+        }
+        rx_arm_receive_from_isr();
     }
 }
 
@@ -168,8 +235,8 @@ int crsf_serial_init(uint32_t baud_rate)
     }
 
     /*
-     * This port only needs FC TX output for standalone RX bring-up.
-     * Leave RX disabled so USART0 does not claim an unnecessary input pin.
+     * RX is enabled only by protocols that need an FC-to-radio byte stream
+     * (currently MAVLink). Normal CRSF timing tests stay TX-only.
      */
     if (g_usart->Control(ARM_USART_CONTROL_TX, 1) != ARM_DRIVER_OK) {
         CRSF_DBG("USART TX enable failed\n");
@@ -180,6 +247,9 @@ int crsf_serial_init(uint32_t baud_rate)
     }
 
     g_tx_in_progress = false;
+    g_rx_enabled = false;
+    g_rx_armed = false;
+    rx_ring_reset();
     CRSF_DBG("Initialized at %lu baud (USART0)\n", (unsigned long)baud_rate);
     
     g_initialized = true;
@@ -193,6 +263,8 @@ void crsf_serial_deinit(void)
 
     if (g_usart != NULL) {
         (void)g_usart->Control(ARM_USART_ABORT_SEND, 0);
+        (void)g_usart->Control(ARM_USART_ABORT_RECEIVE, 0);
+        (void)g_usart->Control(ARM_USART_CONTROL_RX, 0);
         (void)g_usart->PowerControl(ARM_POWER_OFF);
         (void)g_usart->Uninitialize();
         g_usart = NULL;
@@ -200,6 +272,9 @@ void crsf_serial_deinit(void)
     
     g_initialized = false;
     g_tx_in_progress = false;
+    g_rx_enabled = false;
+    g_rx_armed = false;
+    rx_ring_reset();
     CRSF_DBG("Deinitialized\n");
 }
 
@@ -329,4 +404,69 @@ int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len)
 
     g_tx_count++;
     return 0;
+}
+
+int crsf_serial_set_rx_enabled(bool enable)
+{
+    if (!g_initialized || g_usart == NULL) {
+        return -1;
+    }
+
+    if (!enable) {
+        g_rx_enabled = false;
+        g_rx_armed = false;
+        (void)g_usart->Control(ARM_USART_ABORT_RECEIVE, 0);
+        (void)g_usart->Control(ARM_USART_CONTROL_RX, 0);
+        rx_ring_reset();
+        return 0;
+    }
+
+    if (g_rx_enabled) {
+        return 0;
+    }
+
+    rx_ring_reset();
+    if (g_usart->Control(ARM_USART_CONTROL_RX, 1) != ARM_DRIVER_OK) {
+        CRSF_DBG("USART RX enable failed\n");
+        return -2;
+    }
+
+    g_rx_enabled = true;
+    rx_arm_receive_from_isr();
+    if (!g_rx_armed) {
+        CRSF_DBG("USART RX arm failed\n");
+        g_rx_enabled = false;
+        (void)g_usart->Control(ARM_USART_CONTROL_RX, 0);
+        return -3;
+    }
+
+    CRSF_DBG("RX enabled\n");
+    return 0;
+}
+
+uint32_t crsf_serial_rx_available(void)
+{
+    const uint16_t head = g_rx_head;
+    const uint16_t tail = g_rx_tail;
+    return (uint32_t)((head - tail) & CRSF_SERIAL_RX_RING_MASK);
+}
+
+uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
+{
+    if (out == NULL || max_len == 0) {
+        return 0;
+    }
+
+    uint32_t copied = 0;
+    while (copied < max_len && g_rx_tail != g_rx_head) {
+        out[copied++] = g_rx_ring[g_rx_tail];
+        g_rx_tail = (uint16_t)((g_rx_tail + 1U) & CRSF_SERIAL_RX_RING_MASK);
+    }
+
+    return copied;
+}
+
+uint32_t crsf_serial_get_rx_overrun_count(void)
+{
+    return g_rx_overrun_count;
 }

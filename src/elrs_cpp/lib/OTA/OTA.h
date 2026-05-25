@@ -170,6 +170,8 @@ typedef struct {
 extern bool OtaIsFullRes;
 extern volatile uint8_t OtaNonce;
 extern uint16_t OtaCrcInitializer;
+extern volatile uint32_t OtaUplinkPowerDecodeCount;
+extern volatile uint8_t OtaLastUplinkPowerDecodeSource;
 void OtaUpdateCrcInitFromUid();
 
 enum OtaSwitchMode_e { smWideOr8ch = 0, smHybridOr16ch = 1, sm12ch = 2 };

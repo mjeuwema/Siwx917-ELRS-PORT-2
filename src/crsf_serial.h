@@ -126,6 +126,35 @@ int crsf_serial_send_link_stats(const crsf_link_stats_t *stats);
 int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len);
 
 /**
+ * @brief Enable or disable USART RX byte capture
+ *
+ * RX is optional because normal standalone timing tests only need serial TX.
+ *
+ * @param enable true to receive bytes into the internal ring buffer
+ * @return 0 on success, negative on error
+ */
+int crsf_serial_set_rx_enabled(bool enable);
+
+/**
+ * @brief Return the number of bytes currently buffered from USART RX
+ */
+uint32_t crsf_serial_rx_available(void);
+
+/**
+ * @brief Read buffered USART RX bytes without blocking
+ *
+ * @param out Destination buffer
+ * @param max_len Maximum bytes to copy
+ * @return Number of bytes copied
+ */
+uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len);
+
+/**
+ * @brief RX bytes dropped because the software ring was full
+ */
+uint32_t crsf_serial_get_rx_overrun_count(void);
+
+/**
  * @brief Get number of frames sent
  * @return Total frames transmitted
  */

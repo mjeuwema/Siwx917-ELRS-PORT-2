@@ -19,6 +19,8 @@ bool OtaIsFullRes;
 volatile uint8_t OtaNonce;
 uint16_t OtaCrcInitializer;
 OtaSwitchMode_e OtaSwitchModeCurrent;
+volatile uint32_t OtaUplinkPowerDecodeCount;
+volatile uint8_t OtaLastUplinkPowerDecodeSource;
 
 // CRC
 static Crc2Byte ota_crc;
@@ -414,6 +416,8 @@ bool ICACHE_RAM_ATTR UnpackChannelDataHybridWide(OTA_Packet_s const * const otaP
     if (switchIndex == 7)
     {
         linkStats.uplink_TX_Power = switchByte & 0b111111;
+        OtaLastUplinkPowerDecodeSource = 1; // Standard HybridWide metadata slot
+        OtaUplinkPowerDecodeCount++;
     }
     else
     {
@@ -464,6 +468,8 @@ bool ICACHE_RAM_ATTR UnpackChannelData8ch(OTA_Packet_s const * const otaPktPtr, 
 #endif
     // Restore the uplink_TX_Power range 0-7 -> 1-8
     linkStats.uplink_TX_Power = constrain(ota8->rc.uplinkPower + 1, 1, 8);
+    OtaLastUplinkPowerDecodeSource = 2; // Full-res OTA8 RC packet
+    OtaUplinkPowerDecodeCount++;
     return ota8->rc.stubbornAck;
 }
 #endif
