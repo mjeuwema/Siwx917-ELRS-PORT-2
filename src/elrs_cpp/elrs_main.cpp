@@ -112,7 +112,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_CRSF_OTA_VERBOSE 0
 #define ELRS_DIAG_LUA_DISCOVERY 0
 #define ELRS_DIAG_TX_POWER 0
-#define ELRS_DIAG_DYNPOWER_STATS 0
+#define ELRS_DIAG_DYNPOWER_STATS SIW917_ELRS_DYNPOWER_STATS_DIAG
 #define SIW917_ELRS_PERSIST_STARTUP_RATE 0
 #define STARTUP_RATE_SAVE_DELAY_MS 5000U
 ///////////////////
@@ -2038,8 +2038,12 @@ static uint8_t minLqForChaos() {
 #if ELRS_DIAG_DYNPOWER_STATS
 static void printDynpowerStatsDiag(int8_t snrMean) {
   static uint32_t lastPrintMs = 0;
+  if (connectionState != connected || RXtimerState != tim_locked) {
+    return;
+  }
+
   const uint32_t nowMs = millis();
-  if ((uint32_t)(nowMs - lastPrintMs) < 1000U) {
+  if ((uint32_t)(nowMs - lastPrintMs) < 2000U) {
     return;
   }
   lastPrintMs = nowMs;
@@ -2050,13 +2054,15 @@ static void printDynpowerStatsDiag(int8_t snrMean) {
       perf ? perf->DynpowerSnrThreshUp : DYNPOWER_SNR_THRESH_NONE;
   const int8_t downThresh =
       perf ? perf->DynpowerSnrThreshDn : DYNPOWER_SNR_THRESH_NONE;
+  const bool usesSnr = (upThresh != DYNPOWER_SNR_THRESH_NONE) &&
+                       (downThresh != DYNPOWER_SNR_THRESH_NONE);
 
-  DBGLN("DYNSTAT rate=%u enum=%u radio=%u lq=%u rssi=-%u snrRaw=%d snrDb=%d "
-        "lastRaw=%d up=%d dn=%d den=%u",
-        mod ? mod->index : 0xFFU, mod ? (uint8_t)mod->enum_rate : 0xFFU,
-        mod ? mod->radio_type : 0xFFU, uplinkLQ, linkStats.uplink_RSSI_1,
-        snrMean, snrMean / RADIO_SNR_SCALE, lastSnrRaw, upThresh, downThresh,
-        ExpressLRS_currTlmDenom);
+  DBGLN("DYNPOWER metric=%s rate=%u enum=%u radio=%u lq=%u rssi=-%u "
+        "snrRaw=%d snrDb=%d lastRaw=%d up=%d dn=%d den=%u",
+        usesSnr ? "SNR" : "RSSI", mod ? mod->index : 0xFFU,
+        mod ? (uint8_t)mod->enum_rate : 0xFFU, mod ? mod->radio_type : 0xFFU,
+        uplinkLQ, linkStats.uplink_RSSI_1, snrMean, SNR_DESCALE(snrMean),
+        lastSnrRaw, upThresh, downThresh, ExpressLRS_currTlmDenom);
 }
 #endif
 

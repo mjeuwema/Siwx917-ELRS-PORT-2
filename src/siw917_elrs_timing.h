@@ -221,6 +221,15 @@
 #endif
 
 /*
+ * Dynamic-power SNR/RSSI diagnostics are useful when validating MatchTX /
+ * dynamic power, but they run on the telemetry path. Keep them opt-in so the
+ * normal RF acquisition and locked-link paths stay as quiet as upstream.
+ */
+#ifndef SIW917_ELRS_DYNPOWER_STATS_DIAG
+#define SIW917_ELRS_DYNPOWER_STATS_DIAG 0
+#endif
+
+/*
  * Use ARM DWT->CYCCNT as the fast monotonic microsecond source. This avoids the
  * RTOS SysTick sampling jitter in packet-edge/PFD timestamps while preserving a
  * software-extended micros() counter instead of exposing raw 32-bit cycles.
