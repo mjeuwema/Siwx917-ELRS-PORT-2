@@ -1029,6 +1029,7 @@ static volatile bool serialProtocolApplyRequested = false;
 static volatile bool serialProtocolApplyRequiresConnected = false;
 static uint32_t serialProtocolApplyDueMs = 0;
 static uint8_t appliedSerialProtocol = 0xFF;
+static uint8_t startupStoredSerialProtocol = 0;
 static uint32_t mavlinkSerialPendingSinceMs = 0;
 
 static constexpr uint32_t SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS = 100;
@@ -1072,6 +1073,15 @@ static void applyConfiguredSerialProtocol() {
     }
     appliedSerialProtocol = protocol;
     DBGLN("Serial protocol %u selected; CRSF UART output inactive", protocol);
+    return;
+  }
+
+  if (wantsMavlink && TxOtaProtocol != TX_MAVLINK_MODE) {
+    if (crsf_serial_is_ready()) {
+      crsf_serial_deinit();
+    }
+    appliedSerialProtocol = 0xFF;
+    DBGLN("MAVLink serial output deferred until TX MAVLink OTA mode");
     return;
   }
 
@@ -1895,7 +1905,17 @@ static void processStartupRateSave(uint32_t now) {
   }
 
   startupRateSavePending = false;
+  elrs_config_t *cfg = elrs_config_get();
+  const uint8_t runtimeSerialProtocol =
+      cfg != nullptr ? cfg->serial_protocol : startupStoredSerialProtocol;
+  if (cfg != nullptr) {
+    cfg->serial_protocol = startupStoredSerialProtocol;
+  }
   const int saveResult = elrs_config_save();
+  if (cfg != nullptr) {
+    cfg->serial_protocol = runtimeSerialProtocol;
+  }
+
   if (saveResult == 0) {
     DBGLN("Startup RF rate saved: index=%u", startupRateSaveIndex);
   } else {
@@ -2295,6 +2315,12 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
       requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
       otaProtocolSelectionChanged = true;
       DBGLN("TX OTA protocol selected serial protocol %u", desiredProtocol);
+    } else if ((TxOtaProtocol == TX_MAVLINK_MODE) &&
+               (desiredProtocol == ELRS_SERIAL_MAVLINK) &&
+               (appliedSerialProtocol != ELRS_SERIAL_MAVLINK)) {
+      requestSerialProtocolApplyAfter(now, SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS);
+      otaProtocolSelectionChanged = true;
+      DBGLN("TX OTA protocol confirmed serial protocol %u", desiredProtocol);
     }
   }
 
@@ -3998,6 +4024,7 @@ bool elrs_init(void) {
   // Record start time for rate cycling
   RFmodeLastCycled = millis();
 
+  startupStoredSerialProtocol = getConfiguredSerialProtocol();
   applyConfiguredSerialProtocol();
 
   // Load model match ID from config (0xFF = disabled)
