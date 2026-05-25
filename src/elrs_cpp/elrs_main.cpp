@@ -112,6 +112,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_LUA_DISCOVERY 0
 #define ELRS_DIAG_TX_POWER 0
 #define ELRS_DIAG_DYNPOWER_STATS 0
+#define SIW917_ELRS_PERSIST_STARTUP_RATE 0
 #define STARTUP_RATE_SAVE_DELAY_MS 5000U
 ///////////////////
 
@@ -1889,7 +1890,42 @@ static uint8_t getStartupOrBindingRateIndex(void) {
   return enumRatetoIndex(use2G4Domain() ? RATE_LORA_2G4_50HZ : RATE_BINDING);
 }
 
+static void repairPersistedStartupConfig() {
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr) {
+    return;
+  }
+
+  bool changed = false;
+  const uint8_t safe900StartupRate =
+      enumRatetoIndex(RATE_LORA_900_50HZ_DVDA);
+  const uint8_t lora900200HzRate = enumRatetoIndex(RATE_LORA_900_200HZ);
+
+  if (!use2G4Domain() && cfg->rate_index == lora900200HzRate &&
+      safe900StartupRate < RATE_MAX && isSupportedRFRate(safe900StartupRate)) {
+    cfg->rate_index = safe900StartupRate;
+    changed = true;
+  }
+
+  if (cfg->serial_protocol == ELRS_SERIAL_MAVLINK) {
+    cfg->serial_protocol = ELRS_SERIAL_CRSF;
+    changed = true;
+  }
+
+  if (!changed) {
+    return;
+  }
+
+  const int saveResult = elrs_config_save();
+  DBGLN("Recovered startup config: serial=%u rate=%u save=%d",
+        cfg->serial_protocol, cfg->rate_index, saveResult);
+}
+
 static void scheduleStartupRateSave(uint32_t now) {
+#if !SIW917_ELRS_PERSIST_STARTUP_RATE
+  (void)now;
+  return;
+#else
   if (InBindingMode || ExpressLRS_currAirRate_Modparams == nullptr) {
     return;
   }
@@ -1909,6 +1945,7 @@ static void scheduleStartupRateSave(uint32_t now) {
   startupRateSaveIndex = startupIndex;
   startupRateSaveAtMs = now + STARTUP_RATE_SAVE_DELAY_MS;
   startupRateSavePending = true;
+#endif
 }
 
 static void processStartupRateSave(uint32_t now) {
@@ -3947,6 +3984,8 @@ bool elrs_init(void) {
     DBGLN("Options init failed!");
     return false;
   }
+
+  repairPersistedStartupConfig();
 
   // Copy UID from firmware options
   memcpy(UID, firmwareOptions.uid, UID_LEN);
