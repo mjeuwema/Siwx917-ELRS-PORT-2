@@ -1860,12 +1860,29 @@ uint32_t uidMacSeedGet() {
 
 static bool use2G4Domain(void) { return firmwareOptions.domain >= 8; }
 
+static uint8_t getStartupAcquisitionRateIndex(uint8_t rateIndex) {
+  if (rateIndex >= RATE_MAX || !isSupportedRFRate(rateIndex)) {
+    return rateIndex;
+  }
+
+  const expresslrs_mod_settings_s *const params =
+      get_elrs_airRateConfig(rateIndex);
+  if (params != nullptr && params->enum_rate == RATE_LORA_900_200HZ) {
+    const uint8_t scanIndex = enumRatetoIndex(RATE_LORA_900_50HZ_DVDA);
+    if (scanIndex < RATE_MAX && isSupportedRFRate(scanIndex)) {
+      return scanIndex;
+    }
+  }
+
+  return rateIndex;
+}
+
 static uint8_t getStartupOrBindingRateIndex(void) {
   if (!InBindingMode) {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr && cfg->rate_index < RATE_MAX &&
         isSupportedRFRate(cfg->rate_index)) {
-      return cfg->rate_index;
+      return getStartupAcquisitionRateIndex(cfg->rate_index);
     }
   }
 
@@ -1882,13 +1899,14 @@ static void scheduleStartupRateSave(uint32_t now) {
     return;
   }
 
+  const uint8_t startupIndex = getStartupAcquisitionRateIndex(rateIndex);
   elrs_config_t *cfg = elrs_config_get();
-  if (cfg == nullptr || cfg->rate_index == rateIndex) {
+  if (cfg == nullptr || cfg->rate_index == startupIndex) {
     return;
   }
 
-  cfg->rate_index = rateIndex;
-  startupRateSaveIndex = rateIndex;
+  cfg->rate_index = startupIndex;
+  startupRateSaveIndex = startupIndex;
   startupRateSaveAtMs = now + STARTUP_RATE_SAVE_DELAY_MS;
   startupRateSavePending = true;
 }
