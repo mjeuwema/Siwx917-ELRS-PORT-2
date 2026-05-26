@@ -62,7 +62,7 @@ static selectionParameter luaForceTlm = {
 static selectionParameter luaTlmPower = {
     {"Tlm Power", CRSF_TEXT_SELECTION, 0, 0},
     3,
-    "10;25;50;100;250;500;1000;2000;MatchTX",
+    "10;25;50;100;MatchTX",
     "mW",
 };
 
@@ -173,7 +173,7 @@ static uint8_t selectionToModelId(uint8_t selection) {
 }
 
 static constexpr int8_t TLM_POWER_DBM_BY_SELECTION[] = {
-    10, 14, 17, 20, 24, 27, 30, 33,
+    10, 14, 17, 20,
 };
 static constexpr uint8_t TLM_POWER_MATCH_TX_SELECTION =
     (uint8_t)(sizeof(TLM_POWER_DBM_BY_SELECTION) /

@@ -425,13 +425,26 @@ static int8_t crsfPowerToDbm(uint8_t crsfPower) {
 }
 
 static constexpr int8_t RX_TLM_POWER_DBM_BY_SELECTION[] = {
-    10, 14, 17, 20, 24, 27, 30, 33,
+    10, 14, 17, 20,
 };
 static constexpr uint8_t RX_TLM_POWER_MATCH_TX_SELECTION =
     (uint8_t)(sizeof(RX_TLM_POWER_DBM_BY_SELECTION) /
               sizeof(RX_TLM_POWER_DBM_BY_SELECTION[0]));
 static constexpr char RX_TLM_POWER_OPTIONS[] =
-    "10;25;50;100;250;500;1000;2000;MatchTX";
+    "10;25;50;100;MatchTX";
+
+static int8_t clampRxTelemetryPowerDbm(int8_t dbm, bool isSubGHz) {
+  const int8_t maxDbm =
+      isSubGHz ? ELRS_TX_POWER_SUBGHZ_MAX_DBM : ELRS_TX_POWER_2G4_MAX_DBM;
+
+  if (dbm < ELRS_TX_POWER_MIN_DBM) {
+    return ELRS_TX_POWER_MIN_DBM;
+  }
+  if (dbm > maxDbm) {
+    return maxDbm;
+  }
+  return dbm;
+}
 
 static int8_t rxTlmPowerSelectionToDbm(uint8_t selection) {
   if (selection >= RX_TLM_POWER_MATCH_TX_SELECTION) {
@@ -475,18 +488,23 @@ static void updateRxDownlinkPower(bool initialize) {
     }
   }
 
-  if (!initialize && desiredDbm == requestedDbm) {
+  const int8_t subGhzDbm = clampRxTelemetryPowerDbm(desiredDbm, true);
+  const int8_t highBandDbm = clampRxTelemetryPowerDbm(desiredDbm, false);
+  const bool capped = (subGhzDbm != desiredDbm);
+
+  if (!initialize && subGhzDbm == requestedDbm) {
     return;
   }
 
-  requestedDbm = desiredDbm;
+  requestedDbm = subGhzDbm;
 
   // Program both LR1121 PA tables. On SiW917 the pending value is committed
   // just before the next telemetry TX instead of from TX_DONE.
-  Radio.SetOutputPower(desiredDbm, true);
-  Radio.SetOutputPower(desiredDbm, false);
-  DBGLN("RX downlink power scheduled: %d dBm%s", desiredDbm,
-        matchTxPower ? " (matching TX)" : "");
+  Radio.SetOutputPower(subGhzDbm, true);
+  Radio.SetOutputPower(highBandDbm, false);
+  DBGLN("RX downlink power scheduled: %d dBm%s", subGhzDbm,
+        capped ? (matchTxPower ? " (matching TX, capped)" : " (capped)")
+               : (matchTxPower ? " (matching TX)" : ""));
 }
 
 static void ICACHE_RAM_ATTR noteDecodedUplinkTxPower() {

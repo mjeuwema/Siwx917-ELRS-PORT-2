@@ -102,7 +102,13 @@ typedef enum {
 #define ELRS_TX_POWER_MATCH_TX_DBM  ((int8_t)-128)
 #define ELRS_TX_POWER_MIN_DBM       ((int8_t)10)
 #define ELRS_TX_POWER_DEFAULT_DBM   ((int8_t)20)
-#define ELRS_TX_POWER_MAX_DBM       ((int8_t)33)
+/* Core1121/LR1121 has no external PA. The stock ELRS fixed-power menu has no
+ * 22 dBm slot, so expose fixed choices only through 100 mW / 20 dBm. Runtime
+ * MatchTX scheduling is separately capped to the radio PA limits below.
+ */
+#define ELRS_TX_POWER_MAX_DBM       ((int8_t)20)
+#define ELRS_TX_POWER_SUBGHZ_MAX_DBM ((int8_t)22)
+#define ELRS_TX_POWER_2G4_MAX_DBM   ((int8_t)13)
 
 /*******************************************************************************
  * Regulatory Domain Options

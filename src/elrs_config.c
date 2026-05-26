@@ -218,10 +218,6 @@ static void normalize_config_fields(elrs_config_t* config)
   case 14:
   case 17:
   case 20:
-  case 24:
-  case 27:
-  case 30:
-  case 33:
     break;
   default:
     config->tx_power = ELRS_TX_POWER_DEFAULT_DBM;
