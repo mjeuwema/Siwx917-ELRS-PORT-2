@@ -11,6 +11,50 @@
 #define SIW917_ELRS_TIMING_LEAN 1
 #endif
 
+/*
+ * Dual-LR1121 bring-up switches.
+ *
+ * PROBE initializes and version-checks a second LR1121 on the shared GSPI bus,
+ * but keeps upstream ELRS in single-radio mode. Use this first to validate
+ * wiring and chip-select/BUSY/reset timing without risking the working RX link.
+ *
+ * UPSTREAM_DUAL is reserved for the next stage: once the Radio2 DIO9 interrupt
+ * path is implemented and validated, it exposes GPIO_PIN_NSS_2 to ELRS,
+ * advertises true diversity, and lets upstream dual-radio/Gemini packet paths
+ * run. Do not enable until PROBE passes cleanly with both radios wired.
+ */
+#ifndef SIW917_ELRS_DUAL_RADIO_PROBE
+#define SIW917_ELRS_DUAL_RADIO_PROBE 0
+#endif
+
+#ifndef SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define SIW917_ELRS_UPSTREAM_DUAL_RADIO 0
+#endif
+
+#ifndef SIW917_ELRS_RADIO2_IRQ_READY
+#define SIW917_ELRS_RADIO2_IRQ_READY 0
+#endif
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO && !SIW917_ELRS_RADIO2_IRQ_READY
+#error "Enable SIW917_ELRS_UPSTREAM_DUAL_RADIO only after Radio2 DIO9 IRQ support is validated."
+#endif
+
+#ifndef SIW917_ELRS_RADIO2_NSS_PIN
+#define SIW917_ELRS_RADIO2_NSS_PIN 50
+#endif
+
+#ifndef SIW917_ELRS_RADIO2_BUSY_PIN
+#define SIW917_ELRS_RADIO2_BUSY_PIN 51
+#endif
+
+#ifndef SIW917_ELRS_RADIO2_DIO_PIN
+#define SIW917_ELRS_RADIO2_DIO_PIN 47
+#endif
+
+#ifndef SIW917_ELRS_RADIO2_RST_PIN
+#define SIW917_ELRS_RADIO2_RST_PIN 49
+#endif
+
 /* Boot/init timer logs are useful for bring-up, but not for timing runs. */
 #ifndef SIW917_ELRS_TIMER_VERBOSE_INIT
 #define SIW917_ELRS_TIMER_VERBOSE_INIT (!SIW917_ELRS_TIMING_LEAN)

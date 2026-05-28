@@ -23,6 +23,40 @@ constexpr size_t kSpiScratchSize = 512;
 uint8_t gTransferWriteDummy[kSpiScratchSize];
 uint8_t gTransferReadBuf[kSpiScratchSize];
 uint8_t gSpiexWriteDummy[kSpiScratchSize];
+
+static inline uint8_t lr1121RadioForMask(uint8_t cs_mask) {
+  return (cs_mask & SX12XX_Radio_2) ? LR1121_RADIO_2 : LR1121_RADIO_1;
+}
+
+static void transferSelectedRadio(uint8_t radio_mask, uint8_t *data,
+                                  uint32_t size, bool reading) {
+  lr1121_select_radio(radio_mask);
+  lr1121_cs_assert();
+
+  if (reading) {
+    if (size <= sizeof(gTransferReadBuf)) {
+      lr1121_spi_transfer(data, gTransferReadBuf, size);
+      memcpy(data, gTransferReadBuf, size);
+    } else {
+      for (uint32_t i = 0; i < size; i++) {
+        uint8_t rx = 0;
+        lr1121_spi_transfer(&data[i], &rx, 1);
+        data[i] = rx;
+      }
+    }
+  } else {
+    if (size <= sizeof(gSpiexWriteDummy)) {
+      lr1121_spi_transfer(data, gSpiexWriteDummy, size);
+    } else {
+      for (uint32_t i = 0; i < size; i++) {
+        uint8_t rx = 0;
+        lr1121_spi_transfer(&data[i], &rx, 1);
+      }
+    }
+  }
+
+  lr1121_cs_deassert();
+}
 } // namespace
 
 //-----------------------------------------------------------------------------
@@ -76,41 +110,17 @@ void SPIExClass::read(uint8_t cs_mask, uint8_t *data, uint32_t size) {
 
 void SPIExClass::_transfer(uint8_t cs_mask, uint8_t *data, uint32_t size,
                            bool reading) {
-  // cs_mask indicates which radio(s) to select:
-  // SX12XX_Radio_1 = 0x01, SX12XX_Radio_2 = 0x02, SX12XX_Radio_All = 0x03
-  // For SiW917 we only support Radio_1
-  (void)cs_mask;
-
   if (size == 0)
     return;
 
-  // Assert CS
-  lr1121_cs_assert();
-
-  if (reading) {
-    // Read operation: send data as dummy, receive response
-    if (size <= sizeof(gTransferReadBuf)) {
-      lr1121_spi_transfer(data, gTransferReadBuf, size);
-      memcpy(data, gTransferReadBuf, size);
-    } else {
-      for (uint32_t i = 0; i < size; i++) {
-        uint8_t rx = 0;
-        lr1121_spi_transfer(&data[i], &rx, 1);
-        data[i] = rx;
-      }
-    }
-  } else {
-    // Write operation: send data, ignore response
-    if (size <= sizeof(gSpiexWriteDummy)) {
-      lr1121_spi_transfer(data, gSpiexWriteDummy, size);
-    } else {
-      for (uint32_t i = 0; i < size; i++) {
-        uint8_t rx = 0;
-        lr1121_spi_transfer(&data[i], &rx, 1);
-      }
-    }
+  if (!reading && cs_mask == SX12XX_Radio_All &&
+      SIW917_ELRS_UPSTREAM_DUAL_RADIO) {
+    transferSelectedRadio(LR1121_RADIO_1, data, size, false);
+    transferSelectedRadio(LR1121_RADIO_2, data, size, false);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return;
   }
 
-  // Deassert CS
-  lr1121_cs_deassert();
+  transferSelectedRadio(lr1121RadioForMask(cs_mask), data, size, reading);
+  lr1121_select_radio(LR1121_RADIO_1);
 }

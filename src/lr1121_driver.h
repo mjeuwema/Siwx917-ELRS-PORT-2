@@ -26,6 +26,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "siw917_elrs_timing.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -108,6 +110,24 @@ extern "C" {
 #define LR1121_PIN_NSS 28  /* SPI Chip Select (Active Low) */
 #define LR1121_PIN_BUSY 29 /* Busy signal (Active High) */
 #define LR1121_PIN_RST 30  /* Reset signal (Active Low) */
+
+#define LR1121_RADIO_1 0x01U
+#define LR1121_RADIO_2 0x02U
+#define LR1121_RADIO_ALL (LR1121_RADIO_1 | LR1121_RADIO_2)
+
+#if SIW917_ELRS_DUAL_RADIO_PROBE || SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define LR1121_HAS_RADIO2 1
+#define LR1121_PIN_NSS_2 SIW917_ELRS_RADIO2_NSS_PIN
+#define LR1121_PIN_BUSY_2 SIW917_ELRS_RADIO2_BUSY_PIN
+#define LR1121_PIN_DIO_2 SIW917_ELRS_RADIO2_DIO_PIN
+#define LR1121_PIN_RST_2 SIW917_ELRS_RADIO2_RST_PIN
+#else
+#define LR1121_HAS_RADIO2 0
+#define LR1121_PIN_NSS_2 0xFFU
+#define LR1121_PIN_BUSY_2 0xFFU
+#define LR1121_PIN_DIO_2 0xFFU
+#define LR1121_PIN_RST_2 0xFFU
+#endif
 
 /*******************************************************************************
  * Timing Constants
@@ -384,6 +404,15 @@ void lr1121_gpio_toggle_test(uint32_t cycles);
  * @return true if BUSY went LOW, false on timeout
  */
 bool lr1121_wait_busy_timeout(uint32_t timeout_ms);
+
+/**
+ * @brief Select which LR1121 low-level operations target.
+ *
+ * The SiW917 port keeps one shared GSPI bus. This selector controls which
+ * manual NSS/BUSY/RST GPIO the existing command helpers use.
+ */
+void lr1121_select_radio(uint8_t radio_mask);
+uint8_t lr1121_get_selected_radio(void);
 
 /**
  * @brief Hot-path BUSY wait with no coarse delay.

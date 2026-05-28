@@ -385,6 +385,37 @@ static sl_gspi_handle_t gspi_handle = NULL;
 static volatile bool gspi_transfer_complete = false;
 extern void IRQ046_Handler(void);
 static bool driver_initialized = false;
+static uint8_t selected_radio = LR1121_RADIO_1;
+
+static inline bool radio2_available(void) { return LR1121_HAS_RADIO2 != 0; }
+
+void lr1121_select_radio(uint8_t radio_mask) {
+  if ((radio_mask & LR1121_RADIO_2) && radio2_available()) {
+    selected_radio = LR1121_RADIO_2;
+  } else {
+    selected_radio = LR1121_RADIO_1;
+  }
+}
+
+uint8_t lr1121_get_selected_radio(void) { return selected_radio; }
+
+static inline uint8_t selected_nss_pin(void) {
+  return (selected_radio == LR1121_RADIO_2 && radio2_available())
+             ? (uint8_t)LR1121_PIN_NSS_2
+             : (uint8_t)LR1121_PIN_NSS;
+}
+
+static inline uint8_t selected_busy_pin(void) {
+  return (selected_radio == LR1121_RADIO_2 && radio2_available())
+             ? (uint8_t)LR1121_PIN_BUSY_2
+             : (uint8_t)LR1121_PIN_BUSY;
+}
+
+static inline uint8_t selected_rst_pin(void) {
+  return (selected_radio == LR1121_RADIO_2 && radio2_available())
+             ? (uint8_t)LR1121_PIN_RST_2
+             : (uint8_t)LR1121_PIN_RST;
+}
 
 static void configure_output_pad_slow(uint8_t pin) {
   uint32_t pad = PAD_CONFIG_REG(pin);
@@ -400,6 +431,10 @@ static void configure_lr1121_output_pads_slow(void) {
   configure_output_pad_slow(LR1121_PIN_MOSI);
   configure_output_pad_slow(LR1121_PIN_NSS);
   configure_output_pad_slow(LR1121_PIN_RST);
+#if LR1121_HAS_RADIO2
+  configure_output_pad_slow(LR1121_PIN_NSS_2);
+  configure_output_pad_slow(LR1121_PIN_RST_2);
+#endif
 }
 
 /*******************************************************************************
@@ -578,12 +613,30 @@ static void configure_gpio_pads(void) {
   /* Enable receiver on BUSY (GPIO_29) */
   PAD_CONFIG_REG(29) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
 
+#if LR1121_HAS_RADIO2
+  /* Radio 2 prototype controls live on BRD2708A breakout HP GPIOs. */
+  PAD_CONFIG_REG(LR1121_PIN_BUSY_2) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS_2) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY_2) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST_2) &= ~(0xF << 2);
+  HP_GPIO_SET_OUTPUT(LR1121_PIN_NSS_2);
+  HP_GPIO_SET_INPUT(LR1121_PIN_BUSY_2);
+  HP_GPIO_SET_OUTPUT(LR1121_PIN_RST_2);
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS_2);
+  HP_GPIO_SET_HIGH(LR1121_PIN_RST_2);
+#endif
+
   /* Reduce SiW917 output drive and slew for cleaner SPI captures. */
   configure_lr1121_output_pads_slow();
 
   DEBUGOUT("  PAD_CONFIG_REG(26/MISO) = 0x%08lX (REN=%d)\n",
            (unsigned long)PAD_CONFIG_REG(26),
            (PAD_CONFIG_REG(26) & PADCONFIG_REN_BIT) ? 1 : 0);
+#if LR1121_HAS_RADIO2
+  DEBUGOUT("  Radio2 pins: NSS=GPIO_%u BUSY=GPIO_%u RST=GPIO_%u\n",
+           (unsigned)LR1121_PIN_NSS_2, (unsigned)LR1121_PIN_BUSY_2,
+           (unsigned)LR1121_PIN_RST_2);
+#endif
   DEBUGOUT("  SPI output pads: 4mA drive, low slew (SCK/MOSI/NSS/RST)\n");
 #endif
   DEBUGOUT("LR1121: GPIO pads configured\n");
@@ -672,11 +725,14 @@ static inline uint32_t lr1121_fast_busy_timeout_us(uint16_t opcode) {
 }
 
 static inline int read_busy_pin(void) {
+  const uint8_t busy_pin = selected_busy_pin();
 #if SIW917_ELRS_BUSY_PORT_READ
-  return (int)HP_GPIO_READ_PORT1(LR1121_PIN_BUSY);
+  if (busy_pin == LR1121_PIN_BUSY) {
+    return (int)HP_GPIO_READ_PORT1(LR1121_PIN_BUSY);
+  }
 #else
-  return (int)HP_GPIO_READ(LR1121_PIN_BUSY);
 #endif
+  return (int)HP_GPIO_READ(busy_pin);
 }
 
 /**
@@ -687,7 +743,7 @@ static inline int read_busy_pin(void) {
  * GPIO_28 (CS) is bit 12 of PORT 1
  */
 static void cs_assert(void) {
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   delay_us(1); /* NSS setup time */
 }
 
@@ -698,7 +754,7 @@ static void cs_assert(void) {
  */
 static void cs_deassert(void) {
   delay_us(1); /* NSS hold time */
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
   delay_us(1); /* Inter-transaction gap */
 }
 
@@ -950,7 +1006,7 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   __asm volatile("nop");
 
   bool ok = true;
@@ -991,7 +1047,7 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
   }
 
   __asm volatile("nop");
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1104,7 +1160,7 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   __asm volatile("nop");
 
   bool ok = true;
@@ -1142,7 +1198,7 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
 
   __asm volatile("nop");
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1238,7 +1294,7 @@ static bool lr1121_read_response_fast(uint8_t *response,
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   __asm volatile("nop");
 
   bool ok = true;
@@ -1279,7 +1335,7 @@ static bool lr1121_read_response_fast(uint8_t *response,
   }
 
   __asm volatile("nop");
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1720,11 +1776,28 @@ lr1121_status_t lr1121_init(void) {
   /* Enable receiver on BUSY pin */
   PAD_CONFIG_REG(LR1121_PIN_BUSY) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
 
+#if LR1121_HAS_RADIO2
+  DEBUGOUT("LR1121: Configuring BUSY2 pin (GPIO-%d) as input\n",
+           LR1121_PIN_BUSY_2);
+  RSI_EGPIO_SetPinMux(EGPIO, 0, LR1121_PIN_BUSY_2, EGPIO_PIN_MUX_MODE0);
+  RSI_EGPIO_SetDir(EGPIO, 0, LR1121_PIN_BUSY_2, EGPIO_CONFIG_DIR_INPUT);
+  PAD_CONFIG_REG(LR1121_PIN_BUSY_2) |=
+      (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
+#endif
+
   /* Step 3: Configure RST pin (GPIO_30) as output, drive HIGH (not reset) */
   DEBUGOUT("LR1121: Configuring RST pin (GPIO-%d) as output\n", LR1121_PIN_RST);
   RSI_EGPIO_SetPinMux(EGPIO, 0, LR1121_PIN_RST, EGPIO_PIN_MUX_MODE0);
   RSI_EGPIO_SetDir(EGPIO, 0, LR1121_PIN_RST, EGPIO_CONFIG_DIR_OUTPUT);
   RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_RST, 1); /* RST HIGH (not reset) */
+
+#if LR1121_HAS_RADIO2
+  DEBUGOUT("LR1121: Configuring RST2 pin (GPIO-%d) as output\n",
+           LR1121_PIN_RST_2);
+  RSI_EGPIO_SetPinMux(EGPIO, 0, LR1121_PIN_RST_2, EGPIO_PIN_MUX_MODE0);
+  RSI_EGPIO_SetDir(EGPIO, 0, LR1121_PIN_RST_2, EGPIO_CONFIG_DIR_OUTPUT);
+  RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_RST_2, 1);
+#endif
 #endif
 
 #ifdef USE_SOFT_SPI
@@ -1914,6 +1987,11 @@ skip_gspi_init:
   RSI_EGPIO_SetPinMux(EGPIO, 0, LR1121_PIN_NSS, EGPIO_PIN_MUX_MODE0);
   RSI_EGPIO_SetDir(EGPIO, 0, LR1121_PIN_NSS, EGPIO_CONFIG_DIR_OUTPUT);
   RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_NSS, 1);
+#if LR1121_HAS_RADIO2
+  RSI_EGPIO_SetPinMux(EGPIO, 0, LR1121_PIN_NSS_2, EGPIO_PIN_MUX_MODE0);
+  RSI_EGPIO_SetDir(EGPIO, 0, LR1121_PIN_NSS_2, EGPIO_CONFIG_DIR_OUTPUT);
+  RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_NSS_2, 1);
+#endif
 
   DEBUGOUT("LR1121: Driver initialization complete\n");
   driver_initialized = true;
@@ -1938,14 +2016,16 @@ void lr1121_deinit(void) {
 }
 
 lr1121_status_t lr1121_reset(void) {
-  DEBUGOUT("\nPerforming hardware reset...\n");
+  const uint8_t rst_pin = selected_rst_pin();
+  DEBUGOUT("\nPerforming hardware reset on radio %u (RST GPIO_%u)...\n",
+           (unsigned)selected_radio, (unsigned)rst_pin);
 
   /* Drive RST LOW */
-  RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_RST, 0);
+  RSI_EGPIO_SetPin(EGPIO, 0, rst_pin, 0);
   delay_ms(LR1121_RESET_PULSE_MS);
 
   /* Drive RST HIGH */
-  RSI_EGPIO_SetPin(EGPIO, 0, LR1121_PIN_RST, 1);
+  RSI_EGPIO_SetPin(EGPIO, 0, rst_pin, 1);
   DEBUGOUT("LR1121: Hardware reset performed\n");
 
   /* Wait for recovery (BUSY is HIGH for ~230ms after reset) */
@@ -2381,7 +2461,7 @@ void lr1121_hw_verification_test(void) {
 
   /* Test MISO with CS asserted after reset */
   DEBUGOUT("\n2. MISO Test with CS Asserted:\n");
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS); /* Assert CS */
+  HP_GPIO_SET_LOW(selected_nss_pin()); /* Assert CS */
   delay_ms(1);
 
   DEBUGOUT("   MISO reads with CS=LOW (10 samples, 50ms apart): ");
@@ -2395,7 +2475,7 @@ void lr1121_hw_verification_test(void) {
   }
   DEBUGOUT("\n");
 
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS); /* Deassert CS */
+  HP_GPIO_SET_HIGH(selected_nss_pin()); /* Deassert CS */
 
   DEBUGOUT("   MISO HIGH count: %d/10 ", miso_high_count);
   if (miso_high_count > 0 && miso_high_count < 10) {
@@ -2419,9 +2499,9 @@ void lr1121_hw_verification_test(void) {
   /* Send GetStatus command (0x0100) */
   uint8_t cmd[2] = {0x01, 0x00};
   uint8_t rx[2];
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   spi_transfer(cmd, rx, 2);
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
 
   delay_ms(1); /* Wait for processing */
 
@@ -2434,9 +2514,9 @@ void lr1121_hw_verification_test(void) {
   /* Read response */
   uint8_t nop[3] = {0x00, 0x00, 0x00};
   uint8_t resp[3];
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   spi_transfer(nop, resp, 3);
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
 
   DEBUGOUT("   Response: %02X %02X %02X\n", resp[0], resp[1], resp[2]);
 
@@ -2731,13 +2811,13 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
 
     /* Test GPIO_28 (CS) */
     DEBUGOUT("\nGPIO_28 (CS) -> HIGH (expect ~3.3V on mikroBUS pin 3)\n");
-    HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+    HP_GPIO_SET_HIGH(selected_nss_pin());
     DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 1)\n",
              (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
     delay_ms(500);
 
     DEBUGOUT("GPIO_28 (CS) -> LOW (expect ~0V on mikroBUS pin 3)\n");
-    HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+    HP_GPIO_SET_LOW(selected_nss_pin());
     DEBUGOUT("  BIT_LOAD_REG(28) readback = %lu (expect 0)\n",
              (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS));
     delay_ms(500);
@@ -2770,7 +2850,7 @@ void lr1121_gpio_toggle_test(uint32_t cycles) {
   DEBUGOUT("Test complete. Restoring idle state...\n");
   HP_GPIO_SET_LOW(LR1121_PIN_SCK);
   HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
   HP_GPIO_SET_HIGH(LR1121_PIN_RST);
 
   DEBUGOUT("Idle state: SCK=LOW, MOSI=LOW, CS=HIGH, RST=HIGH\n");
@@ -2929,24 +3009,25 @@ static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
   const uint32_t cfg_sck = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK);
   const uint32_t cfg_miso = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO);
   const uint32_t cfg_mosi = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI);
-  const uint32_t cfg_nss = EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS);
+  const uint8_t nss_pin = selected_nss_pin();
+  const uint32_t cfg_nss = EGPIO_GPIO_CONFIG_REG(nss_pin);
 
   // Temporarily take the SPI pins out of peripheral mode for a pure GPIO
   // transaction. Restore the SDK/GSPI pin config before returning.
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) &= ~(0xF << 2);
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) &= ~(0xF << 2);
+  EGPIO_GPIO_CONFIG_REG(nss_pin) &= ~(0xF << 2);
 
   HP_GPIO_SET_OUTPUT(LR1121_PIN_SCK);
   HP_GPIO_SET_OUTPUT(LR1121_PIN_MOSI);
-  HP_GPIO_SET_OUTPUT(LR1121_PIN_NSS);
+  HP_GPIO_SET_OUTPUT(nss_pin);
   HP_GPIO_SET_INPUT(LR1121_PIN_MISO);
 
   HP_GPIO_SET_LOW(LR1121_PIN_SCK);
   HP_GPIO_SET_LOW(LR1121_PIN_MOSI);
 
-  HP_GPIO_SET_LOW(LR1121_PIN_NSS);
+  HP_GPIO_SET_LOW(selected_nss_pin());
   for (volatile int d = 0; d < 100; d++) {
   }
 
@@ -2984,14 +3065,14 @@ static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
 
   for (volatile int d = 0; d < 100; d++) {
   }
-  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+  HP_GPIO_SET_HIGH(selected_nss_pin());
   for (volatile int d = 0; d < 100; d++) {
   }
 
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_SCK) = cfg_sck;
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MISO) = cfg_miso;
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_MOSI) = cfg_mosi;
-  EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS) = cfg_nss;
+  EGPIO_GPIO_CONFIG_REG(nss_pin) = cfg_nss;
 
   return true;
 }

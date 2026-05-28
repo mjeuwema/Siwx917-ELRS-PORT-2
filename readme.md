@@ -18,9 +18,32 @@ An ExpressLRS 4.0 compatible receiver implementation for the Silicon Labs SiWx91
 | GPIO_26     | MISO       | SPI Data Out |
 | GPIO_27     | MOSI       | SPI Data In |
 | GPIO_28     | NSS        | SPI Chip Select |
-| GPIO_46     | BUSY       | Radio Busy |
-| GPIO_47     | DIO1       | Radio IRQ |
-| GPIO_50     | NRESET     | Radio Reset |
+| GPIO_29     | BUSY       | Radio Busy |
+| GPIO_46     | DIO9       | Radio IRQ (ELRS DIO1 signal) |
+| GPIO_30     | NRESET     | Radio Reset |
+
+### Gemini / Diversity Prototype Wiring
+
+The first Gemini bring-up should keep both LR1121 modules on the proven
+16 MHz GSPI bus and add separate control lines for the second radio. This
+matches the ELRS dual-radio model while avoiding a second, unproven SPI driver
+path in the timing-critical packet loop.
+
+| Signal | Radio 1 | Radio 2 prototype | Notes |
+|--------|---------|-------------------|-------|
+| SCK    | GPIO_25 | GPIO_25 shared    | Shared GSPI clock |
+| MISO   | GPIO_26 | GPIO_26 shared    | Both LR1121 MISO pins must tri-state when NSS is high |
+| MOSI   | GPIO_27 | GPIO_27 shared    | Shared GSPI MOSI |
+| NSS    | GPIO_28 | GPIO_50           | Separate chip-select per radio |
+| BUSY   | GPIO_29 | GPIO_51           | Separate BUSY per radio |
+| DIO9   | GPIO_46 | GPIO_47           | Separate IRQ per radio |
+| NRESET | GPIO_30 | GPIO_49           | Separate reset is better for debug |
+
+Avoid GPIO_10/11 (LED/button), GPIO_52/54/55 (USART0 serial), and ULP/UULP GPIOs
+for the second radio IRQ path. On BRD2708A, the breakout pads expose convenient
+HP GPIOs GPIO_50, GPIO_51, GPIO_48, GPIO_47, GPIO_49, GPIO_46, and GPIO_15; the
+prototype map keeps GPIO_46 for Radio 1 DIO9 and uses GPIO_50/51/47/49 for
+Radio 2.
 
 ## Features
 

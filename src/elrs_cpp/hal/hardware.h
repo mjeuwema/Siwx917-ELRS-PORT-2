@@ -12,7 +12,7 @@
  *
  * LR1121 Control:
  *   GPIO_29 = BUSY (LR1121 busy indicator) 
- *   GPIO_6  = DIO1 (LR1121 interrupt) - HP GPIO for reliable interrupts
+ *   GPIO_46 = DIO9 (LR1121 interrupt, ELRS DIO1 signal)
  *   GPIO_30 = NRESET (LR1121 reset)
  *
  * RF Switch (PE4259):
@@ -23,6 +23,7 @@
 #pragma once
 
 #include "Arduino.h"
+#include "siw917_elrs_timing.h"
 
 //=============================================================================
 // SPI Pins - GSPI peripheral
@@ -40,12 +41,19 @@
 #define GPIO_PIN_RST    30   // Hardware reset (active low, GPIO_30)
 
 //=============================================================================
-// Secondary Radio (Gemini/Dual mode) - Not used
+// Secondary Radio (Gemini/Dual mode)
 //=============================================================================
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define GPIO_PIN_NSS_2      SIW917_ELRS_RADIO2_NSS_PIN
+#define GPIO_PIN_BUSY_2     SIW917_ELRS_RADIO2_BUSY_PIN
+#define GPIO_PIN_DIO1_2     SIW917_ELRS_RADIO2_DIO_PIN
+#define GPIO_PIN_RST_2      SIW917_ELRS_RADIO2_RST_PIN
+#else
 #define GPIO_PIN_NSS_2      UNDEF_PIN
 #define GPIO_PIN_BUSY_2     UNDEF_PIN
 #define GPIO_PIN_DIO1_2     UNDEF_PIN
 #define GPIO_PIN_RST_2      UNDEF_PIN
+#endif
 
 //=============================================================================
 // LED Pins
@@ -117,5 +125,4 @@
 // Helper Functions
 //=============================================================================
 
-// Single radio configuration (no Gemini mode)
-static inline bool isDualRadio() { return false; }
+static inline bool isDualRadio() { return SIW917_ELRS_UPSTREAM_DUAL_RADIO != 0; }

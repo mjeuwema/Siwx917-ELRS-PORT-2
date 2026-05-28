@@ -41,7 +41,7 @@ extern SPIClass SPI;
 /**
  * @brief ELRS SPIEx class for dual-radio support
  * 
- * SiW917 implementation only supports single radio (Radio_1)
+ * SiW917 uses one shared GSPI bus and selects the target LR1121 by manual NSS.
  */
 class SPIExClass : public SPIClass {
 public:

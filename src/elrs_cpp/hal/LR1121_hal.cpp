@@ -79,6 +79,22 @@ static inline bool handleBusyTimeout(const char *context, uint16_t opcode,
 #endif
 }
 
+static inline bool siw917DualRuntimeEnabled() {
+  return SIW917_ELRS_UPSTREAM_DUAL_RADIO != 0;
+}
+
+static inline bool siw917FanoutAllRadios(SX12XX_Radio_Number_t radioNumber) {
+  return radioNumber == SX12XX_Radio_All && siw917DualRuntimeEnabled();
+}
+
+static inline uint8_t siw917LrRadioFor(SX12XX_Radio_Number_t radioNumber) {
+  return (radioNumber & SX12XX_Radio_2) ? LR1121_RADIO_2 : LR1121_RADIO_1;
+}
+
+static inline void siw917SelectRadio(SX12XX_Radio_Number_t radioNumber) {
+  lr1121_select_radio(siw917LrRadioFor(radioNumber));
+}
+
 // Static instance pointer
 LR1121Hal *LR1121Hal::instance = nullptr;
 
@@ -122,11 +138,37 @@ void LR1121Hal::init() {
   //  10. Calibrate(0x3F)
   //  11. ClearErrors
   //  12. ClearIrq
+  lr1121_select_radio(LR1121_RADIO_1);
   status = lr1121_waveshare_init();
   if (status != LR1121_OK) {
     DBGLN("LR1121 TCXO init failed: %d", (int)status);
     return;
   }
+
+#if SIW917_ELRS_DUAL_RADIO_PROBE || SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  DBGLN("LR1121Hal Radio2 probe enabled: NSS=GPIO_%u BUSY=GPIO_%u "
+        "DIO9=GPIO_%u RST=GPIO_%u",
+        (unsigned)LR1121_PIN_NSS_2, (unsigned)LR1121_PIN_BUSY_2,
+        (unsigned)LR1121_PIN_DIO_2, (unsigned)LR1121_PIN_RST_2);
+  lr1121_select_radio(LR1121_RADIO_2);
+  status = lr1121_waveshare_init();
+  if (status != LR1121_OK) {
+    DBGLN("LR1121 Radio2 TCXO/probe init failed: %d", (int)status);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return;
+  }
+
+  lr1121_firmware_version_t radio2Version;
+  if (lr1121_get_firmware_version(&radio2Version, LR1121_OPCODE_GET_VERSION)) {
+    DBGLN("LR1121 #2 Probe Ready: HW=0x%02X Type=0x%02X FW=0x%04X",
+          radio2Version.hardware, radio2Version.type, radio2Version.version);
+  } else {
+    DBGLN("LR1121 #2 probe version read failed");
+    lr1121_select_radio(LR1121_RADIO_1);
+    return;
+  }
+  lr1121_select_radio(LR1121_RADIO_1);
+#endif
 
   // Configure LR1121 DIO9 interrupt (SiW917 GPIO_46)
   // NOTE: Function named "dio1" for ELRS legacy compatibility, but this is
@@ -176,10 +218,20 @@ void LR1121Hal::reset(bool bootloader) {
   // Perform hardware reset AND full TCXO init via C driver
   // CRITICAL: A raw lr1121_reset() kills the TCXO. We MUST re-run the full
   // waveshare TCXO init sequence every time the chip is hardware reset!
+  lr1121_select_radio(LR1121_RADIO_1);
   lr1121_status_t status = lr1121_waveshare_init();
   if (status != LR1121_OK) {
     DBGLN("LR1121 reset/init failed: %d", (int)status);
   }
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  lr1121_select_radio(LR1121_RADIO_2);
+  status = lr1121_waveshare_init();
+  if (status != LR1121_OK) {
+    DBGLN("LR1121 Radio2 reset/init failed: %d", (int)status);
+  }
+  lr1121_select_radio(LR1121_RADIO_1);
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -189,6 +241,14 @@ void LR1121Hal::reset(bool bootloader) {
 
 void LR1121Hal::WriteCommand(uint16_t opcode,
                              SX12XX_Radio_Number_t radioNumber) {
+  if (siw917FanoutAllRadios(radioNumber)) {
+    WriteCommand(opcode, SX12XX_Radio_1);
+    WriteCommand(opcode, SX12XX_Radio_2);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return;
+  }
+
+  siw917SelectRadio(radioNumber);
   last_command_opcode = opcode;
 
   if (opcode == LR11XX_RADIO_GET_PACKET) {
@@ -221,6 +281,14 @@ void LR1121Hal::WriteCommand(uint16_t opcode,
 
 void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
                              SX12XX_Radio_Number_t radioNumber) {
+  if (siw917FanoutAllRadios(radioNumber)) {
+    WriteCommand(opcode, buffer, size, SX12XX_Radio_1);
+    WriteCommand(opcode, buffer, size, SX12XX_Radio_2);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return;
+  }
+
+  siw917SelectRadio(radioNumber);
   last_command_opcode = opcode;
 
   if (opcode == LR11XX_RADIO_GET_PACKET) {
@@ -387,6 +455,8 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
 
 void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
                             SX12XX_Radio_Number_t radioNumber) {
+  siw917SelectRadio(radioNumber);
+
   if (buffer != nullptr && size >= 2) {
     const uint16_t inline_opcode =
         ((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1];
@@ -456,8 +526,14 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
 //-----------------------------------------------------------------------------
 
 bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
-  // We only support single radio (Radio_1)
-  (void)radioNumber;
+  if (siw917FanoutAllRadios(radioNumber)) {
+    const bool radio1Ready = WaitOnBusy(SX12XX_Radio_1);
+    const bool radio2Ready = WaitOnBusy(SX12XX_Radio_2);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return radio1Ready && radio2Ready;
+  }
+
+  siw917SelectRadio(radioNumber);
 
   if (lr1121_wait_busy_fast_us(SIW917_ELRS_BUSY_FAST_US)) {
     return true;
@@ -537,6 +613,7 @@ static void SIW917_ELRS_RAMFUNC_ATTR processDio1IrqNow() {
   // calls back into RX re-arm, so the level-held DIO line is deasserted first.
   if (LR1121Hal::instance && LR1121Hal::instance->IsrCallback_1) {
     LR1121Driver::instance = &Radio;
+    lr1121_select_radio(LR1121_RADIO_1);
     LR1121Hal::instance->IsrCallback_1();
   }
 }
@@ -821,6 +898,8 @@ void LR1121Hal::handleDeferredISR() {
 
 void LR1121Hal::dioISR_2() {
   if (instance && instance->IsrCallback_2) {
+    lr1121_select_radio(LR1121_RADIO_2);
     instance->IsrCallback_2();
+    lr1121_select_radio(LR1121_RADIO_1);
   }
 }
