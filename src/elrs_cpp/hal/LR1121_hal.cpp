@@ -177,12 +177,19 @@ void LR1121Hal::init() {
   // dioISR_1, RISING)
   lr1121_dio1_init();
   lr1121_dio1_set_callback(dioISR_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  lr1121_dio2_init();
+  lr1121_dio2_set_callback(dioISR_2);
+#endif
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
   const bool dioStageReady = dio1StageInit();
 #else
   const bool dioStageReady = false;
 #endif
   lr1121_dio1_enable();
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  lr1121_dio2_enable();
+#endif
 
   DBGLN("LR1121Hal DIO hot path: %s",
         SIW917_ELRS_TWO_STAGE_DIO_ISR
@@ -200,6 +207,9 @@ void LR1121Hal::end() {
 
   // Disable interrupts
   lr1121_dio1_disable();
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  lr1121_dio2_disable();
+#endif
   IsrCallback_1 = nullptr;
   IsrCallback_2 = nullptr;
 
@@ -561,11 +571,16 @@ bool LR1121Hal::WaitOnBusy(SX12XX_Radio_Number_t radioNumber) {
 // from elrs_loop().
 static volatile bool dio1_isr_pending = false;
 static volatile bool dio1_isr_processing = false;
+static volatile bool dio2_isr_pending = false;
+static volatile bool dio2_isr_processing = false;
 static volatile uint32_t dio1_direct_count = 0;
 static volatile uint32_t dio1_direct_reentrant_count = 0;
 static volatile uint32_t dio1_level_requeue_count = 0;
+static volatile uint32_t dio2_level_requeue_count = 0;
 static volatile uint32_t dio1_last_edge_us = 0;
 static volatile uint32_t dio1_last_deferred_us = 0;
+static volatile uint32_t dio2_last_edge_us = 0;
+static volatile uint32_t dio2_last_deferred_us = 0;
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static volatile bool dio1_stage_irq_installed = false;
 static volatile uint32_t dio1_stage_irq_count = 0;
@@ -617,6 +632,17 @@ static void SIW917_ELRS_RAMFUNC_ATTR processDio1IrqNow() {
     LR1121Hal::instance->IsrCallback_1();
   }
 }
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+static void SIW917_ELRS_RAMFUNC_ATTR processDio2IrqNow() {
+  if (LR1121Hal::instance && LR1121Hal::instance->IsrCallback_2) {
+    LR1121Driver::instance = &Radio;
+    lr1121_select_radio(LR1121_RADIO_2);
+    LR1121Hal::instance->IsrCallback_2();
+    lr1121_select_radio(LR1121_RADIO_1);
+  }
+}
+#endif
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static void SIW917_ELRS_RAMFUNC_ATTR dio1PendStageFromIsr() {
@@ -733,7 +759,11 @@ extern "C" uint32_t lr1121_hal_get_last_deferred_us(void) {
 }
 
 extern "C" bool lr1121_hal_has_pending_dio1(void) {
-  return dio1_isr_pending || (lr1121_dio1_read() != 0);
+  bool pending = dio1_isr_pending || (lr1121_dio1_read() != 0);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  pending = pending || dio2_isr_pending || (lr1121_dio2_read() != 0);
+#endif
+  return pending;
 }
 
 extern "C" uint32_t lr1121_hal_get_direct_dio_count(void) {
@@ -894,12 +924,56 @@ void LR1121Hal::handleDeferredISR() {
       lr1121_dio1_pause_isr();
     }
   }
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  const bool dio2High = lr1121_dio2_read() != 0;
+  if (dio2_isr_pending || dio2High) {
+    dio2_last_deferred_us = micros();
+  }
+
+  if (!dio2_isr_pending && dio2High) {
+    dio2_level_requeue_count++;
+    dio2_last_edge_us = dio2_last_deferred_us;
+    dio2_isr_pending = true;
+    isr_2_pending = true;
+    lr1121_dio2_pause_isr();
+  }
+
+  if (dio2_isr_pending) {
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+
+    dio2_isr_processing = true;
+    processDio2IrqNow();
+    dio2_isr_processing = false;
+
+    lr1121_dio2_resume_isr();
+    if (lr1121_dio2_read() != 0) {
+      dio2_level_requeue_count++;
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+      lr1121_dio2_pause_isr();
+    }
+  }
+#endif
 }
 
 void LR1121Hal::dioISR_2() {
-  if (instance && instance->IsrCallback_2) {
-    lr1121_select_radio(LR1121_RADIO_2);
-    instance->IsrCallback_2();
-    lr1121_select_radio(LR1121_RADIO_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  dio2_last_edge_us = micros();
+  isr_2_pending_count++;
+
+  if (dio2_isr_processing) {
+    dio2_isr_pending = true;
+    isr_2_pending = true;
+    lr1121_dio2_pause_isr();
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    return;
   }
+
+  dio2_isr_pending = true;
+  isr_2_pending = true;
+  lr1121_dio2_pause_isr();
+  elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+#endif
 }

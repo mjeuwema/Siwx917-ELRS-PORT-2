@@ -3770,8 +3770,15 @@ int lr1121_end_update(void) {
 #define DIO1_INT_CHANNEL                                                       \
   2 /* Try channel 2 in case 0 conflicts with GSPI DMA                         \
      */
+#define DIO2_HP_GPIO LR1121_PIN_DIO_2
+#define DIO2_HP_PORT SL_GPIO_PORT_C
+#define DIO2_HP_PIN (DIO2_HP_GPIO - 32)
+#define DIO2_INT_CHANNEL 3
 /* Static pin config - needed for SDK calls */
 static sl_si91x_gpio_pin_config_t dio1_pin_config;
+#if LR1121_HAS_RADIO2
+static sl_si91x_gpio_pin_config_t dio2_pin_config;
+#endif
 
 /* Static callback storage */
 static lr1121_dio1_callback_t dio1_callback = NULL;
@@ -3779,12 +3786,21 @@ static bool dio1_initialized = false;
 static volatile bool dio1_callback_enabled =
     false; /* Don't call callback until system ready */
 static volatile uint32_t dio1_isr_count = 0; /* Debug: count ISR entries */
+#if LR1121_HAS_RADIO2
+static lr1121_dio1_callback_t dio2_callback = NULL;
+static bool dio2_initialized = false;
+static volatile bool dio2_callback_enabled = false;
+static volatile uint32_t dio2_isr_count = 0;
+#endif
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
 static volatile uint32_t dio1_direct_vector_count = 0;
 #endif
 
 /* Forward declaration of SDK callback */
 static void dio1_gpio_interrupt_callback(uint32_t pin_intr);
+#if LR1121_HAS_RADIO2
+static void dio2_gpio_interrupt_callback(uint32_t pin_intr);
+#endif
 
 static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_invoke_callback(void) {
   dio1_isr_count++;
@@ -3810,6 +3826,33 @@ static inline uint8_t lr1121_dio1_read_level(void) {
   return pin_val;
 #endif
 }
+
+#if LR1121_HAS_RADIO2
+static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio2_invoke_callback(void) {
+  dio2_isr_count++;
+  if (dio2_callback_enabled && dio2_callback != NULL) {
+    dio2_callback();
+  }
+}
+
+static inline void lr1121_dio2_clear_interrupt(void) {
+#if SIW917_ELRS_DIRECT_DIO_GPIO_REGS
+  GPIO->INTR[DIO2_INT_CHANNEL].GPIO_INTR_STATUS = INTR_CLR;
+#else
+  sl_gpio_driver_clear_interrupts(DIO2_INT_CHANNEL);
+#endif
+}
+
+static inline uint8_t lr1121_dio2_read_level(void) {
+#if SIW917_ELRS_DIRECT_DIO_GPIO_REGS
+  return (uint8_t)(EGPIO_BIT_LOAD_REG(DIO2_HP_GPIO) & 1U);
+#else
+  uint8_t pin_val = 0;
+  sl_gpio_driver_get_pin(&dio2_pin_config.port_pin, &pin_val);
+  return pin_val;
+#endif
+}
+#endif
 
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
 #define LR1121_DIO_VECTOR_RESERVED_ENTRIES 16U
@@ -4108,6 +4151,155 @@ static void dio1_gpio_interrupt_callback(uint32_t flag) {
  * @return Number of times the DIO1 ISR callback was entered
  */
 uint32_t lr1121_dio1_get_isr_count(void) { return dio1_isr_count; }
+
+lr1121_status_t lr1121_dio2_init(void) {
+#if LR1121_HAS_RADIO2
+  sl_status_t status;
+
+  DEBUGOUT("LR1121: Initializing DIO2 interrupt on GPIO_%d (HP domain)...\n",
+           DIO2_HP_GPIO);
+
+  CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;
+  CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;
+  DEBUGOUT("  EGPIO clocks enabled\n");
+
+  status = sl_gpio_driver_init();
+  if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
+    DEBUGOUT("  sl_gpio_driver_init failed: 0x%04lX\n", (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  GPIO driver initialized\n");
+
+  dio2_pin_config.port_pin.port = DIO2_HP_PORT;
+  dio2_pin_config.port_pin.pin = DIO2_HP_PIN;
+  dio2_pin_config.direction = GPIO_INPUT;
+
+  status = sl_gpio_set_configuration(dio2_pin_config);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("  sl_gpio_set_configuration failed: 0x%04lX\n",
+             (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+
+  sl_si91x_gpio_driver_select_pad_driver_disable_state(
+      DIO2_HP_GPIO, (sl_si91x_gpio_driver_disable_state_t)2);
+
+  status = sl_gpio_driver_configure_interrupt(
+      &dio2_pin_config.port_pin, DIO2_INT_CHANNEL,
+      (sl_gpio_interrupt_flag_t)SL_GPIO_INTERRUPT_RISE_EDGE,
+      (sl_gpio_irq_callback_t)&dio2_gpio_interrupt_callback, (uint32_t *)NULL);
+  if (status != SL_STATUS_OK) {
+    DEBUGOUT("  sl_gpio_driver_configure_interrupt failed: 0x%04lX\n",
+             (unsigned long)status);
+    return LR1121_ERROR_GPIO_INIT;
+  }
+  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n",
+           DIO2_INT_CHANNEL);
+
+  dio2_initialized = true;
+
+  uint8_t sdk_pin_value = 0;
+  sl_gpio_driver_get_pin(&dio2_pin_config.port_pin, &sdk_pin_value);
+  DEBUGOUT("  SDK pin read: GPIO_%d = %d\n", DIO2_HP_GPIO, sdk_pin_value);
+  DEBUGOUT("LR1121: DIO2 interrupt initialized (currently %s)\n",
+           sdk_pin_value ? "HIGH" : "LOW");
+
+  return LR1121_OK;
+#else
+  return LR1121_OK;
+#endif
+}
+
+void lr1121_dio2_enable(void) {
+#if LR1121_HAS_RADIO2
+  if (!dio2_initialized) {
+    DEBUGOUT("LR1121: DIO2 not initialized, call lr1121_dio2_init() first\n");
+    return;
+  }
+
+  lr1121_dio2_clear_interrupt();
+
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO2_INT_CHANNEL;
+  NVIC_SetPriority((IRQn_Type)irqn, SIW917_ELRS_DIO_IRQ_PRIORITY);
+  NVIC_EnableIRQ((IRQn_Type)irqn);
+
+  dio2_callback_enabled = true;
+
+  DEBUGOUT("LR1121: DIO2 interrupt enabled on GPIO_%d (IRQ channel %d, "
+           "priority %u)\n",
+           DIO2_HP_GPIO, DIO2_INT_CHANNEL,
+           (unsigned)SIW917_ELRS_DIO_IRQ_PRIORITY);
+#endif
+}
+
+void lr1121_dio2_disable(void) {
+#if LR1121_HAS_RADIO2
+  if (!dio2_initialized) {
+    return;
+  }
+
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO2_INT_CHANNEL;
+  NVIC_DisableIRQ((IRQn_Type)irqn);
+
+  dio2_callback_enabled = false;
+
+  DEBUGOUT("LR1121: DIO2 interrupt disabled\n");
+#endif
+}
+
+void lr1121_dio2_pause_isr(void) {
+#if LR1121_HAS_RADIO2
+  if (!dio2_initialized) {
+    return;
+  }
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO2_INT_CHANNEL;
+  NVIC_DisableIRQ((IRQn_Type)irqn);
+#endif
+}
+
+void lr1121_dio2_resume_isr(void) {
+#if LR1121_HAS_RADIO2
+  if (!dio2_initialized) {
+    return;
+  }
+  uint32_t irqn = EGPIO_PIN_0_IRQn + DIO2_INT_CHANNEL;
+  NVIC_EnableIRQ((IRQn_Type)irqn);
+#endif
+}
+
+int lr1121_dio2_read(void) {
+#if LR1121_HAS_RADIO2
+  return dio2_initialized ? lr1121_dio2_read_level() : 0;
+#else
+  return 0;
+#endif
+}
+
+void lr1121_dio2_set_callback(lr1121_dio1_callback_t callback) {
+#if LR1121_HAS_RADIO2
+  dio2_callback = callback;
+  DEBUGOUT("LR1121: DIO2 callback %s\n",
+           callback ? "registered" : "unregistered");
+#else
+  (void)callback;
+#endif
+}
+
+#if LR1121_HAS_RADIO2
+static void dio2_gpio_interrupt_callback(uint32_t flag) {
+  if ((flag == DIO2_INT_CHANNEL) || (flag & (1 << DIO2_INT_CHANNEL))) {
+    lr1121_dio2_invoke_callback();
+  }
+}
+#endif
+
+uint32_t lr1121_dio2_get_isr_count(void) {
+#if LR1121_HAS_RADIO2
+  return dio2_isr_count;
+#else
+  return 0;
+#endif
+}
 
 /**
  * @brief Flash ELRS firmware to LR1121 (stub)

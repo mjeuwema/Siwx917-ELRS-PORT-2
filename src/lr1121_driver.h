@@ -729,10 +729,11 @@ int lr1121_write_update_bytes(const uint8_t *data, uint32_t size);
 int lr1121_end_update(void);
 
 /*******************************************************************************
- * DIO1 Interrupt Functions
+ * DIO9 Interrupt Functions
  *
- * Citation: LR1121 Datasheet - DIO1 is used for IRQ signaling
- * Connected to SiW917 UULP_VBAT_GPIO_2 on BRD2708A
+ * The ELRS driver names these DIO1 for compatibility with upstream radio
+ * abstractions, but the Waveshare LR1121 module uses physical DIO9 as the IRQ
+ * line. Radio 1 is on GPIO_46; optional Radio 2 is on GPIO_47.
  ******************************************************************************/
 
 /* DIO1 callback function type */
@@ -796,6 +797,49 @@ void lr1121_dio1_resume_isr(void);
  * @return Number of times the DIO1 ISR callback was entered
  */
 uint32_t lr1121_dio1_get_isr_count(void);
+
+/**
+ * @brief Initialize Radio 2 DIO9 GPIO for interrupt input
+ * @return LR1121_OK on success
+ */
+lr1121_status_t lr1121_dio2_init(void);
+
+/**
+ * @brief Read Radio 2 DIO9 pin state
+ * @return 1 if HIGH, 0 if LOW
+ */
+int lr1121_dio2_read(void);
+
+/**
+ * @brief Set Radio 2 DIO9 interrupt callback
+ * @param callback Function to call on DIO9 rising edge
+ */
+void lr1121_dio2_set_callback(lr1121_dio1_callback_t callback);
+
+/**
+ * @brief Enable Radio 2 DIO9 NVIC interrupt
+ */
+void lr1121_dio2_enable(void);
+
+/**
+ * @brief Disable Radio 2 DIO9 NVIC interrupt
+ */
+void lr1121_dio2_disable(void);
+
+/**
+ * @brief Pause Radio 2 DIO9 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio2_pause_isr(void);
+
+/**
+ * @brief Resume Radio 2 DIO9 NVIC interrupt (for SPI re-entrancy)
+ */
+void lr1121_dio2_resume_isr(void);
+
+/**
+ * @brief Get Radio 2 DIO9 ISR count for debugging
+ */
+uint32_t lr1121_dio2_get_isr_count(void);
 
 #ifdef __cplusplus
 }

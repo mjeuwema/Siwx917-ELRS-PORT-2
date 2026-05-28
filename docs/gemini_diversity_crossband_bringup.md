@@ -49,9 +49,10 @@ The firmware keeps the validated single-radio RX path as the default.
 - `SIW917_ELRS_DUAL_RADIO_PROBE=1`: initializes Radio 2 on the shared GSPI bus,
   selects its NSS/BUSY/RST lines, and prints its firmware version, but still
   advertises a single-radio receiver to ELRS.
-- `SIW917_ELRS_UPSTREAM_DUAL_RADIO=1`: reserved for the next stage after Radio
-  2 DIO9 interrupt handling is implemented. It is intentionally compile-guarded
-  so a partial Gemini path cannot accidentally replace the proven RX link.
+- `SIW917_ELRS_UPSTREAM_DUAL_RADIO=1`: exposes Radio 2 to upstream ELRS Gemini
+  and diversity logic after the probe passes. The first Radio 2 DIO9 path is
+  deferred through the ELRS task for safety; optimize it only after the dual
+  link is functionally stable.
 
 UG590 for BRD2708A lists GPIO_50 and GPIO_51 on the left-side breakout pads, and
 GPIO_48, GPIO_47, GPIO_49, GPIO_46, and GPIO_15 on the right-side breakout pads.

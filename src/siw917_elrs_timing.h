@@ -18,10 +18,10 @@
  * but keeps upstream ELRS in single-radio mode. Use this first to validate
  * wiring and chip-select/BUSY/reset timing without risking the working RX link.
  *
- * UPSTREAM_DUAL is reserved for the next stage: once the Radio2 DIO9 interrupt
- * path is implemented and validated, it exposes GPIO_PIN_NSS_2 to ELRS,
- * advertises true diversity, and lets upstream dual-radio/Gemini packet paths
- * run. Do not enable until PROBE passes cleanly with both radios wired.
+ * UPSTREAM_DUAL exposes GPIO_PIN_NSS_2 to ELRS, advertises true diversity, and
+ * lets upstream dual-radio/Gemini packet paths run. Do not enable until PROBE
+ * passes cleanly with both radios wired; the first Radio2 IRQ implementation is
+ * intentionally deferred/safe rather than timing-optimized.
  */
 #ifndef SIW917_ELRS_DUAL_RADIO_PROBE
 #define SIW917_ELRS_DUAL_RADIO_PROBE 0
@@ -32,11 +32,11 @@
 #endif
 
 #ifndef SIW917_ELRS_RADIO2_IRQ_READY
-#define SIW917_ELRS_RADIO2_IRQ_READY 0
+#define SIW917_ELRS_RADIO2_IRQ_READY 1
 #endif
 
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO && !SIW917_ELRS_RADIO2_IRQ_READY
-#error "Enable SIW917_ELRS_UPSTREAM_DUAL_RADIO only after Radio2 DIO9 IRQ support is validated."
+#error "Enable SIW917_ELRS_UPSTREAM_DUAL_RADIO only after Radio2 DIO9 IRQ support is compiled in."
 #endif
 
 #ifndef SIW917_ELRS_RADIO2_NSS_PIN

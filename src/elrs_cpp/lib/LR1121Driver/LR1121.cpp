@@ -915,7 +915,7 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
 #endif
 }
 
-inline void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
     SX12XX_Radio_Number_t radioNumber, const uint8_t *buf) {
   // RssiPkt defines the average RSSI over the last packet received. RSSI value
   // in dBm is –RssiPkt/2.
