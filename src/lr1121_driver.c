@@ -3590,7 +3590,11 @@ int lr1121_begin_update(uint32_t expected_size) {
   /* Step 3: Erase flash */
   DEBUGOUT("LR1121 OTA: Erasing flash (this takes ~3 seconds)...\n");
 
-  uint8_t erase_tx[2] = {0x80, 0x01}; /* BL_ERASE_FLASH_OC */
+  const uint8_t erase_tx[2] = {
+      (uint8_t)(LR1121_OPCODE_BL_ERASE_FLASH >> 8),
+      (uint8_t)(LR1121_OPCODE_BL_ERASE_FLASH & 0xFF)};
+  DEBUGOUT("LR1121 OTA: Sending erase opcode 0x%04X\n",
+           LR1121_OPCODE_BL_ERASE_FLASH);
   cs_assert();
   bool result = spi_transfer(erase_tx, NULL, 2);
   cs_deassert();
