@@ -608,7 +608,9 @@ static volatile bool dio1_isr_processing = false;
 static volatile bool dio2_isr_pending = false;
 static volatile bool dio2_isr_processing = false;
 static volatile uint32_t dio1_direct_count = 0;
+static volatile uint32_t dio2_direct_count = 0;
 static volatile uint32_t dio1_direct_reentrant_count = 0;
+static volatile uint32_t dio2_direct_reentrant_count = 0;
 static volatile uint32_t dio1_level_requeue_count = 0;
 static volatile uint32_t dio2_level_requeue_count = 0;
 static volatile uint32_t dio1_last_edge_us = 0;
@@ -688,51 +690,96 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
   dio1_stage_irq_count++;
 
+  const bool dio1Seen = dio1_isr_pending || (lr1121_dio1_read() != 0);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  const bool dio2Seen = dio2_isr_pending || (lr1121_dio2_read() != 0);
+#else
+  constexpr bool dio2Seen = false;
+#endif
+
   if (!dio1StagePathAllowed()) {
-    dio1_isr_pending = true;
-    isr_1_pending = true;
-    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
-    return;
-  }
-
-  if (dio1_isr_processing) {
-    dio1_direct_reentrant_count++;
-    dio1_isr_pending = true;
-    isr_1_pending = true;
-    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
-    return;
-  }
-
-  if (!dio1_isr_pending && lr1121_dio1_read() == 0) {
-    return;
-  }
-
-  dio1_isr_pending = false;
-  isr_1_pending = false;
-  dio1_direct_count++;
-  dio1_last_deferred_us = micros();
-  dio1_isr_processing = true;
-#if SIW917_ELRS_HOTPATH_TIMING_DIAG
-  const uint32_t processStartUs = micros();
+    if (dio1Seen) {
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+    }
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+    if (dio2Seen) {
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+    }
 #endif
-  processDio1IrqNow();
-#if SIW917_ELRS_HOTPATH_TIMING_DIAG
-  dio1UpdateMax(dio1_stage_max_us, micros() - processStartUs);
-#endif
-  dio1_isr_processing = false;
-
-  lr1121_dio1_resume_isr();
-  if (lr1121_dio1_read() != 0) {
-    dio1_level_requeue_count++;
-    dio1_isr_pending = true;
-    isr_1_pending = true;
-    lr1121_dio1_pause_isr();
-    if (dio1StagePathAllowed()) {
-      dio1PendStageFromIsr();
-    } else {
+    if (dio1Seen || dio2Seen) {
       elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
     }
+    return;
   }
+
+  if (dio1_isr_processing || dio2_isr_processing) {
+    if (dio1Seen) {
+      dio1_direct_reentrant_count++;
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+    }
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+    if (dio2Seen) {
+      dio2_direct_reentrant_count++;
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+    }
+#endif
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    return;
+  }
+
+  if (!dio1Seen && !dio2Seen) {
+    return;
+  }
+
+  if (dio1Seen) {
+    dio1_isr_pending = false;
+    isr_1_pending = false;
+    dio1_direct_count++;
+    dio1_last_deferred_us = micros();
+    dio1_isr_processing = true;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    const uint32_t processStartUs = micros();
+#endif
+    processDio1IrqNow();
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    dio1UpdateMax(dio1_stage_max_us, micros() - processStartUs);
+#endif
+    dio1_isr_processing = false;
+
+    lr1121_dio1_resume_isr();
+    if (lr1121_dio1_read() != 0) {
+      dio1_level_requeue_count++;
+      dio1_isr_pending = true;
+      isr_1_pending = true;
+      lr1121_dio1_pause_isr();
+      dio1PendStageFromIsr();
+    }
+  }
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  if (dio2Seen) {
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+    dio2_direct_count++;
+    dio2_last_deferred_us = micros();
+    dio2_isr_processing = true;
+    processDio2IrqNow();
+    dio2_isr_processing = false;
+
+    lr1121_dio2_resume_isr();
+    if (lr1121_dio2_read() != 0) {
+      dio2_level_requeue_count++;
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+      lr1121_dio2_pause_isr();
+      dio1PendStageFromIsr();
+    }
+  }
+#endif
 }
 
 static bool dio1StageInit() {
@@ -801,15 +848,15 @@ extern "C" bool lr1121_hal_has_pending_dio1(void) {
 }
 
 extern "C" uint32_t lr1121_hal_get_direct_dio_count(void) {
-  return dio1_direct_count;
+  return dio1_direct_count + dio2_direct_count;
 }
 
 extern "C" uint32_t lr1121_hal_get_direct_reentrant_count(void) {
-  return dio1_direct_reentrant_count;
+  return dio1_direct_reentrant_count + dio2_direct_reentrant_count;
 }
 
 extern "C" uint32_t lr1121_hal_get_level_requeue_count(void) {
-  return dio1_level_requeue_count;
+  return dio1_level_requeue_count + dio2_level_requeue_count;
 }
 
 extern "C" uint32_t lr1121_hal_get_stage_max_us(void) {
@@ -997,7 +1044,49 @@ void LR1121Hal::dioISR_2() {
   dio2_last_edge_us = micros();
   isr_2_pending_count++;
 
+#if SIW917_ELRS_TWO_STAGE_DIO_ISR
+  dio2_isr_pending = true;
+  isr_2_pending = true;
+
+  lr1121_dio2_pause_isr();
+#if SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
+  if (dio1_stage_irq_installed && dio1GpioDirectPathAllowed()) {
+    if (dio2_isr_processing) {
+      dio2_direct_reentrant_count++;
+      dio1PendStageFromIsr();
+      return;
+    }
+
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+    dio2_direct_count++;
+    dio2_last_deferred_us = dio2_last_edge_us;
+    dio2_isr_processing = true;
+    processDio2IrqNow();
+    dio2_isr_processing = false;
+
+    lr1121_dio2_resume_isr();
+    if (lr1121_dio2_read() != 0) {
+      dio2_level_requeue_count++;
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+      lr1121_dio2_pause_isr();
+      dio1PendStageFromIsr();
+    }
+    return;
+  }
+#endif
+
+  if (dio1_stage_irq_installed) {
+    dio1PendStageFromIsr();
+  } else {
+    elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+  }
+  return;
+#endif
+
   if (dio2_isr_processing) {
+    dio2_direct_reentrant_count++;
     dio2_isr_pending = true;
     isr_2_pending = true;
     lr1121_dio2_pause_isr();
@@ -1008,6 +1097,25 @@ void LR1121Hal::dioISR_2() {
   dio2_isr_pending = true;
   isr_2_pending = true;
   lr1121_dio2_pause_isr();
+  if (dio1GpioDirectPathAllowed()) {
+    dio2_direct_count++;
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+    dio2_isr_processing = true;
+    processDio2IrqNow();
+    dio2_isr_processing = false;
+
+    lr1121_dio2_resume_isr();
+    if (lr1121_dio2_read() != 0) {
+      dio2_level_requeue_count++;
+      dio2_isr_pending = true;
+      isr_2_pending = true;
+      lr1121_dio2_pause_isr();
+      elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
+    }
+    return;
+  }
+
   elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
 #endif
 }

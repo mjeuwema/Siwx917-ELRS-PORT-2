@@ -35,6 +35,36 @@
 #define SIW917_ELRS_RADIO2_IRQ_READY 1
 #endif
 
+/*
+ * Keep LR1121 dual-band/crossband air rates gated separately from same-band
+ * Gemini/diversity bring-up. The current SiW917 path validates two radios on
+ * the shared 915 MHz FHSS domain; crossband needs explicit FHSS/band routing
+ * before rate indexes 18/19 are safe to scan.
+ */
+#ifndef SIW917_ELRS_ENABLE_CROSSBAND_RATES
+#define SIW917_ELRS_ENABLE_CROSSBAND_RATES 0
+#endif
+
+/*
+ * The first dual-LR1121 SiW917 bring-up can hard-stop while scanning the fast
+ * 900 MHz SF5 acquisition modes (indexes 1/2). Keep those out of disconnected
+ * scan on the dual-radio branch until the shared-SPI/BUSY timing is proven at
+ * SF5. Standard 50/100/200 Hz 900 MHz modes still scan normally.
+ */
+#ifndef SIW917_ELRS_SKIP_FAST_SF5_900_SCAN
+#define SIW917_ELRS_SKIP_FAST_SF5_900_SCAN SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#endif
+
+/*
+ * The SiW917 HAL performs the Waveshare TCXO/XOSC bring-up and CalibImage for
+ * each LR1121 before LR1121Driver::Begin() returns to the upstream-shaped
+ * driver code. Re-running CalibImage here has proven intermittent after the
+ * radios are already configured, so leave the runtime duplicate disabled.
+ */
+#ifndef SIW917_ELRS_RUNTIME_CALIB_IMAGE
+#define SIW917_ELRS_RUNTIME_CALIB_IMAGE 0
+#endif
+
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO && !SIW917_ELRS_RADIO2_IRQ_READY
 #error "Enable SIW917_ELRS_UPSTREAM_DUAL_RADIO only after Radio2 DIO9 IRQ support is compiled in."
 #endif
@@ -148,14 +178,12 @@
 #endif
 
 /*
- * Timing profile: do not initialize the flight-controller CRSF UART during RF
- * acquisition. Handset Lua/telemetry still goes over OTA, and MAVLink serial
- * still starts once the TX explicitly negotiates MAVLink OTA mode. Starting
- * the local 420k CRSF UART before lock adds enough load on SiW917 to disturb
- * telemetry negotiation.
+ * RF-only bring-up profile: do not initialize the flight-controller UART at
+ * all. Handset Lua/config telemetry still goes over OTA, but this board is not
+ * wired to an FC during Gemini/diversity testing, so USART0 should stay quiet.
  */
 #ifndef SIW917_ELRS_DISABLE_CRSF_SERIAL
-#define SIW917_ELRS_DISABLE_CRSF_SERIAL SIW917_ELRS_TIMING_LEAN
+#define SIW917_ELRS_DISABLE_CRSF_SERIAL 1
 #endif
 
 /*
@@ -221,7 +249,7 @@
  * "packets received but CRC rejected" without adding connected hot-path load.
  */
 #ifndef SIW917_ELRS_DISCONNECTED_SCAN_DIAG
-#define SIW917_ELRS_DISCONNECTED_SCAN_DIAG 0
+#define SIW917_ELRS_DISCONNECTED_SCAN_DIAG SIW917_ELRS_UPSTREAM_DUAL_RADIO
 #endif
 
 /*

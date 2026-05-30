@@ -3940,6 +3940,9 @@ static volatile uint32_t dio2_isr_count = 0;
 #endif
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
 static volatile uint32_t dio1_direct_vector_count = 0;
+#if LR1121_HAS_RADIO2
+static volatile uint32_t dio2_direct_vector_count = 0;
+#endif
 #endif
 
 /* Forward declaration of SDK callback */
@@ -4002,9 +4005,14 @@ static inline uint8_t lr1121_dio2_read_level(void) {
 
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
 #define LR1121_DIO_VECTOR_RESERVED_ENTRIES 16U
-#define LR1121_DIO_VECTOR_INDEX                                                \
+#define LR1121_DIO1_VECTOR_INDEX                                               \
   (LR1121_DIO_VECTOR_RESERVED_ENTRIES +                                       \
    (uint32_t)(EGPIO_PIN_0_IRQn + DIO1_INT_CHANNEL))
+#if LR1121_HAS_RADIO2
+#define LR1121_DIO2_VECTOR_INDEX                                               \
+  (LR1121_DIO_VECTOR_RESERVED_ENTRIES +                                       \
+   (uint32_t)(EGPIO_PIN_0_IRQn + DIO2_INT_CHANNEL))
+#endif
 
 static uint32_t lr1121_dio_ram_vector_table[SI91X_VECTOR_TABLE_ENTRIES]
     __attribute__((aligned(512)));
@@ -4019,10 +4027,20 @@ static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_direct_irq(void) {
   lr1121_dio1_invoke_callback();
 }
 
-static bool lr1121_dio1_install_direct_vector(void) {
-  if (LR1121_DIO_VECTOR_INDEX >= SI91X_VECTOR_TABLE_ENTRIES) {
-    DEBUGOUT("  DIO1 vector index %lu outside table size %lu\n",
-             (unsigned long)LR1121_DIO_VECTOR_INDEX,
+#if LR1121_HAS_RADIO2
+static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio2_direct_irq(void) {
+  lr1121_dio2_clear_interrupt();
+  dio2_direct_vector_count++;
+  lr1121_dio2_invoke_callback();
+}
+#endif
+
+static bool lr1121_dio_install_direct_vector(uint32_t vector_index,
+                                             void (*handler)(void),
+                                             const char *name) {
+  if (vector_index >= SI91X_VECTOR_TABLE_ENTRIES) {
+    DEBUGOUT("  %s vector index %lu outside table size %lu\n", name,
+             (unsigned long)vector_index,
              (unsigned long)SI91X_VECTOR_TABLE_ENTRIES);
     return false;
   }
@@ -4039,9 +4057,8 @@ static bool lr1121_dio1_install_direct_vector(void) {
            sizeof(lr1121_dio_ram_vector_table));
   }
 
-  old_dio_vector = lr1121_dio_ram_vector_table[LR1121_DIO_VECTOR_INDEX];
-  lr1121_dio_ram_vector_table[LR1121_DIO_VECTOR_INDEX] =
-      (uint32_t)(uintptr_t)lr1121_dio1_direct_irq;
+  old_dio_vector = lr1121_dio_ram_vector_table[vector_index];
+  lr1121_dio_ram_vector_table[vector_index] = (uint32_t)(uintptr_t)handler;
 
   __DSB();
   __ISB();
@@ -4050,13 +4067,25 @@ static bool lr1121_dio1_install_direct_vector(void) {
   __ISB();
   lr1121_exit_critical(primask);
 
-  DEBUGOUT("  DIO1 direct vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
+  DEBUGOUT("  %s direct vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
            "oldDIO=0x%08lX newDIO=0x%08lX\n",
+           name,
            (unsigned long)old_vtor, (unsigned long)new_vtor,
-           (unsigned long)old_dio_vector,
-           (unsigned long)(uintptr_t)lr1121_dio1_direct_irq);
+           (unsigned long)old_dio_vector, (unsigned long)(uintptr_t)handler);
   return true;
 }
+
+static bool lr1121_dio1_install_direct_vector(void) {
+  return lr1121_dio_install_direct_vector(
+      LR1121_DIO1_VECTOR_INDEX, lr1121_dio1_direct_irq, "DIO1");
+}
+
+#if LR1121_HAS_RADIO2
+static bool lr1121_dio2_install_direct_vector(void) {
+  return lr1121_dio_install_direct_vector(
+      LR1121_DIO2_VECTOR_INDEX, lr1121_dio2_direct_irq, "DIO2");
+}
+#endif
 #endif
 
 /**
@@ -4341,6 +4370,10 @@ lr1121_status_t lr1121_dio2_init(void) {
   }
   DEBUGOUT("  Rising-edge interrupt configured on channel %d\n",
            DIO2_INT_CHANNEL);
+
+#if SIW917_ELRS_DIRECT_DIO_VECTOR
+  (void)lr1121_dio2_install_direct_vector();
+#endif
 
   dio2_initialized = true;
 

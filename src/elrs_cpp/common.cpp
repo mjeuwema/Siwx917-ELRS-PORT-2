@@ -12,6 +12,7 @@
 #include "LR1121_Regs.h"
 #include "crsf_protocol.h"
 #include "options.h"
+#include "siw917_elrs_timing.h"
 
 // Global Radio instance
 LR1121Driver Radio;
@@ -144,9 +145,16 @@ bool isSupportedRFRate(uint8_t index)
 {
     expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
 
-    // Dual Band modes not supported for hardware with only a single LR1121
-    if (!isDualRadio() && ModParams->radio_type == RADIO_TYPE_LR1121_LORA_DUAL)
+    // Crossband LR1121 rates need explicit FHSS/band routing. Same-band
+    // Gemini still presents as dual radio, but should not scan rate 18/19 yet.
+    if (ModParams->radio_type == RADIO_TYPE_LR1121_LORA_DUAL)
     {
+#if SIW917_ELRS_ENABLE_CROSSBAND_RATES
+        if (isDualRadio())
+        {
+            return true;
+        }
+#endif
         return false;
     }
 
@@ -155,6 +163,14 @@ bool isSupportedRFRate(uint8_t index)
     // This ensures RX scans the correct band for the configured domain
     if (firmwareOptions.domain <= 7) // 900MHz domains (AU915, FCC915, EU868, IN866, AU433, EU433, US433, US433W)
     {
+#if SIW917_ELRS_SKIP_FAST_SF5_900_SCAN
+        if (ModParams->enum_rate == RATE_LORA_900_250HZ ||
+            ModParams->enum_rate == RATE_LORA_900_200HZ_8CH)
+        {
+            return false;
+        }
+#endif
+
         // Skip 2.4GHz-only rates (9-17)
         if (ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4 ||
             ModParams->radio_type == RADIO_TYPE_LR1121_LORA_2G4)

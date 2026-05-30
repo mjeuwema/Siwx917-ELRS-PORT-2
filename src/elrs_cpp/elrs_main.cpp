@@ -53,9 +53,12 @@ extern "C" {
 #include "wifi_http_test.h"
 void elrs_cpp_request_wifi_mode(void);
 int lr1121_dio1_read(void);
+int lr1121_dio2_read(void);
 uint32_t lr1121_dio1_irq_enabled(void);
 uint32_t lr1121_dio1_irq_pending(void);
 uint32_t lr1121_dio1_gpio_intr_status(void);
+uint32_t lr1121_dio1_get_isr_count(void);
+uint32_t lr1121_dio2_get_isr_count(void);
 uint32_t lr1121_hal_get_last_dio1_edge_us(void);
 uint32_t lr1121_hal_get_last_deferred_us(void);
 uint32_t lr1121_hal_get_direct_dio_count(void);
@@ -73,6 +76,8 @@ uint32_t lr1121_get_raw_gspi_fail_count(void);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
+void lr1121_get_radio_isr_stats(uint32_t *isr_1, uint32_t *isr_2,
+                                uint32_t *rx_1, uint32_t *rx_2);
 bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
 void elrs_enter_binding_mode(void);
 }
@@ -1141,14 +1146,14 @@ static void applyConfiguredSerialProtocol() {
   const bool wantsMavlink = protocol == ELRS_SERIAL_MAVLINK;
 
 #if ELRS_DIAG_DISABLE_CRSF_SERIAL
-  if (wantsCrsf) {
-    if (crsf_serial_is_ready()) {
-      crsf_serial_deinit();
-    }
-    appliedSerialProtocol = protocol;
-    DBGLN("CRSF serial output deferred during RF acquisition profile");
-    return;
+  (void)wantsCrsf;
+  (void)wantsMavlink;
+  if (crsf_serial_is_ready()) {
+    crsf_serial_deinit();
   }
+  appliedSerialProtocol = protocol;
+  DBGLN("FC serial UART disabled for RF-only build");
+  return;
 #endif
 
   if (!wantsCrsf && !wantsMavlink) {
@@ -4414,8 +4419,14 @@ void elrs_loop(void) {
     uint32_t txIrqCount = 0;
     uint32_t otherIrqCount = 0;
     uint32_t lastIrq = 0;
+    uint32_t radio1IsrCount = 0;
+    uint32_t radio2IsrCount = 0;
+    uint32_t radio1RxIrqCount = 0;
+    uint32_t radio2RxIrqCount = 0;
     lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
                          &lastIrq);
+    lr1121_get_radio_isr_stats(&radio1IsrCount, &radio2IsrCount,
+                               &radio1RxIrqCount, &radio2RxIrqCount);
     int8_t instantRssi = 0;
     if (isrCount == 0 && connectionState == disconnected) {
       uint8_t stat1 = 0;
@@ -4430,11 +4441,23 @@ void elrs_loop(void) {
       Radio.StartRssiInst(SX12XX_Radio_1);
       instantRssi = Radio.GetRssiInst(SX12XX_Radio_1);
     }
-    DBGLN("IRQ isr:%lu rx:%lu tx:%lu other:%lu dio:%d irq:0x%08lX "
+    const int dio1Level = lr1121_dio1_read();
+    const uint32_t dio1Edges = lr1121_dio1_get_isr_count();
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+    const int dio2Level = lr1121_dio2_read();
+    const uint32_t dio2Edges = lr1121_dio2_get_isr_count();
+#else
+    const int dio2Level = 0;
+    const uint32_t dio2Edges = 0;
+#endif
+    DBGLN("IRQ isr:%lu rx:%lu tx:%lu other:%lu cb:%lu/%lu rxr:%lu/%lu "
+          "dio:%d/%d edge:%lu/%lu irq:0x%08lX "
           "rxok:%lu crcfail:%lu okT:%lu/%lu/%lu failT:%lu/%lu/%lu "
           "stat:%u/%02X/%02X/%02X irssi:%d",
-          isrCount, rxIrqCount, txIrqCount, otherIrqCount, lr1121_dio1_read(),
-          lastIrq, pkt_capture_count, crcFailCount,
+          isrCount, rxIrqCount, txIrqCount, otherIrqCount,
+          radio1IsrCount, radio2IsrCount, radio1RxIrqCount, radio2RxIrqCount,
+          dio1Level, dio2Level, (unsigned long)dio1Edges,
+          (unsigned long)dio2Edges, lastIrq, pkt_capture_count, crcFailCount,
           (unsigned long)crcPassTypeCount[PACKET_TYPE_RCDATA],
           (unsigned long)crcPassTypeCount[PACKET_TYPE_DATA],
           (unsigned long)crcPassTypeCount[PACKET_TYPE_SYNC],

@@ -220,16 +220,35 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
                      SX12XX_Radio_All); // Enable DCDC converter instead of LDO
   }
 
-  // CalibrateImage must match the actual operating band. The generic
-  // Waveshare bring-up sequence performs a baseline calibration during init,
-  // but the active runtime band may differ (for example, forced 2.4 GHz
-  // bring-up on Core1121-HF). Re-apply the ELRS band-specific image
-  // calibration here using the real min/max frequencies before entering RX.
+  // The SiW917 HAL's Waveshare init already performs CalibImage after TCXO/XOSC
+  // setup for each radio. Re-running it here is optional and can fail after the
+  // radios are already configured, so keep the duplicate gated for experiments.
+#if SIW917_ELRS_RUNTIME_CALIB_IMAGE
+  SetMode(LR1121_MODE_STDBY_XOSC, SX12XX_Radio_All);
+  delay(5);
+
+  lr1121_select_radio(LR1121_RADIO_1);
   if (!lr1121_elrs_calib_image(minimumFrequency, maximumFrequency)) {
-    DBGLN("CalibImage failed for runtime band %lu-%lu",
+    DBGLN("CalibImage failed for radio #1 runtime band %lu-%lu",
           (unsigned long)minimumFrequency, (unsigned long)maximumFrequency);
+    lr1121_select_radio(LR1121_RADIO_1);
     return false;
   }
+
+  if (GPIO_PIN_NSS_2 != UNDEF_PIN) {
+    lr1121_select_radio(LR1121_RADIO_2);
+    if (!lr1121_elrs_calib_image(minimumFrequency, maximumFrequency)) {
+      DBGLN("CalibImage failed for radio #2 runtime band %lu-%lu",
+            (unsigned long)minimumFrequency, (unsigned long)maximumFrequency);
+      lr1121_select_radio(LR1121_RADIO_1);
+      return false;
+    }
+  }
+
+  lr1121_select_radio(LR1121_RADIO_1);
+#else
+  DBGLN("Runtime CalibImage skipped (already done during HAL init)");
+#endif
 
   return true;
 }
@@ -1052,7 +1071,11 @@ void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallback_2() {
 
 // Debug counters for ISR tracking
 static volatile uint32_t isrCallCount = 0;
+static volatile uint32_t isrCallCountRadio1 = 0;
+static volatile uint32_t isrCallCountRadio2 = 0;
 volatile uint32_t rxDoneCount = 0;
+static volatile uint32_t rxDoneCountRadio1 = 0;
+static volatile uint32_t rxDoneCountRadio2 = 0;
 static volatile uint32_t txDoneCount = 0;
 static volatile uint32_t otherIrqCount = 0;
 volatile uint32_t lastIrqStatus = 0;
@@ -1092,6 +1115,11 @@ LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
 void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
     SX12XX_Radio_Number_t radioNumber, uint32_t irqStatus) {
   isrCallCount++;
+  if (radioNumber == SX12XX_Radio_1) {
+    isrCallCountRadio1++;
+  } else {
+    isrCallCountRadio2++;
+  }
   instance->processingPacketRadio = radioNumber;
   const SX12XX_Radio_Number_t otherRadioNumber =
       radioNumber == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
@@ -1110,6 +1138,11 @@ void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
     }
   } else if (irqStatus & LR1121_IRQ_RX_DONE) {
     rxDoneCount++;
+    if (radioNumber == SX12XX_Radio_1) {
+      rxDoneCountRadio1++;
+    } else {
+      rxDoneCountRadio2++;
+    }
     instance->RXnbISR(radioNumber);
     // Note: GetIrqStatus already cleared the IRQ atomically
   } else if (irqStatus & LR1121_IRQ_TIMEOUT) {
@@ -1135,6 +1168,20 @@ extern "C" void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
     *other_count = otherIrqCount;
   if (last_irq)
     *last_irq = lastIrqStatus;
+}
+
+extern "C" void lr1121_get_radio_isr_stats(uint32_t *isr_1,
+                                           uint32_t *isr_2,
+                                           uint32_t *rx_1,
+                                           uint32_t *rx_2) {
+  if (isr_1)
+    *isr_1 = isrCallCountRadio1;
+  if (isr_2)
+    *isr_2 = isrCallCountRadio2;
+  if (rx_1)
+    *rx_1 = rxDoneCountRadio1;
+  if (rx_2)
+    *rx_2 = rxDoneCountRadio2;
 }
 
 struct lr1121UpdateState_s {
