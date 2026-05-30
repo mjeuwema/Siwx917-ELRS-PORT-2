@@ -415,6 +415,22 @@ void lr1121_select_radio(uint8_t radio_mask);
 uint8_t lr1121_get_selected_radio(void);
 
 /**
+ * @brief Print GPIO levels for LR1121 shared SPI and Radio 2 control pins.
+ *
+ * Diagnostic helper used during dual-radio bring-up. Safe to call in probe
+ * builds; it does not assert chip-select or reset lines.
+ */
+void lr1121_debug_dump_radio_pins(const char *label);
+
+/**
+ * @brief Briefly toggle Radio 2 NSS/RST outputs and print readback levels.
+ *
+ * Diagnostic helper used before Radio 2 probe init to verify the SiW917 can
+ * drive the selected prototype GPIOs. Radio 1 chip-select remains deasserted.
+ */
+bool lr1121_debug_exercise_radio2_pins(void);
+
+/**
  * @brief Hot-path BUSY wait with no coarse delay.
  *
  * This is intended for ELRS timing-critical commands that should fail fast

@@ -24,7 +24,7 @@
  * intentionally deferred/safe rather than timing-optimized.
  */
 #ifndef SIW917_ELRS_DUAL_RADIO_PROBE
-#define SIW917_ELRS_DUAL_RADIO_PROBE 0
+#define SIW917_ELRS_DUAL_RADIO_PROBE 1
 #endif
 
 #ifndef SIW917_ELRS_UPSTREAM_DUAL_RADIO

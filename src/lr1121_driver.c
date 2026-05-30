@@ -182,6 +182,7 @@ extern uint32_t micros(void);
 #define MEM_GPIO_ACCESS_CTRL_SET                                               \
   (*(volatile uint32_t *)(GPIO_PAD_CTRL_BASE + 0x000))
 #define NWP_MCUHP_GPIO_CTRL2_BIT (1UL << 5)
+#define MCUHP_PAD_SELECTION (*(volatile uint32_t *)(GPIO_PAD_CTRL_BASE + 0x610))
 
 /* MCU Configuration Register - HOST_PADS_GPIO_MODE */
 #define MCR_BASE 0x46008000UL
@@ -329,6 +330,9 @@ extern uint32_t micros(void);
 #define PADCONFIG_SR_BIT (1UL << 5)  /* Slew Rate */
 #define PADCONFIG_DRIVE_MASK 0x3UL
 #define PADCONFIG_DRIVE_4MA 0x1UL
+#define PADCONFIG_PULL_MASK (0x3UL << 6)
+#define PADCONFIG_PULLUP (1UL << 6)
+#define PADCONFIG_PULLDOWN (2UL << 6)
 
 /* GSPI Peripheral Registers for Full-Duplex Mode
  * Citation: siw917x-family-rm.pdf Section 20.4 "GSPI Primary Register Map"
@@ -388,8 +392,54 @@ static bool driver_initialized = false;
 static uint8_t selected_radio = LR1121_RADIO_1;
 
 static inline bool radio2_available(void) { return LR1121_HAS_RADIO2 != 0; }
+static void delay_ms(uint32_t ms);
+static void delay_us(uint32_t us);
+
+static uint32_t mcu_hp_pad_selection_bit_for_gpio(uint8_t pin) {
+  if (pin >= 46U && pin <= 57U) {
+    return 1UL << (pin - 36U);
+  }
+  if (pin >= 9U && pin <= 15U) {
+    return 1UL << (pin - 5U);
+  }
+  return 0U;
+}
+
+#if LR1121_HAS_RADIO2
+static void configure_radio2_pad_ownership(void) {
+  const uint32_t mask =
+      mcu_hp_pad_selection_bit_for_gpio(LR1121_PIN_NSS_2) |
+      mcu_hp_pad_selection_bit_for_gpio(LR1121_PIN_BUSY_2) |
+      mcu_hp_pad_selection_bit_for_gpio(LR1121_PIN_RST_2) |
+      mcu_hp_pad_selection_bit_for_gpio(LR1121_PIN_DIO_2);
+
+  if (mask == 0U) {
+    DEBUGOUT("  Radio2 MCUHP pad ownership mask is empty for configured pins\n");
+    return;
+  }
+
+  const uint32_t before = MCUHP_PAD_SELECTION;
+  MCUHP_PAD_SELECTION = before | mask;
+  for (volatile int i = 0; i < 100; i++) {
+  }
+  DEBUGOUT("  MCUHP_PAD_SELECTION Radio2: before=0x%08lX after=0x%08lX "
+           "mask=0x%08lX\n",
+           (unsigned long)before, (unsigned long)MCUHP_PAD_SELECTION,
+           (unsigned long)mask);
+}
+#endif
+
+static inline void deassert_all_radio_nss(void) {
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS);
+#if LR1121_HAS_RADIO2
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS_2);
+#endif
+}
 
 void lr1121_select_radio(uint8_t radio_mask) {
+  if (driver_initialized) {
+    deassert_all_radio_nss();
+  }
   if ((radio_mask & LR1121_RADIO_2) && radio2_available()) {
     selected_radio = LR1121_RADIO_2;
   } else {
@@ -398,6 +448,82 @@ void lr1121_select_radio(uint8_t radio_mask) {
 }
 
 uint8_t lr1121_get_selected_radio(void) { return selected_radio; }
+
+void lr1121_debug_dump_radio_pins(const char *label) {
+  DEBUGOUT("LR1121 GPIO diag%s%s: selected=%u SCK=%lu MOSI=%lu MISO=%lu "
+           "NSS1=%lu BUSY1=%lu RST1=%lu",
+           label ? " " : "", label ? label : "", (unsigned)selected_radio,
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
+#if LR1121_HAS_RADIO2
+  DEBUGOUT(" NSS2=%lu BUSY2=%lu RST2=%lu DIO9_2=%lu\n",
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_DIO_2));
+  DEBUGOUT("LR1121 GPIO diag regs: CFG49=0x%08lX CFG50=0x%08lX "
+           "CFG51=0x%08lX PAD49=0x%08lX PAD50=0x%08lX PAD51=0x%08lX\n",
+           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST_2),
+           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS_2),
+           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY_2),
+           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_RST_2),
+           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_NSS_2),
+           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_BUSY_2));
+#else
+  DEBUGOUT("\n");
+#endif
+}
+
+bool lr1121_debug_exercise_radio2_pins(void) {
+#if LR1121_HAS_RADIO2
+  const uint8_t saved_radio = selected_radio;
+  bool pins_ok = false;
+
+  DEBUGOUT("LR1121 Radio2 GPIO exercise begin\n");
+  deassert_all_radio_nss();
+  HP_GPIO_SET_HIGH(LR1121_PIN_RST_2);
+  delay_us(10);
+  lr1121_debug_dump_radio_pins("r2-idle");
+
+  HP_GPIO_SET_LOW(LR1121_PIN_NSS_2);
+  delay_us(10);
+  DEBUGOUT("LR1121 Radio2 NSS2 low readback=%lu\n",
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2));
+  HP_GPIO_SET_HIGH(LR1121_PIN_NSS_2);
+  delay_us(10);
+  const uint32_t nss2_high = HP_GPIO_READ(LR1121_PIN_NSS_2);
+  DEBUGOUT("LR1121 Radio2 NSS2 high readback=%lu\n",
+           (unsigned long)nss2_high);
+
+  HP_GPIO_SET_LOW(LR1121_PIN_RST_2);
+  delay_us(100);
+  DEBUGOUT("LR1121 Radio2 RST2 low readback=%lu BUSY2=%lu\n",
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
+  HP_GPIO_SET_HIGH(LR1121_PIN_RST_2);
+  delay_ms(5);
+  const uint32_t rst2_high = HP_GPIO_READ(LR1121_PIN_RST_2);
+  DEBUGOUT("LR1121 Radio2 RST2 high readback=%lu BUSY2=%lu\n",
+           (unsigned long)rst2_high,
+           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
+
+  lr1121_debug_dump_radio_pins("r2-after-exercise");
+  pins_ok = (nss2_high != 0U) && (rst2_high != 0U);
+  if (!pins_ok) {
+    DEBUGOUT("LR1121 Radio2 GPIO exercise FAILED: NSS2/RST2 cannot idle high; "
+             "skipping Radio2 SPI probe to protect Radio1\n");
+  }
+  lr1121_select_radio(saved_radio);
+  return pins_ok;
+#else
+  DEBUGOUT("LR1121 Radio2 GPIO exercise skipped (no Radio2 pins compiled)\n");
+  return false;
+#endif
+}
 
 static inline uint8_t selected_nss_pin(void) {
   return (selected_radio == LR1121_RADIO_2 && radio2_available())
@@ -426,6 +552,18 @@ static void configure_output_pad_slow(uint8_t pin) {
   PAD_CONFIG_REG(pin) = pad;
 }
 
+#if LR1121_HAS_RADIO2
+static void configure_radio2_failsafe_output_pad(uint8_t pin) {
+  uint32_t pad = PAD_CONFIG_REG(pin);
+
+  /* Bias prototype CS/RST inactive while we validate the second radio path. */
+  pad &= ~(PADCONFIG_DRIVE_MASK | PADCONFIG_SR_BIT | PADCONFIG_PULL_MASK);
+  pad |= (PADCONFIG_DRIVE_4MA | PADCONFIG_PULLUP | PADCONFIG_REN_BIT |
+          PADCONFIG_SMT_BIT);
+  PAD_CONFIG_REG(pin) = pad;
+}
+#endif
+
 static void configure_lr1121_output_pads_slow(void) {
   configure_output_pad_slow(LR1121_PIN_SCK);
   configure_output_pad_slow(LR1121_PIN_MOSI);
@@ -434,6 +572,8 @@ static void configure_lr1121_output_pads_slow(void) {
 #if LR1121_HAS_RADIO2
   configure_output_pad_slow(LR1121_PIN_NSS_2);
   configure_output_pad_slow(LR1121_PIN_RST_2);
+  configure_radio2_failsafe_output_pad(LR1121_PIN_NSS_2);
+  configure_radio2_failsafe_output_pad(LR1121_PIN_RST_2);
 #endif
 }
 
@@ -615,6 +755,7 @@ static void configure_gpio_pads(void) {
 
 #if LR1121_HAS_RADIO2
   /* Radio 2 prototype controls live on BRD2708A breakout HP GPIOs. */
+  configure_radio2_pad_ownership();
   PAD_CONFIG_REG(LR1121_PIN_BUSY_2) |= (PADCONFIG_REN_BIT | PADCONFIG_SMT_BIT);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS_2) &= ~(0xF << 2);
   EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY_2) &= ~(0xF << 2);
@@ -743,6 +884,7 @@ static inline int read_busy_pin(void) {
  * GPIO_28 (CS) is bit 12 of PORT 1
  */
 static void cs_assert(void) {
+  deassert_all_radio_nss();
   HP_GPIO_SET_LOW(selected_nss_pin());
   delay_us(1); /* NSS setup time */
 }

@@ -88,11 +88,19 @@ static inline bool siw917FanoutAllRadios(SX12XX_Radio_Number_t radioNumber) {
 }
 
 static inline uint8_t siw917LrRadioFor(SX12XX_Radio_Number_t radioNumber) {
-  return (radioNumber & SX12XX_Radio_2) ? LR1121_RADIO_2 : LR1121_RADIO_1;
+  if (radioNumber == SX12XX_Radio_2) {
+    return LR1121_RADIO_2;
+  }
+  return LR1121_RADIO_1;
 }
 
 static inline void siw917SelectRadio(SX12XX_Radio_Number_t radioNumber) {
   lr1121_select_radio(siw917LrRadioFor(radioNumber));
+}
+
+static inline bool siw917IsValidLr1121Version(
+    const lr1121_firmware_version_t &version) {
+  return version.hardware == 0x22 && version.type != 0x00;
 }
 
 // Static instance pointer
@@ -151,21 +159,47 @@ void LR1121Hal::init() {
         (unsigned)LR1121_PIN_NSS_2, (unsigned)LR1121_PIN_BUSY_2,
         (unsigned)LR1121_PIN_DIO_2, (unsigned)LR1121_PIN_RST_2);
   lr1121_select_radio(LR1121_RADIO_2);
-  status = lr1121_waveshare_init();
-  if (status != LR1121_OK) {
-    DBGLN("LR1121 Radio2 TCXO/probe init failed: %d", (int)status);
+  const bool radio2PinsOk = lr1121_debug_exercise_radio2_pins();
+  if (!radio2PinsOk) {
+    DBGLN("LR1121 #2 probe skipped: NSS2/RST2 did not idle high");
     lr1121_select_radio(LR1121_RADIO_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
     return;
-  }
-
-  lr1121_firmware_version_t radio2Version;
-  if (lr1121_get_firmware_version(&radio2Version, LR1121_OPCODE_GET_VERSION)) {
-    DBGLN("LR1121 #2 Probe Ready: HW=0x%02X Type=0x%02X FW=0x%04X",
-          radio2Version.hardware, radio2Version.type, radio2Version.version);
+#endif
   } else {
-    DBGLN("LR1121 #2 probe version read failed");
-    lr1121_select_radio(LR1121_RADIO_1);
-    return;
+    status = lr1121_waveshare_init();
+    if (status != LR1121_OK) {
+      DBGLN("LR1121 Radio2 TCXO/probe init failed: %d", (int)status);
+      lr1121_select_radio(LR1121_RADIO_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+      return;
+#endif
+    }
+
+    lr1121_firmware_version_t radio2Version;
+    if (status == LR1121_OK &&
+        lr1121_get_firmware_version(&radio2Version, LR1121_OPCODE_GET_VERSION)) {
+      if (siw917IsValidLr1121Version(radio2Version)) {
+        DBGLN("LR1121 #2 Probe Ready: HW=0x%02X Type=0x%02X FW=0x%04X",
+              radio2Version.hardware, radio2Version.type, radio2Version.version);
+      } else {
+        DBGLN("LR1121 #2 probe invalid version: HW=0x%02X Type=0x%02X "
+              "FW=0x%04X (check NSS2/BUSY2/RST2/MISO wiring)",
+              radio2Version.hardware, radio2Version.type, radio2Version.version);
+        lr1121_debug_dump_radio_pins("r2-invalid-version");
+        lr1121_select_radio(LR1121_RADIO_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+        return;
+#endif
+      }
+    } else if (status == LR1121_OK) {
+      DBGLN("LR1121 #2 probe version read failed");
+      lr1121_debug_dump_radio_pins("r2-version-read-failed");
+      lr1121_select_radio(LR1121_RADIO_1);
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+      return;
+#endif
+    }
   }
   lr1121_select_radio(LR1121_RADIO_1);
 #endif
