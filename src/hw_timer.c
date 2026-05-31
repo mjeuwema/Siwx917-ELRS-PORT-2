@@ -43,6 +43,12 @@
 
 #define CT CT0
 
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
+#define HW_TIMER_LOG(...) printf(__VA_ARGS__)
+#else
+#define HW_TIMER_LOG(...) ((void)0)
+#endif
+
 /* ========================================================================== */
 /*                              CONFIGURATION                                 */
 /* ========================================================================== */
@@ -145,7 +151,9 @@ static uint32_t clamp_half_interval_us(int32_t interval_us);
 static int32_t hw_timer_consume_freq_adjust_us(void);
 static void hw_timer_note_edge_from_isr(void);
 static uint32_t hw_timer_get_ct_source_hz(CT_CLK_SRC_SEL_T source);
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
 static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source);
+#endif
 static uint32_t hw_timer_read_counter0(void);
 static void hw_timer_write_match(uint32_t match_value, bool use_buffer);
 static void hw_timer_configure_counter0_direct(void);
@@ -254,6 +262,7 @@ static uint32_t hw_timer_get_ct_source_hz(CT_CLK_SRC_SEL_T source) {
   }
 }
 
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
 static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source) {
   switch (source) {
   case CT_ULPREFCLK:
@@ -268,6 +277,7 @@ static const char *hw_timer_ct_source_name(CT_CLK_SRC_SEL_T source) {
     return "UNKNOWN";
   }
 }
+#endif
 
 static uint32_t hw_timer_read_counter0(void) {
   return CT->CT_COUNTER_REG_b.COUNTER0 & CT_MATCH_MAX;
@@ -531,6 +541,7 @@ static bool hw_timer_install_direct_ct_vector(void) {
   old_ct_vector = hw_timer_ram_vector_table[HW_TIMER_CT_VECTOR_INDEX];
   hw_timer_ram_vector_table[HW_TIMER_CT_VECTOR_INDEX] =
       (uint32_t)(uintptr_t)hw_timer_direct_ct_irq;
+  (void)old_ct_vector;
 
   __DSB();
   __ISB();
@@ -539,11 +550,11 @@ static bool hw_timer_install_direct_ct_vector(void) {
   __ISB();
   hw_timer_exit_critical(primask);
 
-  printf("hw_timer: RAM CT vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
-         "oldCT=0x%08lX newCT=0x%08lX\n",
-         (unsigned long)old_vtor, (unsigned long)new_vtor,
-         (unsigned long)old_ct_vector,
-         (unsigned long)(uintptr_t)hw_timer_direct_ct_irq);
+  HW_TIMER_LOG("hw_timer: RAM CT vector installed oldVTOR=0x%08lX "
+               "newVTOR=0x%08lX oldCT=0x%08lX newCT=0x%08lX\n",
+               (unsigned long)old_vtor, (unsigned long)new_vtor,
+               (unsigned long)old_ct_vector,
+               (unsigned long)(uintptr_t)hw_timer_direct_ct_irq);
   return true;
 }
 #endif
@@ -563,7 +574,8 @@ static bool hw_timer_install_direct_ct_vector(void) {
 sl_status_t hw_timer_init(uint32_t interval_us) {
   sl_status_t status;
 
-  printf(">>> hw_timer_init ENTRY (interval=%lu us) <<<\n", interval_us);
+  HW_TIMER_LOG(">>> hw_timer_init ENTRY (interval=%lu us) <<<\n",
+               interval_us);
 
   /* Initialize state */
   memset(&hw_timer, 0, sizeof(hw_timer));
@@ -580,7 +592,8 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
     hw_timer.half_interval_us = MAX_HALF_INTERVAL_US;
   }
 
-  printf("hw_timer: half_interval=%lu us\n", hw_timer.half_interval_us);
+  HW_TIMER_LOG("hw_timer: half_interval=%lu us\n",
+               hw_timer.half_interval_us);
 
   /* Initialize state variables */
   hw_timer.is_tock = true; /* First callback will be TOCK */
@@ -618,12 +631,12 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
     ct_source_clk = system_clk;
   }
 
-  printf("hw_timer: SystemCoreClock=%lu Hz\n", system_clk);
-  printf("hw_timer: clocks soc=%lu soc_pll=%lu intf_pll=%lu\n",
-         system_clocks.soc_clock, system_clocks.soc_pll_clock,
-         system_clocks.intf_pll_clock);
-  printf("hw_timer: CT source=%s, source_clk=%lu Hz\n",
-         hw_timer_ct_source_name(ct_source), ct_source_clk);
+  HW_TIMER_LOG("hw_timer: SystemCoreClock=%lu Hz\n", system_clk);
+  HW_TIMER_LOG("hw_timer: clocks soc=%lu soc_pll=%lu intf_pll=%lu\n",
+               system_clocks.soc_clock, system_clocks.soc_pll_clock,
+               system_clocks.intf_pll_clock);
+  HW_TIMER_LOG("hw_timer: CT source=%s, source_clk=%lu Hz\n",
+               hw_timer_ct_source_name(ct_source), ct_source_clk);
 
   /* Step 2: Calculate the divider to achieve 2 MHz
    * Formula: div_factor = system_clk / (2 * TARGET_FREQ)
@@ -647,8 +660,8 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
     ct_ticks_per_us = 1; /* Minimum 1 tick per µs */
   }
 
-  printf("hw_timer: div=%lu, ct_freq=%lu Hz, ticks/us=%lu\n", div_factor,
-         actual_ct_freq, ct_ticks_per_us);
+  HW_TIMER_LOG("hw_timer: div=%lu, ct_freq=%lu Hz, ticks/us=%lu\n",
+               div_factor, actual_ct_freq, ct_ticks_per_us);
 
   ct_runtime_source = ct_source;
   ct_runtime_div_factor = div_factor;
@@ -656,17 +669,17 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   /* Step 4: Configure CT clock using RSI API
    * Use CT_SOCPLLCLK as source and apply the calculated divider
    */
-  printf("hw_timer: [1/7] RSI_CLK_PeripheralClkEnable...\n");
+  HW_TIMER_LOG("hw_timer: [1/7] RSI_CLK_PeripheralClkEnable...\n");
   RSI_CLK_PeripheralClkEnable(M4CLK, CT_CLK, ENABLE_STATIC_CLK);
-  printf("hw_timer: [1/7] DONE\n");
+  HW_TIMER_LOG("hw_timer: [1/7] DONE\n");
 
-  printf("hw_timer: [2/7] RSI_CLK_CtClkConfig...\n");
+  HW_TIMER_LOG("hw_timer: [2/7] RSI_CLK_CtClkConfig...\n");
   rsi_error_t clk_status =
       RSI_CLK_CtClkConfig(M4CLK, ct_source, div_factor, ENABLE_STATIC_CLK);
-  printf("hw_timer: [2/7] status=0x%04lX sel=%lu div=%lu\n",
-         (unsigned long)clk_status,
-         (unsigned long)M4CLK->CLK_CONFIG_REG5_b.CT_CLK_SEL,
-         (unsigned long)M4CLK->CLK_CONFIG_REG5_b.CT_CLK_DIV_FAC);
+  HW_TIMER_LOG("hw_timer: [2/7] status=0x%04lX sel=%lu div=%lu\n",
+               (unsigned long)clk_status,
+               (unsigned long)M4CLK->CLK_CONFIG_REG5_b.CT_CLK_SEL,
+               (unsigned long)M4CLK->CLK_CONFIG_REG5_b.CT_CLK_DIV_FAC);
   if (clk_status != RSI_OK) {
     printf("hw_timer: FAILED at CT clock config!\n");
     return SL_STATUS_FAIL;
@@ -682,31 +695,33 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
       ct_ticks_per_us = 1;
     }
   }
-  printf("hw_timer: [2/7] actual CT base=%lu Hz, ticks/us=%lu\n",
-         actual_ct_freq, ct_ticks_per_us);
+  HW_TIMER_LOG("hw_timer: [2/7] actual CT base=%lu Hz, ticks/us=%lu\n",
+               actual_ct_freq, ct_ticks_per_us);
 
   /* Step 5: Configure Counter 0 directly in the CT peripheral. */
-  printf("hw_timer: [3/7] direct CT Counter0 config (16-bit periodic)...\n");
+  HW_TIMER_LOG(
+      "hw_timer: [3/7] direct CT Counter0 config (16-bit periodic)...\n");
   hw_timer_configure_counter0_direct();
-  printf("hw_timer: [3/7] DONE\n");
+  HW_TIMER_LOG("hw_timer: [3/7] DONE\n");
 
-  printf("hw_timer: [4/7] CT config path=bare-metal registers\n");
+  HW_TIMER_LOG("hw_timer: [4/7] CT config path=bare-metal registers\n");
 
   hw_timer.match_value = us_to_match_value(hw_timer.half_interval_us);
   hw_timer.programmed_half_interval_us = hw_timer.half_interval_us;
-  printf("hw_timer: final ct_freq=%lu Hz, ticks/us=%lu, match_value=%lu "
-         "(16-bit max=%lu)\n",
-         (unsigned long)ct_freq_hz, (unsigned long)ct_ticks_per_us,
-         (unsigned long)hw_timer.match_value, (unsigned long)CT_MATCH_MAX);
+  HW_TIMER_LOG("hw_timer: final ct_freq=%lu Hz, ticks/us=%lu, "
+               "match_value=%lu (16-bit max=%lu)\n",
+               (unsigned long)ct_freq_hz, (unsigned long)ct_ticks_per_us,
+               (unsigned long)hw_timer.match_value,
+               (unsigned long)CT_MATCH_MAX);
 
   /* Set initial match value (counter 0) */
-  printf("hw_timer: [5/7] direct CT match write CNT0=%lu...\n",
-         hw_timer.match_value);
+  HW_TIMER_LOG("hw_timer: [5/7] direct CT match write CNT0=%lu...\n",
+               hw_timer.match_value);
   hw_timer_write_match(hw_timer.match_value, false);
-  printf("hw_timer: [5/7] DONE\n");
+  HW_TIMER_LOG("hw_timer: [5/7] DONE\n");
 
   /* Clear any pending CT interrupt before enabling the direct vector. */
-  printf("hw_timer: [6/7] Clearing pending CT IRQ...\n");
+  HW_TIMER_LOG("hw_timer: [6/7] Clearing pending CT IRQ...\n");
   hw_timer_ack_pending_ct_irq();
   NVIC_ClearPendingIRQ(CT_IRQn);
 
@@ -714,18 +729,19 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
    * ELRS work and wakes the task; all LR1121 SPI stays in task context.
    */
   NVIC_SetPriority(CT_IRQn, SIW917_ELRS_CT_IRQ_PRIORITY);
-  printf("hw_timer: [6/7] DONE (priority=%u, FreeRTOS-safe)\n",
-         (unsigned)SIW917_ELRS_CT_IRQ_PRIORITY);
+  HW_TIMER_LOG("hw_timer: [6/7] DONE (priority=%u, FreeRTOS-safe)\n",
+               (unsigned)SIW917_ELRS_CT_IRQ_PRIORITY);
 
 #if !SIW917_ELRS_DIRECT_CT_IRQ
 #error "ELRS radio timer requires SIW917_ELRS_DIRECT_CT_IRQ for bare-metal CT"
 #endif
 
   bool direct_ct_vector_installed = false;
-  printf("hw_timer: [7/7] Installing direct CT vector...\n");
+  HW_TIMER_LOG("hw_timer: [7/7] Installing direct CT vector...\n");
   direct_ct_vector_installed = hw_timer_install_direct_ct_vector();
   if (direct_ct_vector_installed) {
-    printf("hw_timer: [8/8] direct CT IRQ enable path (bare-metal only)\n");
+    HW_TIMER_LOG(
+        "hw_timer: [8/8] direct CT IRQ enable path (bare-metal only)\n");
     hw_timer_ack_pending_ct_irq();
     hw_timer_enable_counter0_peak_irq();
     status = SL_STATUS_OK;
@@ -739,7 +755,7 @@ sl_status_t hw_timer_init(uint32_t interval_us) {
   } else {
     hw_timer.is_initialized = true;
     hw_timer_force_stop_counter0();
-    printf("hw_timer: init COMPLETE OK (counter stopped)\n");
+    HW_TIMER_LOG("hw_timer: init COMPLETE OK (counter stopped)\n");
   }
 
   return status;

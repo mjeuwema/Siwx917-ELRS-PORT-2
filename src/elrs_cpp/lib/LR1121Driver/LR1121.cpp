@@ -203,7 +203,9 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
   fallBackMode = LR1121_MODE_FS;
   hal.WriteCommand(LR11XX_RADIO_SET_RX_TX_FALLBACK_MODE_OC, FBbuf,
                    sizeof(FBbuf), SX12XX_Radio_All);
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("SetRxTxFallbackMode: FS");
+#endif
 
   // 7.2.12 SetRxBoosted
   uint8_t abuf[1] = {1};
@@ -247,7 +249,9 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
 
   lr1121_select_radio(LR1121_RADIO_1);
 #else
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("Runtime CalibImage skipped (already done during HAL init)");
+#endif
 #endif
 
   return true;
@@ -785,7 +789,9 @@ void LR1121Driver::SetDioIrqParams() {
   hal.WriteCommand(LR11XX_SYSTEM_SET_DIOIRQPARAMS_OC, buf, sizeof(buf),
                    SX12XX_Radio_All);
 
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("SetDioIrqParams: TX_DONE|RX_DONE routed to DIO1 (via Dio1Mask)");
+#endif
 }
 
 uint32_t SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
@@ -917,13 +923,17 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
   outBuffer[PayloadLength + 1] = 0;
   outBuffer[PayloadLength + 2] = 0;
   if (sendGeminiBuffer) {
+    WORD_ALIGNED_ATTR uint8_t outBufferGemini[32];
+    codec->encode(outBufferGemini, dataGemini, PayloadLength);
+    outBufferGemini[PayloadLength] = 0;
+    outBufferGemini[PayloadLength + 1] = 0;
+    outBufferGemini[PayloadLength + 2] = 0;
+
+    // Keep the two LR1121 TX start commands adjacent; encoding between them
+    // widens Gemini skew inside the already-tight telemetry slot.
     hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBuffer, length,
                      SX12XX_Radio_1);
-    codec->encode(outBuffer, dataGemini, PayloadLength);
-    outBuffer[PayloadLength] = 0;
-    outBuffer[PayloadLength + 1] = 0;
-    outBuffer[PayloadLength + 2] = 0;
-    hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBuffer, length,
+    hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBufferGemini, length,
                      SX12XX_Radio_2);
   } else {
     hal.WriteCommand(LR11XX_RADIO_WRITE_BUFFER8_SET_TX, outBuffer, length,
@@ -966,7 +976,9 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::DecodeRssiSnr(
 
 bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   siw917_rxnbisr_entry_us = micros();
+#endif
   const uint8_t effectivePayloadLength =
       PayloadLength != 0 ? PayloadLength : siw917_last_payload_length;
   bool packetAccepted = false;
@@ -974,7 +986,9 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   // GetPacket
   hal.WriteCommand(LR11XX_RADIO_GET_PACKET, radioNumber);
   hal.ReadCommand(rx_buf, effectivePayloadLength + 6, radioNumber);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   siw917_packet_ready_us = micros();
+#endif
 
   codec->decode(RXdataBuffer, rx_buf + 6, effectivePayloadLength);
   packetAccepted = RXdoneCallback(SX12XX_RX_OK);
@@ -1080,6 +1094,14 @@ static volatile uint32_t txDoneCount = 0;
 static volatile uint32_t otherIrqCount = 0;
 volatile uint32_t lastIrqStatus = 0;
 
+#if SIW917_ELRS_ISR_STATS_DIAG
+#define LR1121_ISR_STAT_INC(var_) ((var_)++)
+#define LR1121_ISR_STAT_SET(var_, value_) ((var_) = (value_))
+#else
+#define LR1121_ISR_STAT_INC(var_) do { } while (0)
+#define LR1121_ISR_STAT_SET(var_, value_) do { } while (0)
+#endif
+
 extern "C" {
 void lr1121_cs_assert(void);
 void lr1121_cs_deassert(void);
@@ -1091,9 +1113,9 @@ void SIW917_ELRS_RAMFUNC_ATTR
 LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
 #if SIW917_ELRS_RX_FIRST_TXDONE
   if (instance->txInProgress) {
-    isrCallCount++;
-    txDoneCount++;
-    lastIrqStatus = LR1121_IRQ_TX_DONE;
+    LR1121_ISR_STAT_INC(isrCallCount);
+    LR1121_ISR_STAT_INC(txDoneCount);
+    LR1121_ISR_STAT_SET(lastIrqStatus, LR1121_IRQ_TX_DONE);
     instance->processingPacketRadio = radioNumber;
     instance->TXnbISR();
     instance->ClearIrqStatusMask(LR1121_IRQ_TX_DONE, radioNumber);
@@ -1114,43 +1136,45 @@ LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
 
 void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
     SX12XX_Radio_Number_t radioNumber, uint32_t irqStatus) {
-  isrCallCount++;
+  LR1121_ISR_STAT_INC(isrCallCount);
   if (radioNumber == SX12XX_Radio_1) {
-    isrCallCountRadio1++;
+    LR1121_ISR_STAT_INC(isrCallCountRadio1);
   } else {
-    isrCallCountRadio2++;
+    LR1121_ISR_STAT_INC(isrCallCountRadio2);
   }
   instance->processingPacketRadio = radioNumber;
   const SX12XX_Radio_Number_t otherRadioNumber =
       radioNumber == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
 
-  lastIrqStatus = irqStatus;
+  LR1121_ISR_STAT_SET(lastIrqStatus, irqStatus);
 
   // HOT PATH - No debug output here! Printf kills timing.
 
   if (irqStatus & LR1121_IRQ_TX_DONE) {
-    txDoneCount++;
-    instance->TXnbISR();
-    // Note: GetIrqStatus already cleared the IRQ atomically, no need to clear
-    // again But we still clear in case of dual radio setup
+    LR1121_ISR_STAT_INC(txDoneCount);
+    // Clear the paired radio before RXnb() re-arms both radios. Otherwise the
+    // level-held TX_DONE line on radio 2 can leave a stale DIO stage pass and
+    // steal time from the next receive window.
     if (GPIO_PIN_NSS_2 != UNDEF_PIN) {
       instance->ClearIrqStatus(otherRadioNumber);
     }
+    instance->TXnbISR();
+    // Note: GetIrqStatus already cleared this radio's IRQ atomically.
   } else if (irqStatus & LR1121_IRQ_RX_DONE) {
-    rxDoneCount++;
+    LR1121_ISR_STAT_INC(rxDoneCount);
     if (radioNumber == SX12XX_Radio_1) {
-      rxDoneCountRadio1++;
+      LR1121_ISR_STAT_INC(rxDoneCountRadio1);
     } else {
-      rxDoneCountRadio2++;
+      LR1121_ISR_STAT_INC(rxDoneCountRadio2);
     }
     instance->RXnbISR(radioNumber);
     // Note: GetIrqStatus already cleared the IRQ atomically
   } else if (irqStatus & LR1121_IRQ_TIMEOUT) {
     // RX timeout - re-arm receiver
-    otherIrqCount++;  // Count as "other" for stats
+    LR1121_ISR_STAT_INC(otherIrqCount);  // Count as "other" for stats
     instance->RXnb(); // Re-enter RX mode
   } else if (irqStatus != 0) {
-    otherIrqCount++;
+    LR1121_ISR_STAT_INC(otherIrqCount);
   }
 }
 
@@ -1213,9 +1237,12 @@ LR1121Driver::GetFirmwareVersion(const SX12XX_Radio_Number_t radioNumber,
   hal.ReadCommand(buffer, sizeof(buffer), radioNumber);
   hal.WaitOnBusy(radioNumber);
 
-  DBGLN("GetFirmwareVersion raw: [%02X %02X %02X %02X %02X] -> HW=0x%02X Type=0x%02X FW=0x%04X",
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4],
-        buffer[1], buffer[2], (uint16_t)(buffer[3] << 8 | buffer[4]));
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
+  DBGLN("GetFirmwareVersion raw: [%02X %02X %02X %02X %02X] -> HW=0x%02X "
+        "Type=0x%02X FW=0x%04X",
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[1],
+        buffer[2], (uint16_t)(buffer[3] << 8 | buffer[4]));
+#endif
 
   return {.hardware = buffer[1],
           .type = buffer[2],

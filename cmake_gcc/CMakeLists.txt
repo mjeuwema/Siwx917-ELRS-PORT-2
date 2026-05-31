@@ -15,6 +15,12 @@ project(
 # which contains the content of the SLC project
 include(wifi_gspi_merged.cmake)
 
+# Keep the flight-controller CRSF/MAVLink serial path off the byte-IRQ path.
+# The SiW917 USART0 CMSIS driver enables UDMA resources from this definition.
+target_compile_definitions(slc PUBLIC
+    SL_USART0_DMA_CONFIG_ENABLE=1
+)
+
 #=============================================================================
 # ELRS C++ Platform Abstraction Layer for SiW917
 #=============================================================================

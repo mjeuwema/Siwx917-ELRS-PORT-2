@@ -100,6 +100,7 @@ extern bool interface_is_up[];                     /* Per-interface status array
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdlib.h>
 
 /*******************************************************************************
  * Macros
@@ -110,6 +111,370 @@ extern bool interface_is_up[];                     /* Per-interface status array
 
 /* Maximum HTTP headers */
 #define MAX_HTTP_HEADERS         8
+
+/* Keep static WebUI sends small; the SiWx917 HTTP helper mallocs the
+ * first response buffer, so large gzip bundles must be streamed.
+ */
+#define WEB_ASSET_CHUNK_SIZE     1024
+
+/* Upstream hardware.json uses -1 for undefined pins. */
+#define WEBUI_UNDEF_PIN          (-1)
+
+/*******************************************************************************
+ * WebUI JSON Helpers
+ ******************************************************************************/
+
+static const char *skip_json_ws(const char *p)
+{
+  while (p != NULL && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+    p++;
+  }
+  return p;
+}
+
+static bool json_find_key_value(const char *json, const char *key, const char **value_out)
+{
+  char pattern[64];
+  int pattern_len = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  if (pattern_len <= 0 || (size_t)pattern_len >= sizeof(pattern)) {
+    return false;
+  }
+
+  const char *pos = strstr(json, pattern);
+  if (pos == NULL) {
+    return false;
+  }
+
+  pos = strchr(pos + pattern_len, ':');
+  if (pos == NULL) {
+    return false;
+  }
+
+  *value_out = skip_json_ws(pos + 1);
+  return *value_out != NULL;
+}
+
+static bool json_get_int_field(const char *json, const char *key, int *value_out)
+{
+  const char *value = NULL;
+  if (!json_find_key_value(json, key, &value)) {
+    return false;
+  }
+  return sscanf(value, "%d", value_out) == 1;
+}
+
+static bool json_get_bool_field(const char *json, const char *key, bool *value_out)
+{
+  const char *value = NULL;
+  if (!json_find_key_value(json, key, &value)) {
+    return false;
+  }
+  if (strncmp(value, "true", 4) == 0) {
+    *value_out = true;
+    return true;
+  }
+  if (strncmp(value, "false", 5) == 0) {
+    *value_out = false;
+    return true;
+  }
+  return false;
+}
+
+static bool json_get_string_field(const char *json, const char *key,
+                                  char *value_out, size_t value_size)
+{
+  const char *value = NULL;
+  if (value_out == NULL || value_size == 0 ||
+      !json_find_key_value(json, key, &value) || *value != '"') {
+    return false;
+  }
+
+  value++;
+  size_t out = 0;
+  while (*value != '\0' && *value != '"' && out + 1 < value_size) {
+    if (*value == '\\' && value[1] != '\0') {
+      value++;
+    }
+    value_out[out++] = *value++;
+  }
+  value_out[out] = '\0';
+  return true;
+}
+
+static void json_escape_string(const char *src, char *dst, size_t dst_size)
+{
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+
+  size_t out = 0;
+  while (*src != '\0' && out + 1 < dst_size) {
+    if ((*src == '"' || *src == '\\') && out + 2 < dst_size) {
+      dst[out++] = '\\';
+    }
+    dst[out++] = *src++;
+  }
+  dst[out] = '\0';
+}
+
+static int hex_nibble(char c)
+{
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+static void url_decode_form_component(const char *src, char *dst, size_t dst_size)
+{
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+
+  size_t out = 0;
+  while (*src != '\0' && out + 1 < dst_size) {
+    if (*src == '+') {
+      dst[out++] = ' ';
+      src++;
+    } else if (*src == '%' && src[1] != '\0' && src[2] != '\0') {
+      int hi = hex_nibble(src[1]);
+      int lo = hex_nibble(src[2]);
+      if (hi >= 0 && lo >= 0) {
+        dst[out++] = (char)((hi << 4) | lo);
+        src += 3;
+      } else {
+        dst[out++] = *src++;
+      }
+    } else {
+      dst[out++] = *src++;
+    }
+  }
+  dst[out] = '\0';
+}
+
+static bool form_get_urlencoded_field(const char *body, const char *name,
+                                      char *value_out, size_t value_size)
+{
+  char pattern[64];
+  int pattern_len = snprintf(pattern, sizeof(pattern), "%s=", name);
+  if (pattern_len <= 0 || (size_t)pattern_len >= sizeof(pattern)) {
+    return false;
+  }
+
+  const char *pos = body;
+  while (pos != NULL && *pos != '\0') {
+    const char *found = strstr(pos, pattern);
+    if (found == NULL) {
+      return false;
+    }
+    if (found == body || found[-1] == '&' || found[-1] == '\n') {
+      found += pattern_len;
+      const char *end = strchr(found, '&');
+      size_t raw_len = end ? (size_t)(end - found) : strlen(found);
+      char raw[128];
+      if (raw_len >= sizeof(raw)) {
+        raw_len = sizeof(raw) - 1;
+      }
+      memcpy(raw, found, raw_len);
+      raw[raw_len] = '\0';
+      url_decode_form_component(raw, value_out, value_size);
+      return true;
+    }
+    pos = found + pattern_len;
+  }
+  return false;
+}
+
+static bool form_get_multipart_field(const char *body, const char *name,
+                                     char *value_out, size_t value_size)
+{
+  char pattern[64];
+  int pattern_len = snprintf(pattern, sizeof(pattern), "name=\"%s\"", name);
+  if (pattern_len <= 0 || (size_t)pattern_len >= sizeof(pattern)) {
+    return false;
+  }
+
+  const char *pos = strstr(body, pattern);
+  if (pos == NULL) {
+    return false;
+  }
+
+  const char *value = strstr(pos, "\r\n\r\n");
+  size_t separator_len = 4;
+  if (value == NULL) {
+    value = strstr(pos, "\n\n");
+    separator_len = 2;
+  }
+  if (value == NULL) {
+    return false;
+  }
+  value += separator_len;
+
+  const char *end = strstr(value, "\r\n--");
+  if (end == NULL) {
+    end = strstr(value, "\n--");
+  }
+  if (end == NULL) {
+    end = value + strlen(value);
+  }
+  while (end > value && (end[-1] == '\r' || end[-1] == '\n')) {
+    end--;
+  }
+
+  size_t len = (size_t)(end - value);
+  if (len >= value_size) {
+    len = value_size - 1;
+  }
+  memcpy(value_out, value, len);
+  value_out[len] = '\0';
+  return true;
+}
+
+static bool form_get_field(const char *body, const char *name,
+                           char *value_out, size_t value_size)
+{
+  if (body == NULL || name == NULL || value_out == NULL || value_size == 0) {
+    return false;
+  }
+  value_out[0] = '\0';
+  return form_get_multipart_field(body, name, value_out, value_size) ||
+         form_get_urlencoded_field(body, name, value_out, value_size);
+}
+
+static int webui_options_to_json(char *buffer, size_t buffer_size)
+{
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg == NULL) {
+    return snprintf(buffer, buffer_size, "{}");
+  }
+
+  char ssid[80];
+  char password[140];
+  char wifi_interval_json[16];
+  int32_t wifi_interval = elrs_config_get_wifi_on_interval();
+  json_escape_string(cfg->wifi_ssid, ssid, sizeof(ssid));
+  json_escape_string(cfg->wifi_password, password, sizeof(password));
+  if (wifi_interval < 0) {
+    snprintf(wifi_interval_json, sizeof(wifi_interval_json), "null");
+  } else {
+    snprintf(wifi_interval_json, sizeof(wifi_interval_json), "%ld", (long)wifi_interval);
+  }
+
+  return snprintf(buffer, buffer_size,
+                  "{"
+                    "\"domain\":%u,"
+                    "\"uid\":[%u,%u,%u,%u,%u,%u],"
+                    "\"flash-discriminator\":0,"
+                    "\"wifi-on-interval\":%s,"
+                    "\"wifi-ssid\":\"%s\","
+                    "\"wifi-password\":\"%s\","
+                    "\"rcvr-uart-baud\":%lu,"
+                    "\"lock-on-first-connection\":%s,"
+                    "\"dji-permanently-armed\":%s,"
+                    "\"is-airport\":%s,"
+                    "\"customised\":%s"
+                  "}",
+                  elrs_config_get_web_domain(),
+                  cfg->uid[0], cfg->uid[1], cfg->uid[2],
+                  cfg->uid[3], cfg->uid[4], cfg->uid[5],
+                  wifi_interval_json,
+                  ssid,
+                  password,
+                  (unsigned long)elrs_config_get_uart_baud(),
+                  elrs_config_get_lock_on_first_connection() ? "true" : "false",
+                  elrs_config_get_dji_permanently_armed() ? "true" : "false",
+                  elrs_config_get_is_airport() ? "true" : "false",
+                  elrs_config_web_options_customised() ? "true" : "false");
+}
+
+static int webui_hardware_to_json(char *buffer, size_t buffer_size)
+{
+  return snprintf(buffer, buffer_size,
+                  "{"
+                    "\"customised\":false,"
+                    "\"serial_rx\":55,"
+                    "\"serial_tx\":54,"
+                    "\"serial1_rx\":%d,"
+                    "\"serial1_tx\":%d,"
+                    "\"radio_busy\":29,"
+                    "\"radio_busy_2\":51,"
+                    "\"radio_dio0\":%d,"
+                    "\"radio_dio0_2\":%d,"
+                    "\"radio_dio1\":46,"
+                    "\"radio_dio1_2\":47,"
+                    "\"radio_miso\":26,"
+                    "\"radio_mosi\":27,"
+                    "\"radio_nss\":28,"
+                    "\"radio_nss_2\":50,"
+                    "\"radio_rst\":30,"
+                    "\"radio_rst_2\":49,"
+                    "\"radio_sck\":25,"
+                    "\"radio_dcdc\":false,"
+                    "\"radio_rfo_hf\":false,"
+                    "\"radio_rfsw_ctrl\":[],"
+                    "\"ant_ctrl\":%d,"
+                    "\"power_enable\":%d,"
+                    "\"power_apc2\":%d,"
+                    "\"power_rxen\":%d,"
+                    "\"power_txen\":%d,"
+                    "\"power_rxen_2\":%d,"
+                    "\"power_txen_2\":%d,"
+                    "\"power_lna_gain\":0,"
+                    "\"power_min\":0,"
+                    "\"power_max\":3,"
+                    "\"power_default\":3,"
+                    "\"power_control\":0,"
+                    "\"power_values\":[10,14,17,20],"
+                    "\"power_values2\":[],"
+                    "\"power_values_dual\":[10,13],"
+                    "\"button\":11,"
+                    "\"button2\":%d,"
+                    "\"led\":10,"
+                    "\"led_red_invert\":false,"
+                    "\"led_rgb\":%d,"
+                    "\"led_rgb_isgrb\":false,"
+                    "\"ledidx_rgb_status\":[],"
+                    "\"ledidx_rgb_vtx\":[],"
+                    "\"ledidx_rgb_boot\":[],"
+                    "\"pwm_outputs\":[],"
+                    "\"pwm_out_only\":false,"
+                    "\"vbat\":%d,"
+                    "\"vbat_offset\":0,"
+                    "\"vbat_scale\":0,"
+                    "\"vbat_atten\":-1,"
+                    "\"vbat_noreading\":0,"
+                    "\"vbat_cal_min\":0,"
+                    "\"vbat_cal_max\":0,"
+                    "\"vsrc1\":%d,"
+                    "\"vsrc2\":%d,"
+                    "\"vsrc3\":%d,"
+                    "\"i2c_scl\":%d,"
+                    "\"i2c_sda\":%d"
+                  "}",
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN, WEBUI_UNDEF_PIN,
+                  WEBUI_UNDEF_PIN);
+}
 
 /*******************************************************************************
  * Base64 Decoding Implementation
@@ -367,7 +732,7 @@ static int str_icmp(const char *s1, const char *s2)
  * 
  * Citation: MDN Web Docs - Cross-Origin Resource Sharing (CORS)
  * Browsers block cross-origin requests unless server sends these headers.
- * Since we're serving from http://192.168.10.10, any JavaScript fetch() 
+ * Since we're serving from http://10.0.0.1, any JavaScript fetch()
  * needs CORS headers to allow the request.
  ******************************************************************************/
 #define CORS_HEADER_ALLOW_ORIGIN   "Access-Control-Allow-Origin"
@@ -530,9 +895,8 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
       DEBUGOUT("[HTTP] Serving asset: %s (%u bytes gzip)\n", 
                path, (unsigned int)WEB_ASSETS[i].size);
 
-      /* Determine content type based on asset's content_type field
-       * Citation: sl_http_server_types.h - SL_HTTP_CONTENT_TYPE_TEXT_JAVASCRIPT
-       * Browsers require correct Content-Type to execute JavaScript (MIME sniffing protection)
+      /* The SDK response struct uses char* for content_type, so use its
+       * own constant MIME strings instead of the const generated asset field.
        */
       if (strstr(WEB_ASSETS[i].content_type, "javascript")) {
         response.content_type = SL_HTTP_CONTENT_TYPE_TEXT_JAVASCRIPT;
@@ -547,11 +911,32 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
       response.response_code        = SL_HTTP_RESPONSE_OK;
       response.headers              = headers;
       response.header_count         = 2;
-      response.data                 = (uint8_t *)WEB_ASSETS[i].data;
-      response.current_data_length  = WEB_ASSETS[i].size;
+      response.data                 = NULL;
+      response.current_data_length  = 0;
       response.expected_data_length = WEB_ASSETS[i].size;
 
-      return sl_http_server_send_response(handle, &response);
+      sl_status_t status = sl_http_server_send_response(handle, &response);
+      if (status != SL_STATUS_OK) {
+        DEBUGOUT("[HTTP] ERROR: asset header send failed: 0x%lX\n", (unsigned long)status);
+        return status;
+      }
+
+      const unsigned char *data = WEB_ASSETS[i].data;
+      size_t remaining = WEB_ASSETS[i].size;
+      while (remaining > 0) {
+        uint32_t chunk_len = (remaining > WEB_ASSET_CHUNK_SIZE)
+                             ? WEB_ASSET_CHUNK_SIZE
+                             : (uint32_t)remaining;
+        status = sl_http_server_write_data(handle, (uint8_t *)data, chunk_len);
+        if (status != SL_STATUS_OK) {
+          DEBUGOUT("[HTTP] ERROR: asset chunk send failed: 0x%lX\n", (unsigned long)status);
+          return status;
+        }
+        data += chunk_len;
+        remaining -= chunk_len;
+      }
+
+      return SL_STATUS_OK;
     }
   }
 
@@ -773,6 +1158,11 @@ static sl_status_t handle_networks(sl_http_server_t *handle, sl_http_server_requ
   response.expected_data_length = sizeof(networks_json) - 1;
 
   return sl_http_server_send_response(handle, &response);
+}
+
+static sl_status_t handle_networks_json(sl_http_server_t *handle, sl_http_server_request_t *req)
+{
+  return handle_networks(handle, req);
 }
 
 /**
@@ -1359,19 +1749,106 @@ static sl_status_t handle_forceupdate(sl_http_server_t *handle, sl_http_server_r
 static sl_status_t handle_options(sl_http_server_t *handle, sl_http_server_request_t *req)
 {
   sl_http_server_response_t response = { 0 };
-  sl_http_header_t header = { .key = "Content-Type", .value = "application/json" };
-  static const char options_json[] = "{}";
+  sl_http_header_t headers[2] = {
+    { .key = "Content-Type",  .value = "application/json" },
+    { .key = "Cache-Control", .value = "no-cache" }
+  };
+  int len = 0;
 
   request_count++;
   DEBUGOUT("[HTTP] %s /options.json\n", request_type_str[req->type]);
 
+  if (req->type == SL_HTTP_REQUEST_POST) {
+    static char body_buffer[1024];
+    sl_http_recv_req_data_t recv_data = {
+      .request       = req,
+      .buffer        = (uint8_t *)body_buffer,
+      .buffer_length = sizeof(body_buffer) - 1
+    };
+
+    sl_status_t status = sl_http_server_read_request_data(handle, &recv_data);
+    if (status != SL_STATUS_OK) {
+      len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"status\":\"error\",\"msg\":\"Failed to read options body\"}");
+      response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+      goto send_options_response;
+    }
+
+    body_buffer[recv_data.received_data_length] = '\0';
+
+    int int_value = 0;
+    bool bool_value = false;
+    char ssid[33] = {0};
+    char password[65] = {0};
+
+    if (json_get_int_field(body_buffer, "domain", &int_value)) {
+      elrs_config_set_web_domain((uint8_t)int_value);
+    }
+    if (json_get_bool_field(body_buffer, "lock-on-first-connection", &bool_value)) {
+      elrs_config_set_lock_on_first_connection(bool_value);
+    }
+    if (json_get_int_field(body_buffer, "rcvr-uart-baud", &int_value)) {
+      elrs_config_set_uart_baud((uint32_t)int_value);
+    }
+    const char *wifi_interval_value = NULL;
+    if (json_find_key_value(body_buffer, "wifi-on-interval", &wifi_interval_value)) {
+      if (strncmp(wifi_interval_value, "null", 4) == 0) {
+        elrs_config_set_wifi_on_interval(-1);
+      } else if (sscanf(wifi_interval_value, "%d", &int_value) == 1) {
+        elrs_config_set_wifi_on_interval((int32_t)int_value);
+      }
+    }
+    if (json_get_bool_field(body_buffer, "is-airport", &bool_value) && bool_value) {
+      len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"status\":\"error\",\"msg\":\"AirPort mode is not implemented on this SiW917 RX target\"}");
+      response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+      goto send_options_response;
+    }
+    if (json_get_bool_field(body_buffer, "dji-permanently-armed", &bool_value) && bool_value) {
+      len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"status\":\"error\",\"msg\":\"DJI DisplayPort output is not implemented on this SiW917 RX target\"}");
+      response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+      goto send_options_response;
+    }
+
+    elrs_config_set_is_airport(false);
+    elrs_config_set_dji_permanently_armed(false);
+
+    bool have_ssid = json_get_string_field(body_buffer, "wifi-ssid", ssid, sizeof(ssid));
+    bool have_password = json_get_string_field(body_buffer, "wifi-password", password, sizeof(password));
+    if (have_ssid || have_password) {
+      elrs_config_t *cfg = elrs_config_get();
+      if (!have_ssid && cfg != NULL) {
+        strncpy(ssid, cfg->wifi_ssid, sizeof(ssid) - 1);
+      }
+      if (!have_password && cfg != NULL) {
+        strncpy(password, cfg->wifi_password, sizeof(password) - 1);
+      }
+      elrs_config_set_wifi(ssid, password, WIFI_TEST_AP_CHANNEL);
+    }
+
+    extern void wifi_http_request_config_save(void);
+    wifi_http_request_config_save();
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{\"status\":\"ok\",\"msg\":\"Options updated (saving...)\"}");
+    response.response_code = SL_HTTP_RESPONSE_OK;
+    goto send_options_response;
+  }
+
+  if (req->type != SL_HTTP_REQUEST_GET) {
+    return handle_cors_preflight(handle, req);
+  }
+
+  len = webui_options_to_json(response_buffer, RESPONSE_BUFFER_SIZE);
   response.response_code        = SL_HTTP_RESPONSE_OK;
+
+send_options_response:
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
-  response.headers              = &header;
-  response.header_count         = 1;
-  response.data                 = (uint8_t *)options_json;
-  response.current_data_length  = sizeof(options_json) - 1;
-  response.expected_data_length = sizeof(options_json) - 1;
+  response.headers              = headers;
+  response.header_count         = 2;
+  response.data                 = (uint8_t *)response_buffer;
+  response.current_data_length  = len;
+  response.expected_data_length = len;
 
   return sl_http_server_send_response(handle, &response);
 }
@@ -1382,21 +1859,48 @@ static sl_status_t handle_options(sl_http_server_t *handle, sl_http_server_reque
 static sl_status_t handle_hardware(sl_http_server_t *handle, sl_http_server_request_t *req)
 {
   sl_http_server_response_t response = { 0 };
-  sl_http_header_t header = { .key = "Content-Type", .value = "application/json" };
-  static const char hardware_json[] = "{}";
+  sl_http_header_t headers[2] = {
+    { .key = "Content-Type",  .value = "application/json" },
+    { .key = "Cache-Control", .value = "no-cache" }
+  };
+  int len = 0;
 
   request_count++;
   DEBUGOUT("[HTTP] %s /hardware.json\n", request_type_str[req->type]);
 
-  response.response_code        = SL_HTTP_RESPONSE_OK;
+  if (req->type == SL_HTTP_REQUEST_POST) {
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{\"status\":\"error\",\"msg\":\"Runtime hardware layout overrides are not implemented on this fixed SiW917 target\"}");
+    response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+  } else if (req->type == SL_HTTP_REQUEST_GET) {
+    len = webui_hardware_to_json(response_buffer, RESPONSE_BUFFER_SIZE);
+    response.response_code = SL_HTTP_RESPONSE_OK;
+  } else {
+    return handle_cors_preflight(handle, req);
+  }
+
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
-  response.headers              = &header;
-  response.header_count         = 1;
-  response.data                 = (uint8_t *)hardware_json;
-  response.current_data_length  = sizeof(hardware_json) - 1;
-  response.expected_data_length = sizeof(hardware_json) - 1;
+  response.headers              = headers;
+  response.header_count         = 2;
+  response.data                 = (uint8_t *)response_buffer;
+  response.current_data_length  = len;
+  response.expected_data_length = len;
 
   return sl_http_server_send_response(handle, &response);
+}
+
+static bool request_has_query_flag(const sl_http_server_request_t *req, const char *name)
+{
+  if (req == NULL || name == NULL) {
+    return false;
+  }
+  for (uint16_t i = 0; i < req->uri.query_parameter_count; i++) {
+    const char *query = req->uri.query_parameters[i].query;
+    if (query != NULL && strcmp(query, name) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1412,7 +1916,8 @@ static sl_status_t handle_sethome(sl_http_server_t *handle, sl_http_server_reque
 {
   sl_http_server_response_t response = { 0 };
   sl_http_header_t header = { .key = "Content-Type", .value = "application/json" };
-  static char body_buffer[512];
+  static char body_buffer[1536];
+  int response_len = 0;
   
   request_count++;
   DEBUGOUT("[HTTP] %s /sethome\n", request_type_str[req->type]);
@@ -1428,56 +1933,52 @@ static sl_status_t handle_sethome(sl_http_server_t *handle, sl_http_server_reque
     sl_status_t status = sl_http_server_read_request_data(handle, &recv_data);
     if (status == SL_STATUS_OK && recv_data.received_data_length > 0) {
       body_buffer[recv_data.received_data_length] = '\0';
-      DEBUGOUT("[HTTP] SetHome body: %s\n", body_buffer);
-      
-      /* Parse form data: network=<ssid>&password=<password> */
-      char* network_start = strstr(body_buffer, "network=");
-      char* password_start = strstr(body_buffer, "password=");
-      
-      if (network_start != NULL) {
-        network_start += 8;
-        char ssid[33] = {0};
-        char password[65] = {0};
-        
-        /* Extract SSID (up to & or end) */
-        char* ssid_end = strchr(network_start, '&');
-        if (ssid_end) {
-          size_t len = ssid_end - network_start;
-          if (len > 32) len = 32;
-          strncpy(ssid, network_start, len);
+
+      char ssid[33] = {0};
+      char password[65] = {0};
+      char interval[16] = {0};
+      bool have_ssid = form_get_field(body_buffer, "network", ssid, sizeof(ssid));
+      bool have_password = form_get_field(body_buffer, "password", password, sizeof(password));
+      bool have_interval = form_get_field(body_buffer, "wifi-on-interval",
+                                          interval, sizeof(interval));
+
+      if (have_interval) {
+        if (interval[0] == '\0') {
+          elrs_config_set_wifi_on_interval(-1);
+        } else {
+          elrs_config_set_wifi_on_interval((int32_t)atoi(interval));
         }
-        
-        /* Extract password */
-        if (password_start != NULL) {
-          password_start += 9;
-          char* pwd_end = strchr(password_start, '&');
-          size_t len = pwd_end ? (size_t)(pwd_end - password_start) : strlen(password_start);
-          if (len > 64) len = 64;
-          strncpy(password, password_start, len);
+      }
+
+      if (have_ssid) {
+        if (!have_password) {
+          password[0] = '\0';
         }
-        
-        DEBUGOUT("[HTTP] SetHome SSID='%s', Password='%s'\n", ssid, password);
-        
-        /* Save WiFi credentials */
-        elrs_config_set_wifi(ssid, password, 6);  /* Channel 6 default */
-        elrs_config_save();
-        
-        int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE, 
-                          "{\"status\":\"ok\",\"msg\":\"Home Network Set\"}");
+        DEBUGOUT("[HTTP] SetHome SSID='%s'\n", ssid);
+        elrs_config_set_wifi(ssid, password, WIFI_TEST_AP_CHANNEL);
+        extern void wifi_http_request_config_save(void);
+        wifi_http_request_config_save();
+
+        const bool save_home = request_has_query_flag(req, "save");
+        response_len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                                save_home
+                                  ? "{\"status\":\"ok\",\"msg\":\"Home Network Set\"}"
+                                  : "{\"status\":\"ok\",\"msg\":\"Home Network Saved; STA connect requires reboot on this target\"}");
         response.response_code = SL_HTTP_RESPONSE_OK;
         response.data = (uint8_t *)response_buffer;
-        response.current_data_length = len;
-        response.expected_data_length = len;
+        response.current_data_length = response_len;
+        response.expected_data_length = response_len;
       }
     }
   }
   
   if (response.data == NULL) {
-    static const char ok_msg[] = "{\"status\":\"ok\"}";
-    response.response_code = SL_HTTP_RESPONSE_OK;
-    response.data = (uint8_t *)ok_msg;
-    response.current_data_length = sizeof(ok_msg) - 1;
-    response.expected_data_length = sizeof(ok_msg) - 1;
+    response_len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                            "{\"status\":\"error\",\"msg\":\"No WiFi network supplied\"}");
+    response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+    response.data = (uint8_t *)response_buffer;
+    response.current_data_length = response_len;
+    response.expected_data_length = response_len;
   }
   
   response.content_type = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
@@ -1485,6 +1986,85 @@ static sl_status_t handle_sethome(sl_http_server_t *handle, sl_http_server_reque
   response.header_count = 1;
   
   return sl_http_server_send_response(handle, &response);
+}
+
+static sl_status_t send_webui_json_message(sl_http_server_t *handle,
+                                           sl_http_response_code_t code,
+                                           const char *status_text,
+                                           const char *message)
+{
+  sl_http_server_response_t response = { 0 };
+  sl_http_header_t header = { .key = "Content-Type", .value = "application/json" };
+  int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"status\":\"%s\",\"msg\":\"%s\"}",
+                     status_text, message);
+
+  response.response_code        = code;
+  response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
+  response.headers              = &header;
+  response.header_count         = 1;
+  response.data                 = (uint8_t *)response_buffer;
+  response.current_data_length  = len;
+  response.expected_data_length = len;
+
+  return sl_http_server_send_response(handle, &response);
+}
+
+static sl_status_t handle_access(sl_http_server_t *handle, sl_http_server_request_t *req)
+{
+  request_count++;
+  DEBUGOUT("[HTTP] %s /access\n", request_type_str[req->type]);
+  if (req->type != SL_HTTP_REQUEST_POST) {
+    return handle_cors_preflight(handle, req);
+  }
+  return send_webui_json_message(handle, SL_HTTP_RESPONSE_OK, "ok",
+                                 "Access Point mode is already active");
+}
+
+static sl_status_t handle_connect(sl_http_server_t *handle, sl_http_server_request_t *req)
+{
+  request_count++;
+  DEBUGOUT("[HTTP] %s /connect\n", request_type_str[req->type]);
+  if (req->type != SL_HTTP_REQUEST_POST) {
+    return handle_cors_preflight(handle, req);
+  }
+  return send_webui_json_message(handle, SL_HTTP_RESPONSE_OK, "ok",
+                                 "Home network saved; STA mode is not enabled in this RF build");
+}
+
+static sl_status_t handle_forget(sl_http_server_t *handle, sl_http_server_request_t *req)
+{
+  request_count++;
+  DEBUGOUT("[HTTP] %s /forget\n", request_type_str[req->type]);
+  if (req->type != SL_HTTP_REQUEST_POST) {
+    return handle_cors_preflight(handle, req);
+  }
+
+  static char body_buffer[512];
+  sl_http_recv_req_data_t recv_data = {
+    .request       = req,
+    .buffer        = (uint8_t *)body_buffer,
+    .buffer_length = sizeof(body_buffer) - 1
+  };
+  if (sl_http_server_read_request_data(handle, &recv_data) == SL_STATUS_OK) {
+    body_buffer[recv_data.received_data_length] = '\0';
+    char interval[16] = {0};
+    if (form_get_field(body_buffer, "wifi-on-interval", interval, sizeof(interval))) {
+      elrs_config_set_wifi_on_interval(interval[0] == '\0' ? -1 : (int32_t)atoi(interval));
+    }
+  }
+
+  elrs_config_t *cfg = elrs_config_get();
+  if (cfg != NULL) {
+    memset(cfg->wifi_ssid, 0, sizeof(cfg->wifi_ssid));
+    memset(cfg->wifi_password, 0, sizeof(cfg->wifi_password));
+    cfg->flags &= (uint8_t)~ELRS_CONFIG_FLAG_WIFI_CUSTOM;
+    extern void wifi_http_request_config_save(void);
+    wifi_http_request_config_save();
+  }
+
+  return send_webui_json_message(handle, SL_HTTP_RESPONSE_OK, "ok",
+                                 "Home Network forgotten; Access Point mode will be used");
 }
 
 /*******************************************************************************
@@ -1496,6 +2076,68 @@ static sl_status_t handle_sethome(sl_http_server_t *handle, sl_http_server_reque
  *   POST /lr1121      - Firmware upload (X-FileSize header, multipart body)
  ******************************************************************************/
 
+static unsigned lr1121_http_radio_number(uint8_t radio)
+{
+  return (radio == LR1121_RADIO_2) ? 2U : 1U;
+}
+
+static uint8_t lr1121_http_parse_radio_header(const char *value, bool *valid)
+{
+  if (valid != NULL) {
+    *valid = true;
+  }
+
+  if (value == NULL || value[0] == '\0') {
+    return LR1121_RADIO_1;
+  }
+
+  if (value[0] == '2' || str_icmp(value, "radio2") == 0) {
+#if LR1121_HAS_RADIO2
+    return LR1121_RADIO_2;
+#else
+    if (valid != NULL) {
+      *valid = false;
+    }
+    return LR1121_RADIO_1;
+#endif
+  }
+
+  if (value[0] == '1' || str_icmp(value, "radio1") == 0) {
+    return LR1121_RADIO_1;
+  }
+
+  if (valid != NULL) {
+    *valid = false;
+  }
+  return LR1121_RADIO_1;
+}
+
+static bool lr1121_http_read_radio_status(uint8_t radio,
+                                          lr1121_firmware_version_t *version)
+{
+  lr1121_select_radio(radio);
+
+  lr1121_status_t reset_status = lr1121_reset();
+  if (reset_status != LR1121_OK) {
+    DEBUGOUT("[HTTP] LR1121 radio%u reset failed: %d\n",
+             lr1121_http_radio_number(radio), reset_status);
+    return false;
+  }
+
+  if (!lr1121_get_firmware_version(version, LR1121_OPCODE_GET_VERSION)) {
+    DEBUGOUT("[HTTP] Failed to read LR1121 radio%u version\n",
+             lr1121_http_radio_number(radio));
+    return false;
+  }
+
+  DEBUGOUT("[HTTP] LR1121 radio%u status: HW=0x%02X Type=0x%02X FW=0x%04X\n",
+           lr1121_http_radio_number(radio),
+           version->hardware,
+           version->type,
+           version->version);
+  return true;
+}
+
 /**
  * @brief Handler for GET /lr1121.json endpoint
  * 
@@ -1503,7 +2145,8 @@ static sl_status_t handle_sethome(sl_http_server_t *handle, sl_http_server_reque
  * Returns JSON with LR1121 firmware version information:
  * {
  *   "manual": false,
- *   "radio1": { "hardware": 34, "type": 3, "firmware": 258 }
+ *   "radio1": { "hardware": 34, "type": 3, "firmware": 258 },
+ *   "radio2": { "hardware": 34, "type": 3, "firmware": 258 }
  * }
  */
 static sl_status_t handle_lr1121_status(sl_http_server_t *handle, sl_http_server_request_t *req)
@@ -1517,7 +2160,11 @@ static sl_status_t handle_lr1121_status(sl_http_server_t *handle, sl_http_server
     { .key = CORS_HEADER_ALLOW_METHODS,   .value = CORS_VALUE_ALLOW_METHODS },
     { .key = "Cache-Control",             .value = "no-cache" }
   };
-  lr1121_firmware_version_t version;
+  lr1121_firmware_version_t radio1_version = {0};
+#if LR1121_HAS_RADIO2
+  lr1121_firmware_version_t radio2_version = {0};
+  bool radio2_ok = false;
+#endif
   int len;
 
   request_count++;
@@ -1533,46 +2180,66 @@ static sl_status_t handle_lr1121_status(sl_http_server_t *handle, sl_http_server
     goto send_response;
   }
 
-  /* Reset LR1121 to ensure clean state */
-  lr1121_status_t reset_status = lr1121_reset();
-  if (reset_status != LR1121_OK) {
-    DEBUGOUT("[HTTP] LR1121 reset failed: %d\n", reset_status);
-    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
-                   "{\"error\":\"LR1121 reset failed\"}");
-    response.response_code = SL_HTTP_RESPONSE_INTERNAL_SERVER_ERROR;
-    goto send_response;
-  }
-
-  /* Get firmware version using system GetVersion command (0x0101) */
-  if (!lr1121_get_firmware_version(&version, 0x0101)) {
-    DEBUGOUT("[HTTP] Failed to read LR1121 version\n");
+  if (!lr1121_http_read_radio_status(LR1121_RADIO_1, &radio1_version)) {
     len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
                    "{\"error\":\"Failed to read LR1121 firmware version\"}");
     response.response_code = SL_HTTP_RESPONSE_INTERNAL_SERVER_ERROR;
     goto send_response;
   }
 
+#if LR1121_HAS_RADIO2
+  radio2_ok = lr1121_http_read_radio_status(LR1121_RADIO_2, &radio2_version);
+  if (!radio2_ok) {
+    DEBUGOUT("[HTTP] LR1121 radio2 status unavailable; reporting radio1 only\n");
+  }
+#endif
+
   /* Build JSON response matching ELRS format 
    * Citation: ExpressLRS lr1121.cpp - ReadStatusForRadio()
    */
-  len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
-                 "{"
-                 "\"manual\":false,"
-                 "\"radio1\":{"
-                   "\"hardware\":%u,"
-                   "\"type\":%u,"
-                   "\"firmware\":%u"
-                 "}"
-                 "}",
-                 (unsigned)version.hardware,
-                 (unsigned)version.type,
-                 (unsigned)version.version);
+#if LR1121_HAS_RADIO2
+  if (radio2_ok) {
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{"
+                   "\"manual\":false,"
+                   "\"radio1\":{"
+                     "\"hardware\":%u,"
+                     "\"type\":%u,"
+                     "\"firmware\":%u"
+                   "},"
+                   "\"radio2\":{"
+                     "\"hardware\":%u,"
+                     "\"type\":%u,"
+                     "\"firmware\":%u"
+                   "}"
+                   "}",
+                   (unsigned)radio1_version.hardware,
+                   (unsigned)radio1_version.type,
+                   (unsigned)radio1_version.version,
+                   (unsigned)radio2_version.hardware,
+                   (unsigned)radio2_version.type,
+                   (unsigned)radio2_version.version);
+  } else
+#endif
+  {
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{"
+                   "\"manual\":false,"
+                   "\"radio1\":{"
+                     "\"hardware\":%u,"
+                     "\"type\":%u,"
+                     "\"firmware\":%u"
+                   "}"
+                   "}",
+                   (unsigned)radio1_version.hardware,
+                   (unsigned)radio1_version.type,
+                   (unsigned)radio1_version.version);
+  }
 
-  DEBUGOUT("[HTTP] LR1121 status: HW=0x%02X Type=0x%02X FW=0x%04X\n",
-           version.hardware, version.type, version.version);
   response.response_code = SL_HTTP_RESPONSE_OK;
 
 send_response:
+  lr1121_select_radio(LR1121_RADIO_1);
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
   response.headers              = headers;
   response.header_count         = 4;
@@ -1606,6 +2273,8 @@ static sl_status_t handle_lr1121_upload(sl_http_server_t *handle, sl_http_server
   };
   static uint8_t data_buffer[1024];  /* Receive buffer for firmware chunks */
   uint32_t expected_size = 0;
+  uint8_t target_radio = LR1121_RADIO_1;
+  bool radio_header_valid = true;
   int result;
   int len;
 
@@ -1642,9 +2311,20 @@ static sl_status_t handle_lr1121_upload(sl_http_server_t *handle, sl_http_server
         
         if (str_icmp(request_headers[i].key, "X-FileSize") == 0) {
           expected_size = (uint32_t)atoi(request_headers[i].value);
+        } else if (str_icmp(request_headers[i].key, "X-Radio") == 0) {
+          target_radio = lr1121_http_parse_radio_header(request_headers[i].value,
+                                                        &radio_header_valid);
         }
       }
     }
+  }
+
+  if (!radio_header_valid) {
+    DEBUGOUT("[HTTP] ERROR: Invalid or unsupported X-Radio header\n");
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{\"status\":\"error\",\"msg\":\"Invalid or unsupported X-Radio header\"}");
+    response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+    goto send_response;
   }
 
   if (expected_size == 0) {
@@ -1655,8 +2335,8 @@ static sl_status_t handle_lr1121_upload(sl_http_server_t *handle, sl_http_server
     goto send_response;
   }
 
-  DEBUGOUT("[HTTP] LR1121 firmware upload starting, expected size: %lu bytes\n",
-           (unsigned long)expected_size);
+  DEBUGOUT("[HTTP] LR1121 firmware upload starting for radio%u, expected size: %lu bytes\n",
+           lr1121_http_radio_number(target_radio), (unsigned long)expected_size);
 
   /* Initialize LR1121 and begin update */
   lr1121_status_t init_status = lr1121_init();
@@ -1667,6 +2347,8 @@ static sl_status_t handle_lr1121_upload(sl_http_server_t *handle, sl_http_server
     response.response_code = SL_HTTP_RESPONSE_INTERNAL_SERVER_ERROR;
     goto send_response;
   }
+
+  lr1121_select_radio(target_radio);
 
   /* Begin firmware update (enters bootloader, erases flash) */
   result = lr1121_begin_update(expected_size);
@@ -1872,6 +2554,7 @@ static sl_status_t handle_lr1121_upload(sl_http_server_t *handle, sl_http_server
   }
 
 send_response:
+  lr1121_select_radio(LR1121_RADIO_1);
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
   response.headers              = headers;
   response.header_count         = 4;
@@ -1915,6 +2598,10 @@ static const char upload_html_page[] =
 "</style></head><body>\n"
 "<h1>LR1121 Firmware Upload</h1>\n"
 "<div class=\"box\">\n"
+"<p>Target radio:</p>\n"
+"<select id=\"radio\" style=\"width:100%;padding:10px;margin:10px 0\">\n"
+"<option value=\"1\">Radio 1</option><option value=\"2\">Radio 2</option>\n"
+"</select>\n"
 "<p>Select LR1121 firmware file (.bin):</p>\n"
 "<input type=\"file\" id=\"file\" accept=\".bin\">\n"
 "<div class=\"progress\"><div class=\"progress-bar\" id=\"progress\"></div></div>\n"
@@ -1925,6 +2612,7 @@ static const char upload_html_page[] =
 "<script>\n"
 "const fileInput=document.getElementById('file');\n"
 "const uploadBtn=document.getElementById('upload');\n"
+"const radioSelect=document.getElementById('radio');\n"
 "const statusDiv=document.getElementById('status');\n"
 "const progressBar=document.getElementById('progress');\n"
 "let fileData=null,fileName='';\n"
@@ -1969,7 +2657,7 @@ static const char upload_html_page[] =
 "  try{\n"
 "    const resp=await fetch('/lr1121b64',{\n"
 "      method:'POST',\n"
-"      headers:{'Content-Type':'text/plain','X-FileSize':''+fileData.byteLength},\n"
+"      headers:{'Content-Type':'text/plain','X-FileSize':''+fileData.byteLength,'X-Radio':radioSelect.value},\n"
 "      body:b64\n"
 "    });\n"
 "    progressBar.style.width='90%';\n"
@@ -2045,6 +2733,8 @@ static sl_status_t handle_lr1121_upload_base64(sl_http_server_t *handle, sl_http
    * 1536 bytes base64 -> 1152 bytes binary */
   static uint8_t data_buffer[1536];
   uint32_t expected_size = 0;
+  uint8_t target_radio = LR1121_RADIO_1;
+  bool radio_header_valid = true;
   int result;
   int len;
 
@@ -2075,9 +2765,20 @@ static sl_status_t handle_lr1121_upload_base64(sl_http_server_t *handle, sl_http
         
         if (str_icmp(request_headers[i].key, "X-FileSize") == 0) {
           expected_size = (uint32_t)atoi(request_headers[i].value);
+        } else if (str_icmp(request_headers[i].key, "X-Radio") == 0) {
+          target_radio = lr1121_http_parse_radio_header(request_headers[i].value,
+                                                        &radio_header_valid);
         }
       }
     }
+  }
+
+  if (!radio_header_valid) {
+    DEBUGOUT("[HTTP] ERROR: Invalid or unsupported X-Radio header\n");
+    len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE,
+                   "{\"status\":\"error\",\"msg\":\"Invalid or unsupported X-Radio header\"}");
+    response.response_code = SL_HTTP_RESPONSE_BAD_REQUEST;
+    goto send_response;
   }
 
   if (expected_size == 0) {
@@ -2088,8 +2789,8 @@ static sl_status_t handle_lr1121_upload_base64(sl_http_server_t *handle, sl_http
     goto send_response;
   }
 
-  DEBUGOUT("[HTTP] Base64 firmware upload starting, expected decoded size: %lu bytes\n",
-           (unsigned long)expected_size);
+  DEBUGOUT("[HTTP] Base64 firmware upload starting for radio%u, expected decoded size: %lu bytes\n",
+           lr1121_http_radio_number(target_radio), (unsigned long)expected_size);
 
   /* Initialize LR1121 and begin update */
   lr1121_status_t init_status = lr1121_init();
@@ -2100,6 +2801,8 @@ static sl_status_t handle_lr1121_upload_base64(sl_http_server_t *handle, sl_http
     response.response_code = SL_HTTP_RESPONSE_INTERNAL_SERVER_ERROR;
     goto send_response;
   }
+
+  lr1121_select_radio(target_radio);
 
   /* Begin firmware update (enters bootloader, erases flash) */
   result = lr1121_begin_update(expected_size);
@@ -2244,6 +2947,7 @@ static sl_status_t handle_lr1121_upload_base64(sl_http_server_t *handle, sl_http
   }
 
 send_response:
+  lr1121_select_radio(LR1121_RADIO_1);
   response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
   response.headers              = headers;
   response.header_count         = 4;
@@ -2562,17 +3266,17 @@ static sl_status_t handle_not_found(sl_http_server_t *handle, sl_http_server_req
 
   request_count++;
   
-  /* Log EVERY unhandled request - this helps debug missing endpoints */
-  DEBUGOUT("[HTTP] UNHANDLED: %s %s\n", 
-           (req->type < 5) ? request_type_str[req->type] : "UNKNOWN", 
-           req->uri.path);
-  
   /* Try to serve as a web asset first (for asset paths) */
   sl_status_t status = serve_web_asset(handle, req->uri.path);
   if (status == SL_STATUS_OK) {
     DEBUGOUT("[HTTP] -> HANDLED as web asset\n");
     return status;
   }
+
+  /* Log only genuinely missing routes; asset paths are handled above. */
+  DEBUGOUT("[HTTP] UNHANDLED: %s %s\n",
+           (req->type < 5) ? request_type_str[req->type] : "UNKNOWN",
+           req->uri.path);
 
   DEBUGOUT("[HTTP] -> 404 Not Found\n");
 
@@ -2600,12 +3304,16 @@ static sl_http_server_handler_t http_handlers[] = {
   /* ELRS API endpoints */
   { .uri = "/config",        .handler = handle_config },
   { .uri = "/networks",      .handler = handle_networks },
+  { .uri = "/networks.json", .handler = handle_networks_json },
   { .uri = "/reboot",        .handler = handle_reboot },
   { .uri = "/forceupdate",   .handler = handle_forceupdate },
   { .uri = "/update",        .handler = handle_update },
   { .uri = "/options.json",  .handler = handle_options },
   { .uri = "/hardware.json", .handler = handle_hardware },
   { .uri = "/sethome",       .handler = handle_sethome },
+  { .uri = "/access",        .handler = handle_access },
+  { .uri = "/connect",       .handler = handle_connect },
+  { .uri = "/forget",        .handler = handle_forget },
   
   /* LR1121 Firmware OTA endpoints 
    * Citation: ExpressLRS lr1121.cpp - addLR1121Handlers()
@@ -2942,10 +3650,19 @@ static bool force_nwp_reinit_after_wdt(uint32_t wakeup_status)
   uint32_t timeout_count;
   const uint32_t MAX_WAIT_MS = 3000;  /* Max 3 seconds for NWP boot */
   const uint32_t POLL_INTERVAL_MS = 50;
+  const bool wdt_reset = (wakeup_status & WAKEUP_BIT_MCU_WDT) != 0U;
+  const uint32_t initial_p2p = MCU_P2P_COMM_STATUS_REG;
+  const uint32_t initial_host = HOST_INTF_REG_OUT;
+  const bool stale_active_nwp =
+    !device_initialized &&
+    ((initial_p2p & P2P_NWP_ACTIVE_STATUS) != 0U) &&
+    (((initial_host >> 8) & 0xFFU) == WIFI_REGISTER_VALID);
   
-  /* Only apply workaround after WDT reset */
-  if (!(wakeup_status & WAKEUP_BIT_MCU_WDT)) {
-    DEBUGOUT("[NWP-Fix] Not a WDT reset, skipping workaround\n");
+  /* Also recover the stale-active state seen when WiFi auto-start runs after
+   * RF mode: the NWP is alive, but the SDK state says it is not initialized.
+   */
+  if (!wdt_reset && !stale_active_nwp) {
+    DEBUGOUT("[NWP-Fix] NWP reset not needed (wdt=0 stale=0)\n");
     return false;
   }
   
@@ -2955,7 +3672,8 @@ static bool force_nwp_reinit_after_wdt(uint32_t wakeup_status)
   DEBUGOUT("║  Citation: siw917x-family-rm.pdf Section 9.10.13/14          ║\n");
   DEBUGOUT("╚══════════════════════════════════════════════════════════════╝\n");
   DEBUGOUT("\n");
-  DEBUGOUT("[NWP-Fix] WDT reset detected - applying FULL HARDWARE RESET workaround\n");
+  DEBUGOUT("[NWP-Fix] Applying full NWP reset (%s)\n",
+           wdt_reset ? "WDT reset" : "stale active NWP before AP init");
   
   /* Read current state for diagnostics */
   p2p_status = MCU_P2P_COMM_STATUS_REG;
@@ -3284,7 +4002,7 @@ void wifi_http_test_run(void)
   DEBUGOUT("Configuration:\n");
   DEBUGOUT("  SSID:     %s\n", WIFI_TEST_AP_SSID);
   DEBUGOUT("  Password: %s\n", WIFI_TEST_AP_PASSWORD);
-  DEBUGOUT("  IP:       192.168.10.10\n");
+  DEBUGOUT("  IP:       10.0.0.1\n");
   DEBUGOUT("  Port:     %d\n", WIFI_TEST_HTTP_PORT);
   DEBUGOUT("  Version:  %s\n", ELRS_VERSION);
   DEBUGOUT("  Target:   %s\n", ELRS_TARGET);
@@ -3439,8 +4157,8 @@ void wifi_http_test_run(void)
   DEBUGOUT("Password: %s\n", WIFI_TEST_AP_PASSWORD);
   DEBUGOUT("\n");
   DEBUGOUT("Open in browser:\n");
-  DEBUGOUT("  ELRS Config:    http://192.168.10.10/\n");
-  DEBUGOUT("  LR1121 Upload:  http://192.168.10.10/upload.html  <-- Binary-safe!\n");
+  DEBUGOUT("  ELRS Config:    http://10.0.0.1/\n");
+  DEBUGOUT("  LR1121 Upload:  http://10.0.0.1/upload.html  <-- Binary-safe!\n");
   DEBUGOUT("\n");
   DEBUGOUT("ELRS Web Assets: %u files loaded\n", (unsigned int)WEB_ASSETS_COUNT);
   DEBUGOUT("\n");

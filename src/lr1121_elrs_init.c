@@ -20,11 +20,22 @@
 
 #include "lr1121_elrs_init.h"
 #include "lr1121_driver.h"
+#include "siw917_elrs_timing.h"
 /* IRQ constants moved inline - no longer need elrs_protocol header */
 #define LR1121_IRQ_TX_DONE 0x00000004
 #define LR1121_IRQ_RX_DONE 0x00000008
 #include "rsi_debug.h"
 #include <string.h>
+
+#if !SIW917_ELRS_RADIO_INIT_VERBOSE
+#undef DEBUGOUT
+#define DEBUGOUT(...)                                                          \
+  do {                                                                         \
+    if (SIW917_ELRS_RADIO_INIT_VERBOSE) {                                      \
+      printf(__VA_ARGS__);                                                     \
+    }                                                                          \
+  } while (0)
+#endif
 
 /*******************************************************************************
  * Helper Functions - Low-Level Command Execution

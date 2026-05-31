@@ -37,22 +37,51 @@
 
 /*
  * Keep LR1121 dual-band/crossband air rates gated separately from same-band
- * Gemini/diversity bring-up. The current SiW917 path validates two radios on
- * the shared 915 MHz FHSS domain; crossband needs explicit FHSS/band routing
- * before rate indexes 18/19 are safe to scan.
+ * Gemini/diversity bring-up. Enable this only when the port explicitly routes
+ * radio1 on the primary sub-GHz FHSS domain and radio2 on the 2.4 GHz domain.
  */
 #ifndef SIW917_ELRS_ENABLE_CROSSBAND_RATES
-#define SIW917_ELRS_ENABLE_CROSSBAND_RATES 0
+#define SIW917_ELRS_ENABLE_CROSSBAND_RATES 1
+#endif
+
+#ifndef SIW917_ELRS_CROSSBAND_TEST_LOG
+#define SIW917_ELRS_CROSSBAND_TEST_LOG 0
 #endif
 
 /*
- * The first dual-LR1121 SiW917 bring-up can hard-stop while scanning the fast
- * 900 MHz SF5 acquisition modes (indexes 1/2). Keep those out of disconnected
- * scan on the dual-radio branch until the shared-SPI/BUSY timing is proven at
- * SF5. Standard 50/100/200 Hz 900 MHz modes still scan normally.
+ * The 900 MHz SF5 acquisition rates are normal selectable TX modes. Keep this
+ * as an emergency opt-out only; disabling it skips FCC915 250 Hz during scan.
  */
 #ifndef SIW917_ELRS_SKIP_FAST_SF5_900_SCAN
-#define SIW917_ELRS_SKIP_FAST_SF5_900_SCAN SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define SIW917_ELRS_SKIP_FAST_SF5_900_SCAN 0
+#endif
+
+#ifndef SIW917_ELRS_SKIP_900_200HZ_FULL_SCAN
+#define SIW917_ELRS_SKIP_900_200HZ_FULL_SCAN 0
+#endif
+
+/*
+ * 200 Hz Full on 900 MHz has a 5 ms RF interval with a long full-res packet.
+ * Keep this as an emergency SiW917-only guardrail while timing is being
+ * hardened. The upstream-equivalent default is 2, which does not clamp a TX
+ * request for 1:2 telemetry.
+ */
+#ifndef SIW917_ELRS_MIN_TLM_DENOM_200HZ_FULL_GEMINI
+#define SIW917_ELRS_MIN_TLM_DENOM_200HZ_FULL_GEMINI 2
+#endif
+
+/*
+ * Matched TX power changes are not protocol-critical on every telemetry slot,
+ * but committing them costs extra LR1121 commands. In the tightest SiW917 case
+ * (900 MHz 200 Hz Full + Gemini + 1:2 telemetry), defer those commits until the
+ * link moves to a less timing-sensitive mode.
+ */
+#ifndef SIW917_ELRS_DEFER_PWR_COMMIT_200HZ_FULL_GEMINI
+#define SIW917_ELRS_DEFER_PWR_COMMIT_200HZ_FULL_GEMINI 1
+#endif
+
+#ifndef SIW917_ELRS_LOG_CONNECTED_PWR_UPDATES
+#define SIW917_ELRS_LOG_CONNECTED_PWR_UPDATES 0
 #endif
 
 /*
@@ -88,6 +117,21 @@
 /* Boot/init timer logs are useful for bring-up, but not for timing runs. */
 #ifndef SIW917_ELRS_TIMER_VERBOSE_INIT
 #define SIW917_ELRS_TIMER_VERBOSE_INIT (!SIW917_ELRS_TIMING_LEAN)
+#endif
+
+/* Full LR1121/TCXO bring-up traces are useful only when debugging radio init. */
+#ifndef SIW917_ELRS_RADIO_INIT_VERBOSE
+#define SIW917_ELRS_RADIO_INIT_VERBOSE 0
+#endif
+
+/* Radio2 pin-probe dumps are boot-only validation noise after wiring is proven. */
+#ifndef SIW917_ELRS_RADIO2_GPIO_PROBE_DIAG
+#define SIW917_ELRS_RADIO2_GPIO_PROBE_DIAG SIW917_ELRS_RADIO_INIT_VERBOSE
+#endif
+
+/* DIO init/vector details are useful during IRQ bring-up, not normal RF tests. */
+#ifndef SIW917_ELRS_DIO_INIT_VERBOSE
+#define SIW917_ELRS_DIO_INIT_VERBOSE SIW917_ELRS_RADIO_INIT_VERBOSE
 #endif
 
 /*
@@ -178,12 +222,20 @@
 #endif
 
 /*
- * RF-only bring-up profile: do not initialize the flight-controller UART at
- * all. Handset Lua/config telemetry still goes over OTA, but this board is not
- * wired to an FC during Gemini/diversity testing, so USART0 should stay quiet.
+ * Flight-controller CRSF serial path. Upstream RX targets expose RC/link-stats
+ * output and accept FC telemetry back into the OTA downlink. Set this to 1 only
+ * for RF-only timing tests where USART0 should stay completely quiet.
  */
 #ifndef SIW917_ELRS_DISABLE_CRSF_SERIAL
-#define SIW917_ELRS_DISABLE_CRSF_SERIAL 1
+#define SIW917_ELRS_DISABLE_CRSF_SERIAL 0
+#endif
+
+/*
+ * Parse CRSF frames received from the FC UART and enqueue them into the same
+ * OTA telemetry path as RX Lua/device-management responses.
+ */
+#ifndef SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
+#define SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY (!SIW917_ELRS_DISABLE_CRSF_SERIAL)
 #endif
 
 /*
@@ -218,6 +270,60 @@
 #endif
 
 /*
+ * High-rate safety margin trims. These counters/timestamps were useful while
+ * bringing up DIO and CRC timing, but K1000-class modes pay for every volatile
+ * write and timestamp read. Keep them compiled out in the lean timing build;
+ * re-enable only when actively diagnosing that specific path.
+ */
+#ifndef SIW917_ELRS_DIO_EDGE_TIMESTAMPS
+#define SIW917_ELRS_DIO_EDGE_TIMESTAMPS                                       \
+  (SIW917_ELRS_HOTPATH_TIMING_DIAG || SIW917_ELRS_DIO_PFD_TIMESTAMP)
+#endif
+
+#ifndef SIW917_ELRS_DIO_STATS_DIAG
+#define SIW917_ELRS_DIO_STATS_DIAG (!SIW917_ELRS_TIMING_TEST_BUILD)
+#endif
+
+#ifndef SIW917_ELRS_ISR_STATS_DIAG
+#define SIW917_ELRS_ISR_STATS_DIAG (!SIW917_ELRS_TIMING_TEST_BUILD)
+#endif
+
+#ifndef SIW917_ELRS_PACKET_STATS_DIAG
+#define SIW917_ELRS_PACKET_STATS_DIAG (!SIW917_ELRS_TIMING_TEST_BUILD)
+#endif
+
+#ifndef SIW917_ELRS_RAW_GSPI_STATS_DIAG
+#define SIW917_ELRS_RAW_GSPI_STATS_DIAG (!SIW917_ELRS_TIMING_TEST_BUILD)
+#endif
+
+#ifndef SIW917_ELRS_DIRECT_DIO_HAL_IO
+#define SIW917_ELRS_DIRECT_DIO_HAL_IO SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
+ * More GSPI hot-path trimming. These keep the LR1121 command order unchanged
+ * but remove small per-command costs that matter at 250 Hz/K1000: repeated
+ * pin-register address calculation, an unconditional micros() read when BUSY
+ * is already low, pre-filling response buffers, and staging hot command params
+ * through a temporary tx array.
+ */
+#ifndef SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+#define SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS SIW917_ELRS_TIMING_LEAN
+#endif
+
+#ifndef SIW917_ELRS_FAST_BUSY_READ_FIRST
+#define SIW917_ELRS_FAST_BUSY_READ_FIRST SIW917_ELRS_TIMING_LEAN
+#endif
+
+#ifndef SIW917_ELRS_FAST_GSPI_SKIP_RESPONSE_PREFILL
+#define SIW917_ELRS_FAST_GSPI_SKIP_RESPONSE_PREFILL SIW917_ELRS_TIMING_LEAN
+#endif
+
+#ifndef SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
+#define SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
  * Low-rate Lua/downlink progress trace. This runs from the ELRS task only, not
  * from RF IRQ context, so it should not disturb the timer/DIO hot path while we
  * diagnose long Lua parameter downloads.
@@ -244,12 +350,11 @@
 #endif
 
 /*
- * Disconnected scan diagnostics. These print from task context only while the
- * receiver is not connected, so they help distinguish "no RF IRQs" from
- * "packets received but CRC rejected" without adding connected hot-path load.
+ * Disconnected scan diagnostics. Leave off for normal testing; scan mode can
+ * print rapidly and the serial load can obscure the RF timing picture.
  */
 #ifndef SIW917_ELRS_DISCONNECTED_SCAN_DIAG
-#define SIW917_ELRS_DISCONNECTED_SCAN_DIAG SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define SIW917_ELRS_DISCONNECTED_SCAN_DIAG 0
 #endif
 
 /*

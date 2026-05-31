@@ -10,8 +10,8 @@
  *
  * Configuration for ELRS WiFi OTA testing:
  * - AP Mode with static IP
- * - SSID: ELRS_TEST_AP
- * - IP: 192.168.10.10
+ * - SSID: ExpressLRS RX
+ * - IP: 10.0.0.1
  *
  ******************************************************************************/
 
@@ -56,23 +56,23 @@
  * WiFi Access Point Configuration
  ******************************************************************************/
 #ifndef DEFAULT_WIFI_AP_PROFILE_SSID
-#define DEFAULT_WIFI_AP_PROFILE_SSID "ELRS_TEST_AP"
+#define DEFAULT_WIFI_AP_PROFILE_SSID "ExpressLRS RX"
 #endif
 
 #ifndef DEFAULT_WIFI_AP_CREDENTIAL
-#define DEFAULT_WIFI_AP_CREDENTIAL "elrs1234"
+#define DEFAULT_WIFI_AP_CREDENTIAL "expresslrs"
 #endif
 
 /*******************************************************************************
  * IP Address Configuration
  *
  * Note: IP addresses are in little-endian format
- * 0x0A0AA8C0 = 192.168.10.10 (C0=192, A8=168, 0A=10, 0A=10)
+ * 0x0100000A = 10.0.0.1 (0A=10, 00=0, 00=0, 01=1)
  ******************************************************************************/
 
-/* IP address: 192.168.10.10 */
+/* IP address: 10.0.0.1 */
 #ifndef DEFAULT_WIFI_MODULE_IP_ADDRESS
-#define DEFAULT_WIFI_MODULE_IP_ADDRESS 0x0A0AA8C0
+#define DEFAULT_WIFI_MODULE_IP_ADDRESS 0x0100000A
 #endif
 
 /* Subnet mask: 255.255.255.0 */
@@ -80,9 +80,9 @@
 #define DEFAULT_WIFI_SN_MASK_ADDRESS 0x00FFFFFF
 #endif
 
-/* Gateway: 192.168.10.10 (self in AP mode) */
+/* Gateway: 10.0.0.1 (self in AP mode) */
 #ifndef DEFAULT_WIFI_GATEWAY_ADDRESS
-#define DEFAULT_WIFI_GATEWAY_ADDRESS 0x0A0AA8C0
+#define DEFAULT_WIFI_GATEWAY_ADDRESS 0x0100000A
 #endif
 
 /*******************************************************************************

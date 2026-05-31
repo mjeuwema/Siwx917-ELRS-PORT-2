@@ -107,8 +107,8 @@ static const elrs_config_t DEFAULT_CONFIG = {
   .rate_index       = 17,   /* 50Hz rate (RATE_LORA_2G4_50HZ) */
   
   /* WiFi defaults */
-  .wifi_ssid        = "ELRS_TEST_AP",
-  .wifi_password    = "elrs1234",
+  .wifi_ssid        = "",
+  .wifi_password    = "",
   .wifi_channel     = 6,
 
   /* RX Lua / CRSF parameter defaults */
@@ -154,7 +154,8 @@ static uint16_t calc_crc16(const uint8_t* data, size_t len)
 static bool validate_config(const elrs_config_t* config)
 {
   /* Check version */
-  if (config->version != ELRS_CONFIG_VERSION) {
+  if (config->version != ELRS_CONFIG_VERSION &&
+      config->version != ELRS_CONFIG_PREVIOUS_VERSION) {
     DEBUGOUT("[Config] Version mismatch: stored=%d, expected=%d\n",
              config->version, ELRS_CONFIG_VERSION);
     return false;
@@ -196,14 +197,77 @@ static bool config_uid_is_bound(const uint8_t uid[6])
   return false;
 }
 
+bool elrs_serial_protocol_is_supported(uint8_t protocol)
+{
+  return protocol == ELRS_SERIAL_CRSF ||
+         protocol == ELRS_SERIAL_SBUS ||
+         protocol == ELRS_SERIAL_SUMD ||
+         protocol == ELRS_SERIAL_MAVLINK;
+}
+
+uint8_t elrs_serial_protocol_to_lua_selection(uint8_t protocol)
+{
+  switch (protocol) {
+  case ELRS_SERIAL_SBUS:
+    return ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SBUS;
+  case ELRS_SERIAL_SUMD:
+    return ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SUMD;
+  case ELRS_SERIAL_MAVLINK:
+    return ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK;
+  case ELRS_SERIAL_CRSF:
+  default:
+    return ELRS_SERIAL_PROTOCOL_LUA_SELECTION_CRSF;
+  }
+}
+
+uint8_t elrs_serial_protocol_from_lua_selection(uint8_t selection)
+{
+  switch (selection) {
+  case ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SBUS:
+    return ELRS_SERIAL_SBUS;
+  case ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SUMD:
+    return ELRS_SERIAL_SUMD;
+  case ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK:
+    return ELRS_SERIAL_MAVLINK;
+  case ELRS_SERIAL_PROTOCOL_LUA_SELECTION_CRSF:
+  default:
+    return ELRS_SERIAL_CRSF;
+  }
+}
+
+static bool migrate_config_fields(elrs_config_t* config)
+{
+  if (config == NULL || config->version == ELRS_CONFIG_VERSION) {
+    return false;
+  }
+
+  if (config->version == ELRS_CONFIG_PREVIOUS_VERSION) {
+    /* v16 exposed force_tlm but did not enforce it. Clear the old bit before
+     * v17 starts treating it as upstream "force telemetry off".
+     */
+    config->force_tlm = 0;
+  }
+
+  config->version = ELRS_CONFIG_VERSION;
+  return true;
+}
+
 static void normalize_config_fields(elrs_config_t* config)
 {
   if (config == NULL) {
     return;
   }
 
-  if (config->serial_protocol > ELRS_SERIAL_GPS) {
+  if (!elrs_serial_protocol_is_supported(config->serial_protocol)) {
     config->serial_protocol = ELRS_SERIAL_CRSF;
+  }
+  if ((strcmp(config->wifi_ssid, "ELRS_TEST_AP") == 0 &&
+       strcmp(config->wifi_password, "elrs1234") == 0) ||
+      (strcmp(config->wifi_ssid, "ExpressLRS RX") == 0 &&
+       strcmp(config->wifi_password, "expresslrs") == 0)) {
+    memset(config->wifi_ssid, 0, sizeof(config->wifi_ssid));
+    memset(config->wifi_password, 0, sizeof(config->wifi_password));
+    config->flags &= (uint8_t)~ELRS_CONFIG_FLAG_WIFI_CUSTOM;
   }
   if (config->failsafe_mode > ELRS_FAILSAFE_SET) {
     config->failsafe_mode = ELRS_FAILSAFE_NO_PULSES;
@@ -362,8 +426,14 @@ int elrs_config_init(void)
    * Step 5: Use loaded configuration - SUCCESS!
   **************************************************************************/
   memcpy(&g_config, &loaded_config, sizeof(g_config));
+  bool migrated = migrate_config_fields(&g_config);
   normalize_config_fields(&g_config);
   g_initialized = true;
+
+  if (migrated) {
+    DEBUGOUT("[Config] Migrated configuration to version %d\n", ELRS_CONFIG_VERSION);
+    (void)elrs_config_save();
+  }
   
   DEBUGOUT("[Config] Successfully loaded configuration from NVM3!\n");
   elrs_config_print();
@@ -574,6 +644,146 @@ int elrs_config_set_wifi(const char* ssid, const char* password, uint8_t channel
   return 0;
 }
 
+#define ELRS_RESERVED_LOCK_ON_FIRST_OFFSET 0U
+#define ELRS_RESERVED_UART_BAUD_OFFSET     1U
+#define ELRS_RESERVED_IS_AIRPORT_OFFSET    5U
+#define ELRS_RESERVED_DJI_ARMED_OFFSET     6U
+#define ELRS_RESERVED_WIFI_INTERVAL_OFFSET 7U
+
+static uint32_t config_read_reserved_u32(uint8_t offset)
+{
+  return ((uint32_t)g_config.reserved[offset]) |
+         ((uint32_t)g_config.reserved[offset + 1] << 8) |
+         ((uint32_t)g_config.reserved[offset + 2] << 16) |
+         ((uint32_t)g_config.reserved[offset + 3] << 24);
+}
+
+static void config_write_reserved_u32(uint8_t offset, uint32_t value)
+{
+  g_config.reserved[offset]     = (uint8_t)(value & 0xFFU);
+  g_config.reserved[offset + 1] = (uint8_t)((value >> 8) & 0xFFU);
+  g_config.reserved[offset + 2] = (uint8_t)((value >> 16) & 0xFFU);
+  g_config.reserved[offset + 3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+
+uint8_t elrs_config_get_web_domain(void)
+{
+  switch (g_config.reg_domain_low) {
+    case ELRS_DOMAIN_AU_915:  return 0;
+    case ELRS_DOMAIN_FCC_915: return 1;
+    case ELRS_DOMAIN_EU_868:  return 2;
+    case ELRS_DOMAIN_IN_866:  return 3;
+    case ELRS_DOMAIN_AU_433:  return 4;
+    case ELRS_DOMAIN_EU_433:  return 5;
+    default:                  return 1;
+  }
+}
+
+void elrs_config_set_web_domain(uint8_t domain)
+{
+  switch (domain) {
+    case 0: g_config.reg_domain_low = ELRS_DOMAIN_AU_915;  break;
+    case 1: g_config.reg_domain_low = ELRS_DOMAIN_FCC_915; break;
+    case 2: g_config.reg_domain_low = ELRS_DOMAIN_EU_868;  break;
+    case 3: g_config.reg_domain_low = ELRS_DOMAIN_IN_866;  break;
+    case 4: g_config.reg_domain_low = ELRS_DOMAIN_AU_433;  break;
+    case 5: g_config.reg_domain_low = ELRS_DOMAIN_EU_433;  break;
+    default:
+      DEBUGOUT("[Config] WARNING: Unsupported WebUI domain %u, keeping current\n", domain);
+      break;
+  }
+}
+
+bool elrs_config_get_lock_on_first_connection(void)
+{
+  return g_config.reserved[ELRS_RESERVED_LOCK_ON_FIRST_OFFSET] != 1U;
+}
+
+void elrs_config_set_lock_on_first_connection(bool enabled)
+{
+  /* 0 keeps old NVM records on upstream's default true; 1=false, 2=true. */
+  g_config.reserved[ELRS_RESERVED_LOCK_ON_FIRST_OFFSET] = enabled ? 2U : 1U;
+}
+
+uint32_t elrs_config_get_uart_baud(void)
+{
+  uint32_t baud = config_read_reserved_u32(ELRS_RESERVED_UART_BAUD_OFFSET);
+  if (baud < 9600U || baud > 2000000U) {
+    return 420000U;
+  }
+  return baud;
+}
+
+void elrs_config_set_uart_baud(uint32_t baud)
+{
+  if (baud < 9600U || baud > 2000000U) {
+    DEBUGOUT("[Config] WARNING: Ignoring invalid UART baud %lu\n", (unsigned long)baud);
+    return;
+  }
+  config_write_reserved_u32(ELRS_RESERVED_UART_BAUD_OFFSET, baud);
+}
+
+int32_t elrs_config_get_wifi_on_interval(void)
+{
+  uint32_t interval = config_read_reserved_u32(ELRS_RESERVED_WIFI_INTERVAL_OFFSET);
+  if (interval == 0U) {
+    return 60;
+  }
+  if (interval == 0xFFFFFFFFU) {
+    return -1;
+  }
+  if (interval > 86400U) {
+    return 60;
+  }
+  return (int32_t)interval;
+}
+
+void elrs_config_set_wifi_on_interval(int32_t interval_seconds)
+{
+  if (interval_seconds < 0) {
+    config_write_reserved_u32(ELRS_RESERVED_WIFI_INTERVAL_OFFSET, 0xFFFFFFFFU);
+    return;
+  }
+  if (interval_seconds > 86400) {
+    DEBUGOUT("[Config] WARNING: Ignoring invalid WiFi interval %ld\n",
+             (long)interval_seconds);
+    return;
+  }
+  config_write_reserved_u32(ELRS_RESERVED_WIFI_INTERVAL_OFFSET,
+                            (uint32_t)interval_seconds);
+}
+
+bool elrs_config_get_is_airport(void)
+{
+  return g_config.reserved[ELRS_RESERVED_IS_AIRPORT_OFFSET] != 0U;
+}
+
+void elrs_config_set_is_airport(bool enabled)
+{
+  g_config.reserved[ELRS_RESERVED_IS_AIRPORT_OFFSET] = enabled ? 1U : 0U;
+}
+
+bool elrs_config_get_dji_permanently_armed(void)
+{
+  return g_config.reserved[ELRS_RESERVED_DJI_ARMED_OFFSET] != 0U;
+}
+
+void elrs_config_set_dji_permanently_armed(bool enabled)
+{
+  g_config.reserved[ELRS_RESERVED_DJI_ARMED_OFFSET] = enabled ? 1U : 0U;
+}
+
+bool elrs_config_web_options_customised(void)
+{
+  return (elrs_config_get_web_domain() != 1U) ||
+         !elrs_config_get_lock_on_first_connection() ||
+         (elrs_config_get_uart_baud() != 420000U) ||
+         (elrs_config_get_wifi_on_interval() != 60) ||
+         elrs_config_get_is_airport() ||
+         elrs_config_get_dji_permanently_armed() ||
+         ((g_config.flags & ELRS_CONFIG_FLAG_WIFI_CUSTOM) != 0U);
+}
+
 int elrs_config_to_json(char* buffer, size_t buffer_size)
 {
   if (buffer == NULL || buffer_size < 512) {
@@ -595,6 +805,7 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
       "\"config\":{"
         "\"uid\":[%u,%u,%u,%u,%u,%u],"
         "\"serial-protocol\":%u,"
+        "\"serial1-protocol\":0,"
         "\"sbus-failsafe\":%u,"
         "\"modelid\":%u,"
         "\"force-tlm\":%s,"
@@ -609,9 +820,11 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
         "\"product_name\":\"ELRS SiWx917 LR1121 RX\","
         "\"lua_name\":\"SiWx917 RX\","
         "\"uidtype\":\"%s\","
-        "\"ssid\":\"%s\","
+        "\"ssid\":\"ExpressLRS RX\","
         "\"mode\":\"AP\","
         "\"custom_hardware\":false,"
+        "\"has_serial_pins\":true,"
+        "\"wifi_dbm\":0,"
         "\"target\":\"SIWG917Y_LR1121\","
         "\"version\":\"4.0.0-SiWx917\","
         "\"git-commit\":\"siwx917\","
@@ -644,7 +857,6 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
     cfg->bind_storage,
     cfg->vbind,
     elrs_config_is_bound() ? "Bound" : "Not Bound",
-    cfg->wifi_ssid,
     (cfg->reg_domain_low == ELRS_DOMAIN_FCC_915) ? "FCC_915" : "EU_868",
     (cfg->reg_domain_high == ELRS_DOMAIN_ISM_2400) ? "ISM_2400" : "CE_2400",
     (long)g_nvm3_debug_status,
@@ -921,7 +1133,7 @@ void elrs_config_print(void)
   DEBUGOUT("  Serial:     %d\n", cfg->serial_protocol);
   DEBUGOUT("  Failsafe:   %d\n", cfg->failsafe_mode);
   DEBUGOUT("  Model ID:   %d\n", cfg->model_id);
-  DEBUGOUT("  Force TLM:  %d\n", cfg->force_tlm);
+  DEBUGOUT("  TLM Off:    %d\n", cfg->force_tlm);
   DEBUGOUT("  MAVLink:    target=%d, source=%d\n",
            cfg->mavlink_target_sys_id, cfg->mavlink_source_sys_id);
   DEBUGOUT("  Team Race:  ch=%d, pos=%d\n",

@@ -43,6 +43,18 @@
 
 extern uint32_t micros(void);
 
+#if SIW917_ELRS_RADIO2_GPIO_PROBE_DIAG
+#define LR1121_RADIO2_PROBE_LOG(...) DEBUGOUT(__VA_ARGS__)
+#else
+#define LR1121_RADIO2_PROBE_LOG(...) do { } while (0)
+#endif
+
+#if SIW917_ELRS_DIO_INIT_VERBOSE
+#define LR1121_DIO_INIT_LOG(...) DEBUGOUT(__VA_ARGS__)
+#else
+#define LR1121_DIO_INIT_LOG(...) do { } while (0)
+#endif
+
 /* SDK GPIO driver for UULP GPIO interrupt support */
 #include "sl_gpio_board.h"
 #include "sl_si91x_driver_gpio.h"
@@ -270,6 +282,8 @@ extern uint32_t micros(void);
  */
 #define EGPIO_BIT_LOAD_REG(pin)                                                \
   (*(volatile uint32_t *)(EGPIO_BASE + 0x004 + (0x10 * (pin))))
+#define EGPIO_BIT_LOAD_PTR(pin)                                                \
+  ((volatile uint32_t *)(EGPIO_BASE + 0x004 + (0x10 * (pin))))
 
 /* PORT 1 registers for GPIO_25-30
  * Port 1 base offset = 0x1000 + (0x40 * 1) = 0x1040
@@ -450,31 +464,34 @@ void lr1121_select_radio(uint8_t radio_mask) {
 uint8_t lr1121_get_selected_radio(void) { return selected_radio; }
 
 void lr1121_debug_dump_radio_pins(const char *label) {
-  DEBUGOUT("LR1121 GPIO diag%s%s: selected=%u SCK=%lu MOSI=%lu MISO=%lu "
-           "NSS1=%lu BUSY1=%lu RST1=%lu",
-           label ? " " : "", label ? label : "", (unsigned)selected_radio,
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
+  (void)label;
+  LR1121_RADIO2_PROBE_LOG(
+      "LR1121 GPIO diag%s%s: selected=%u SCK=%lu MOSI=%lu MISO=%lu "
+      "NSS1=%lu BUSY1=%lu RST1=%lu",
+      label ? " " : "", label ? label : "", (unsigned)selected_radio,
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_SCK),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_MOSI),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_MISO),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_RST));
 #if LR1121_HAS_RADIO2
-  DEBUGOUT(" NSS2=%lu BUSY2=%lu RST2=%lu DIO9_2=%lu\n",
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_DIO_2));
-  DEBUGOUT("LR1121 GPIO diag regs: CFG49=0x%08lX CFG50=0x%08lX "
-           "CFG51=0x%08lX PAD49=0x%08lX PAD50=0x%08lX PAD51=0x%08lX\n",
-           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST_2),
-           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS_2),
-           (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY_2),
-           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_RST_2),
-           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_NSS_2),
-           (unsigned long)PAD_CONFIG_REG(LR1121_PIN_BUSY_2));
+  LR1121_RADIO2_PROBE_LOG(" NSS2=%lu BUSY2=%lu RST2=%lu DIO9_2=%lu\n",
+                          (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2),
+                          (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2),
+                          (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
+                          (unsigned long)HP_GPIO_READ(LR1121_PIN_DIO_2));
+  LR1121_RADIO2_PROBE_LOG(
+      "LR1121 GPIO diag regs: CFG49=0x%08lX CFG50=0x%08lX "
+      "CFG51=0x%08lX PAD49=0x%08lX PAD50=0x%08lX PAD51=0x%08lX\n",
+      (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_RST_2),
+      (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_NSS_2),
+      (unsigned long)EGPIO_GPIO_CONFIG_REG(LR1121_PIN_BUSY_2),
+      (unsigned long)PAD_CONFIG_REG(LR1121_PIN_RST_2),
+      (unsigned long)PAD_CONFIG_REG(LR1121_PIN_NSS_2),
+      (unsigned long)PAD_CONFIG_REG(LR1121_PIN_BUSY_2));
 #else
-  DEBUGOUT("\n");
+  LR1121_RADIO2_PROBE_LOG("\n");
 #endif
 }
 
@@ -483,7 +500,7 @@ bool lr1121_debug_exercise_radio2_pins(void) {
   const uint8_t saved_radio = selected_radio;
   bool pins_ok = false;
 
-  DEBUGOUT("LR1121 Radio2 GPIO exercise begin\n");
+  LR1121_RADIO2_PROBE_LOG("LR1121 Radio2 GPIO exercise begin\n");
   deassert_all_radio_nss();
   HP_GPIO_SET_HIGH(LR1121_PIN_RST_2);
   delay_us(10);
@@ -491,25 +508,27 @@ bool lr1121_debug_exercise_radio2_pins(void) {
 
   HP_GPIO_SET_LOW(LR1121_PIN_NSS_2);
   delay_us(10);
-  DEBUGOUT("LR1121 Radio2 NSS2 low readback=%lu\n",
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2));
+  LR1121_RADIO2_PROBE_LOG("LR1121 Radio2 NSS2 low readback=%lu\n",
+                          (unsigned long)HP_GPIO_READ(LR1121_PIN_NSS_2));
   HP_GPIO_SET_HIGH(LR1121_PIN_NSS_2);
   delay_us(10);
   const uint32_t nss2_high = HP_GPIO_READ(LR1121_PIN_NSS_2);
-  DEBUGOUT("LR1121 Radio2 NSS2 high readback=%lu\n",
-           (unsigned long)nss2_high);
+  LR1121_RADIO2_PROBE_LOG("LR1121 Radio2 NSS2 high readback=%lu\n",
+                          (unsigned long)nss2_high);
 
   HP_GPIO_SET_LOW(LR1121_PIN_RST_2);
   delay_us(100);
-  DEBUGOUT("LR1121 Radio2 RST2 low readback=%lu BUSY2=%lu\n",
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
+  LR1121_RADIO2_PROBE_LOG(
+      "LR1121 Radio2 RST2 low readback=%lu BUSY2=%lu\n",
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_RST_2),
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
   HP_GPIO_SET_HIGH(LR1121_PIN_RST_2);
   delay_ms(5);
   const uint32_t rst2_high = HP_GPIO_READ(LR1121_PIN_RST_2);
-  DEBUGOUT("LR1121 Radio2 RST2 high readback=%lu BUSY2=%lu\n",
-           (unsigned long)rst2_high,
-           (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
+  LR1121_RADIO2_PROBE_LOG(
+      "LR1121 Radio2 RST2 high readback=%lu BUSY2=%lu\n",
+      (unsigned long)rst2_high,
+      (unsigned long)HP_GPIO_READ(LR1121_PIN_BUSY_2));
 
   lr1121_debug_dump_radio_pins("r2-after-exercise");
   pins_ok = (nss2_high != 0U) && (rst2_high != 0U);
@@ -520,7 +539,8 @@ bool lr1121_debug_exercise_radio2_pins(void) {
   lr1121_select_radio(saved_radio);
   return pins_ok;
 #else
-  DEBUGOUT("LR1121 Radio2 GPIO exercise skipped (no Radio2 pins compiled)\n");
+  LR1121_RADIO2_PROBE_LOG(
+      "LR1121 Radio2 GPIO exercise skipped (no Radio2 pins compiled)\n");
   return false;
 #endif
 }
@@ -535,6 +555,26 @@ static inline uint8_t selected_busy_pin(void) {
   return (selected_radio == LR1121_RADIO_2 && radio2_available())
              ? (uint8_t)LR1121_PIN_BUSY_2
              : (uint8_t)LR1121_PIN_BUSY;
+}
+
+static inline volatile uint32_t *selected_nss_reg(void) {
+#if LR1121_HAS_RADIO2
+  return (selected_radio == LR1121_RADIO_2 && radio2_available())
+             ? EGPIO_BIT_LOAD_PTR(LR1121_PIN_NSS_2)
+             : EGPIO_BIT_LOAD_PTR(LR1121_PIN_NSS);
+#else
+  return EGPIO_BIT_LOAD_PTR(LR1121_PIN_NSS);
+#endif
+}
+
+static inline volatile uint32_t *selected_busy_reg(void) {
+#if LR1121_HAS_RADIO2
+  return (selected_radio == LR1121_RADIO_2 && radio2_available())
+             ? EGPIO_BIT_LOAD_PTR(LR1121_PIN_BUSY_2)
+             : EGPIO_BIT_LOAD_PTR(LR1121_PIN_BUSY);
+#else
+  return EGPIO_BIT_LOAD_PTR(LR1121_PIN_BUSY);
+#endif
 }
 
 static inline uint8_t selected_rst_pin(void) {
@@ -827,6 +867,12 @@ static volatile uint32_t lr1121_raw_gspi_max_us = 0;
 static volatile uint32_t lr1121_raw_gspi_count = 0;
 static volatile uint32_t lr1121_raw_gspi_fail_count = 0;
 
+#if SIW917_ELRS_RAW_GSPI_STATS_DIAG
+#define LR1121_RAW_GSPI_STAT_INC(var_) ((var_)++)
+#else
+#define LR1121_RAW_GSPI_STAT_INC(var_) do { } while (0)
+#endif
+
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
 static inline void lr1121_diag_update_max(volatile uint32_t *max_value,
                                           uint32_t value) {
@@ -852,12 +898,17 @@ enum {
 };
 
 static inline void lr1121_busy_fast_record(uint32_t iterations, bool ready) {
+#if SIW917_ELRS_RAW_GSPI_STATS_DIAG
   if (iterations > lr1121_busy_fast_max_iterations) {
     lr1121_busy_fast_max_iterations = iterations;
   }
   if (!ready) {
     lr1121_busy_fast_fail_count++;
   }
+#else
+  (void)iterations;
+  (void)ready;
+#endif
 }
 
 static inline uint32_t lr1121_fast_busy_timeout_us(uint16_t opcode) {
@@ -866,6 +917,9 @@ static inline uint32_t lr1121_fast_busy_timeout_us(uint16_t opcode) {
 }
 
 static inline int read_busy_pin(void) {
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  return (int)(*selected_busy_reg() & 1U);
+#else
   const uint8_t busy_pin = selected_busy_pin();
 #if SIW917_ELRS_BUSY_PORT_READ
   if (busy_pin == LR1121_PIN_BUSY) {
@@ -874,6 +928,36 @@ static inline int read_busy_pin(void) {
 #else
 #endif
   return (int)HP_GPIO_READ(busy_pin);
+#endif
+}
+
+static inline bool lr1121_wait_busy_fast_timeout(uint32_t timeout_us) {
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  volatile uint32_t *const busy_reg = selected_busy_reg();
+#define LR1121_FAST_BUSY_READ() ((*busy_reg) & 1U)
+#else
+#define LR1121_FAST_BUSY_READ() ((uint32_t)read_busy_pin())
+#endif
+
+#if SIW917_ELRS_FAST_BUSY_READ_FIRST
+  if (LR1121_FAST_BUSY_READ() == 0U) {
+    lr1121_busy_fast_record(0U, true);
+    return true;
+  }
+#endif
+
+  const uint32_t busy_start_us = micros();
+  uint32_t busy_iterations = 0U;
+  while (LR1121_FAST_BUSY_READ() != 0U &&
+         (uint32_t)(micros() - busy_start_us) <= timeout_us) {
+    busy_iterations++;
+    __asm volatile("nop");
+  }
+
+  const bool busy_ready = LR1121_FAST_BUSY_READ() == 0U;
+  lr1121_busy_fast_record(busy_iterations, busy_ready);
+#undef LR1121_FAST_BUSY_READ
+  return busy_ready;
 }
 
 /**
@@ -951,7 +1035,7 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
   }
 
   if (!wait_gspi_idle_timeout(100000U)) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1053,7 +1137,7 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
   lr1121_exit_critical(primask);
 
   if (log_raw_timeout) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
     static uint32_t raw_timeout_count = 0;
     if (raw_timeout_count < 16) {
       raw_timeout_count++;
@@ -1066,7 +1150,7 @@ static bool spi_transfer_raw_gspi(const uint8_t *tx_data, uint8_t *rx_data,
     }
   }
 
-  lr1121_raw_gspi_count++;
+  LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1100,18 +1184,10 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
     *irq_status = 0U;
   }
 
-  const uint32_t busy_start_us = micros();
-  uint32_t busy_iterations = 0U;
-  while (read_busy_pin() != 0 &&
-         (uint32_t)(micros() - busy_start_us) <= SIW917_ELRS_BUSY_FAST_US) {
-    busy_iterations++;
-    __asm volatile("nop");
-  }
-
-  const bool busy_ready = read_busy_pin() == 0;
-  lr1121_busy_fast_record(busy_iterations, busy_ready);
+  const bool busy_ready =
+      lr1121_wait_busy_fast_timeout(SIW917_ELRS_BUSY_FAST_US);
   if (!busy_ready && !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1119,7 +1195,7 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1148,7 +1224,12 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  volatile uint32_t *const nss_reg = selected_nss_reg();
+  *nss_reg = 0U;
+#else
   HP_GPIO_SET_LOW(selected_nss_pin());
+#endif
   __asm volatile("nop");
 
   bool ok = true;
@@ -1189,7 +1270,11 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
   }
 
   __asm volatile("nop");
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  *nss_reg = 1U;
+#else
   HP_GPIO_SET_HIGH(selected_nss_pin());
+#endif
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1207,12 +1292,12 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
   }
   lr1121_exit_critical(primask);
 
-  lr1121_raw_gspi_count++;
+  LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
   if (!ok) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
   }
 
   if (!ok) {
@@ -1235,37 +1320,36 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
+#if !SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
   enum { LR1121_FAST_COMMAND_MAX = 64 };
   uint8_t tx[LR1121_FAST_COMMAND_MAX];
+#endif
   const uint16_t total_len = (uint16_t)(2U + param_len);
 
+#if SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
+  if (param_len > 62U || (param_len > 0U && params == NULL)) {
+#else
   if (total_len > sizeof(tx) || (param_len > 0U && params == NULL)) {
-    lr1121_raw_gspi_fail_count++;
+#endif
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
     return false;
   }
 
+#if !SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
   tx[0] = (uint8_t)(opcode >> 8);
   tx[1] = (uint8_t)opcode;
   if (param_len > 0U) {
     memcpy(&tx[2], params, param_len);
   }
+#endif
 
   const uint32_t busy_timeout_us = lr1121_fast_busy_timeout_us(opcode);
-  const uint32_t busy_start_us = micros();
-  uint32_t busy_iterations = 0U;
-  while (read_busy_pin() != 0 &&
-         (uint32_t)(micros() - busy_start_us) <= busy_timeout_us) {
-    busy_iterations++;
-    __asm volatile("nop");
-  }
-
-  const bool busy_ready = read_busy_pin() == 0;
-  lr1121_busy_fast_record(busy_iterations, busy_ready);
+  const bool busy_ready = lr1121_wait_busy_fast_timeout(busy_timeout_us);
   if (!busy_ready && !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1273,7 +1357,7 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1302,7 +1386,12 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  volatile uint32_t *const nss_reg = selected_nss_reg();
+  *nss_reg = 0U;
+#else
   HP_GPIO_SET_LOW(selected_nss_pin());
+#endif
   __asm volatile("nop");
 
   bool ok = true;
@@ -1316,7 +1405,14 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
       break;
     }
 
+#if SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
+    const uint8_t tx_byte =
+        (i == 0U) ? (uint8_t)(opcode >> 8)
+                  : ((i == 1U) ? (uint8_t)opcode : params[i - 2U]);
+    gspi_fifo_write8(tx_byte);
+#else
     gspi_fifo_write8(tx[i]);
+#endif
 
     timeout = 10000U;
     while ((GSPI_STATUS_REG & GSPI_STATUS_BUSY) != 0U && timeout-- > 0U) {
@@ -1340,7 +1436,11 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
 
   __asm volatile("nop");
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  *nss_reg = 1U;
+#else
   HP_GPIO_SET_HIGH(selected_nss_pin());
+#endif
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1358,12 +1458,12 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
   lr1121_exit_critical(primask);
 
-  lr1121_raw_gspi_count++;
+  LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
   if (!ok) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
   }
 
   return ok;
@@ -1379,27 +1479,21 @@ static bool lr1121_read_response_fast(uint8_t *response,
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
   if (response == NULL || response_len == 0U || response_len > 64U) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
     return false;
   }
 
+#if !SIW917_ELRS_FAST_GSPI_SKIP_RESPONSE_PREFILL
   memset(response, 0xBB, response_len);
+#endif
 
-  const uint32_t busy_start_us = micros();
-  uint32_t busy_iterations = 0U;
-  while (read_busy_pin() != 0 &&
-         (uint32_t)(micros() - busy_start_us) <= SIW917_ELRS_BUSY_FAST_US) {
-    busy_iterations++;
-    __asm volatile("nop");
-  }
-
-  const bool busy_ready = read_busy_pin() == 0;
-  lr1121_busy_fast_record(busy_iterations, busy_ready);
+  const bool busy_ready =
+      lr1121_wait_busy_fast_timeout(SIW917_ELRS_BUSY_FAST_US);
   if (!busy_ready && !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1407,7 +1501,7 @@ static bool lr1121_read_response_fast(uint8_t *response,
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
@@ -1436,7 +1530,12 @@ static bool lr1121_read_response_fast(uint8_t *response,
       ~(GSPI_CONFIG1_MANUAL_RD | GSPI_CONFIG1_MANUAL_CSN);
   GSPI_INTR_UNMASK_REG |= GSPI_INTR_UNMASK_BIT;
 
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  volatile uint32_t *const nss_reg = selected_nss_reg();
+  *nss_reg = 0U;
+#else
   HP_GPIO_SET_LOW(selected_nss_pin());
+#endif
   __asm volatile("nop");
 
   bool ok = true;
@@ -1477,7 +1576,11 @@ static bool lr1121_read_response_fast(uint8_t *response,
   }
 
   __asm volatile("nop");
+#if SIW917_ELRS_FAST_GSPI_CACHE_PIN_REGS
+  *nss_reg = 1U;
+#else
   HP_GPIO_SET_HIGH(selected_nss_pin());
+#endif
 
   GSPI_CONFIG1_REG = saved_config1;
   GSPI_WRITE_DATA2_REG = saved_write_data2;
@@ -1495,12 +1598,12 @@ static bool lr1121_read_response_fast(uint8_t *response,
   }
   lr1121_exit_critical(primask);
 
-  lr1121_raw_gspi_count++;
+  LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
 #endif
   if (!ok) {
-    lr1121_raw_gspi_fail_count++;
+    LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
   }
 
   return ok;
@@ -3571,6 +3674,7 @@ typedef struct {
   uint32_t expected_size; /**< Expected firmware size from X-FileSize header */
   uint32_t total_size;    /**< Total bytes written to flash */
   uint32_t left_over;     /**< Bytes remaining in buffer (< 256) */
+  uint8_t radio;          /**< Selected radio for this update */
   uint8_t buffer[256];    /**< Write buffer (256 bytes per flash write) */
   bool in_progress;       /**< Update is in progress */
 } lr1121_update_state_t;
@@ -3585,6 +3689,8 @@ static bool lr1121_write_flash_chunk(const uint8_t *data, uint32_t data_size) {
   static uint8_t packet[262]; /* 2B opcode + 4B address + 256B data */
   uint32_t write_size;
   uint32_t flash_address = lr1121_update_state.total_size;
+
+  lr1121_select_radio(lr1121_update_state.radio);
 
   /* Build command header */
   packet[0] = (uint8_t)(LR1121_OPCODE_BL_WRITE_FLASH >> 8);   /* 0x80 */
@@ -3685,17 +3791,21 @@ bool lr1121_get_firmware_version(lr1121_firmware_version_t *version,
  * @brief Begin LR1121 firmware update
  */
 int lr1121_begin_update(uint32_t expected_size) {
+  const uint8_t update_radio = selected_radio;
   lr1121_firmware_version_t version;
   uint8_t mode;
 
   DEBUGOUT("\n=== LR1121 OTA: Beginning firmware update ===\n");
+  DEBUGOUT("LR1121 OTA: Target radio: %u\n", (unsigned)update_radio);
   DEBUGOUT("LR1121 OTA: Expected size: %lu bytes\n",
            (unsigned long)expected_size);
 
   /* Initialize update state */
   memset(&lr1121_update_state, 0, sizeof(lr1121_update_state));
   lr1121_update_state.expected_size = expected_size;
+  lr1121_update_state.radio = update_radio;
   lr1121_update_state.in_progress = true;
+  lr1121_select_radio(lr1121_update_state.radio);
 
   /* Step 1: Reboot LR1121 to bootloader mode */
   DEBUGOUT("LR1121 OTA: Rebooting to bootloader mode...\n");
@@ -3782,6 +3892,8 @@ int lr1121_write_update_bytes(const uint8_t *data, uint32_t size) {
     return -1;
   }
 
+  lr1121_select_radio(lr1121_update_state.radio);
+
   /* Process data in 256-byte chunks */
   while (size >= 256 - lr1121_update_state.left_over) {
     uint32_t chunk_size = 256 - lr1121_update_state.left_over;
@@ -3822,6 +3934,7 @@ int lr1121_end_update(void) {
   }
 
   DEBUGOUT("\n=== LR1121 OTA: Completing firmware update ===\n");
+  lr1121_select_radio(lr1121_update_state.radio);
 
   /* Step 1: Flush remaining buffered data */
   if (lr1121_update_state.left_over > 0) {
@@ -3952,7 +4065,9 @@ static void dio2_gpio_interrupt_callback(uint32_t pin_intr);
 #endif
 
 static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_invoke_callback(void) {
+#if SIW917_ELRS_DIO_STATS_DIAG
   dio1_isr_count++;
+#endif
   if (dio1_callback_enabled && dio1_callback != NULL) {
     dio1_callback();
   }
@@ -3978,7 +4093,9 @@ static inline uint8_t lr1121_dio1_read_level(void) {
 
 #if LR1121_HAS_RADIO2
 static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio2_invoke_callback(void) {
+#if SIW917_ELRS_DIO_STATS_DIAG
   dio2_isr_count++;
+#endif
   if (dio2_callback_enabled && dio2_callback != NULL) {
     dio2_callback();
   }
@@ -4023,14 +4140,18 @@ static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_direct_irq(void) {
    * bitmask. This mirrors PIN_IRQ2_Handler() in the Silicon Labs GPIO driver.
    */
   lr1121_dio1_clear_interrupt();
+#if SIW917_ELRS_DIO_STATS_DIAG
   dio1_direct_vector_count++;
+#endif
   lr1121_dio1_invoke_callback();
 }
 
 #if LR1121_HAS_RADIO2
 static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio2_direct_irq(void) {
   lr1121_dio2_clear_interrupt();
+#if SIW917_ELRS_DIO_STATS_DIAG
   dio2_direct_vector_count++;
+#endif
   lr1121_dio2_invoke_callback();
 }
 #endif
@@ -4059,6 +4180,7 @@ static bool lr1121_dio_install_direct_vector(uint32_t vector_index,
 
   old_dio_vector = lr1121_dio_ram_vector_table[vector_index];
   lr1121_dio_ram_vector_table[vector_index] = (uint32_t)(uintptr_t)handler;
+  (void)old_dio_vector;
 
   __DSB();
   __ISB();
@@ -4067,11 +4189,11 @@ static bool lr1121_dio_install_direct_vector(uint32_t vector_index,
   __ISB();
   lr1121_exit_critical(primask);
 
-  DEBUGOUT("  %s direct vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
-           "oldDIO=0x%08lX newDIO=0x%08lX\n",
-           name,
-           (unsigned long)old_vtor, (unsigned long)new_vtor,
-           (unsigned long)old_dio_vector, (unsigned long)(uintptr_t)handler);
+  LR1121_DIO_INIT_LOG(
+      "  %s direct vector installed oldVTOR=0x%08lX newVTOR=0x%08lX "
+      "oldDIO=0x%08lX newDIO=0x%08lX\n",
+      name, (unsigned long)old_vtor, (unsigned long)new_vtor,
+      (unsigned long)old_dio_vector, (unsigned long)(uintptr_t)handler);
   return true;
 }
 
@@ -4102,8 +4224,9 @@ static bool lr1121_dio2_install_direct_vector(void) {
 lr1121_status_t lr1121_dio1_init(void) {
   sl_status_t status;
 
-  DEBUGOUT("LR1121: Initializing DIO1 interrupt on GPIO_%d (HP domain)...\n",
-           DIO1_HP_GPIO);
+  LR1121_DIO_INIT_LOG(
+      "LR1121: Initializing DIO1 interrupt on GPIO_%d (HP domain)...\n",
+      DIO1_HP_GPIO);
 
   /* Step 1: Ensure EGPIO clocks are enabled
    * Citation: siw917x-family-rm.pdf Section 11.6.1
@@ -4112,7 +4235,7 @@ lr1121_status_t lr1121_dio1_init(void) {
   CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT; /* Enable EGPIO APB clock */
   CLK_ENABLE_SET_REG3 =
       EGPIO_CLK_ENABLE_BIT; /* Enable EGPIO controller clock */
-  DEBUGOUT("  EGPIO clocks enabled\n");
+  LR1121_DIO_INIT_LOG("  EGPIO clocks enabled\n");
 
   /* Step 2: Initialize GPIO driver (for interrupt support & clocks) */
   status = sl_gpio_driver_init();
@@ -4120,7 +4243,7 @@ lr1121_status_t lr1121_dio1_init(void) {
     DEBUGOUT("  sl_gpio_driver_init failed: 0x%04lX\n", (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  GPIO driver initialized\n");
+  LR1121_DIO_INIT_LOG("  GPIO driver initialized\n");
 
   /* Step 3: Configure SDK pin structure */
   dio1_pin_config.port_pin.port = DIO1_HP_PORT;
@@ -4159,8 +4282,8 @@ lr1121_status_t lr1121_dio1_init(void) {
              (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n",
-           DIO1_INT_CHANNEL);
+  LR1121_DIO_INIT_LOG("  Rising-edge interrupt configured on channel %d\n",
+                      DIO1_INT_CHANNEL);
 
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
   (void)lr1121_dio1_install_direct_vector();
@@ -4171,10 +4294,11 @@ lr1121_status_t lr1121_dio1_init(void) {
   /* Final verification read using SDK */
   uint8_t sdk_pin_value = 0;
   sl_gpio_driver_get_pin(&dio1_pin_config.port_pin, &sdk_pin_value);
-  DEBUGOUT("  SDK pin read: GPIO_%d = %d\n", DIO1_HP_GPIO, sdk_pin_value);
+  LR1121_DIO_INIT_LOG("  SDK pin read: GPIO_%d = %d\n", DIO1_HP_GPIO,
+                      sdk_pin_value);
 
-  DEBUGOUT("LR1121: DIO1 interrupt initialized (currently %s)\n",
-           sdk_pin_value ? "HIGH" : "LOW");
+  LR1121_DIO_INIT_LOG("LR1121: DIO1 interrupt initialized (currently %s)\n",
+                      sdk_pin_value ? "HIGH" : "LOW");
 
   return LR1121_OK;
 }
@@ -4212,10 +4336,10 @@ void lr1121_dio1_enable(void) {
   /* Now allow callbacks to be invoked */
   dio1_callback_enabled = true;
 
-  DEBUGOUT("LR1121: DIO1 interrupt enabled on GPIO_%d (IRQ channel %d, "
-           "priority %u)\n",
-           DIO1_HP_GPIO, DIO1_INT_CHANNEL,
-           (unsigned)SIW917_ELRS_DIO_IRQ_PRIORITY);
+  LR1121_DIO_INIT_LOG("LR1121: DIO1 interrupt enabled on GPIO_%d "
+                      "(IRQ channel %d, priority %u)\n",
+                      DIO1_HP_GPIO, DIO1_INT_CHANNEL,
+                      (unsigned)SIW917_ELRS_DIO_IRQ_PRIORITY);
 }
 
 /**
@@ -4232,7 +4356,7 @@ void lr1121_dio1_disable(void) {
 
   dio1_callback_enabled = false;
 
-  DEBUGOUT("LR1121: DIO1 interrupt disabled\n");
+  LR1121_DIO_INIT_LOG("LR1121: DIO1 interrupt disabled\n");
 }
 
 /**
@@ -4300,8 +4424,8 @@ uint32_t lr1121_dio1_gpio_intr_status(void) {
  */
 void lr1121_dio1_set_callback(lr1121_dio1_callback_t callback) {
   dio1_callback = callback;
-  DEBUGOUT("LR1121: DIO1 callback %s\n",
-           callback ? "registered" : "unregistered");
+  LR1121_DIO_INIT_LOG("LR1121: DIO1 callback %s\n",
+                      callback ? "registered" : "unregistered");
 }
 
 /**
@@ -4331,19 +4455,20 @@ lr1121_status_t lr1121_dio2_init(void) {
 #if LR1121_HAS_RADIO2
   sl_status_t status;
 
-  DEBUGOUT("LR1121: Initializing DIO2 interrupt on GPIO_%d (HP domain)...\n",
-           DIO2_HP_GPIO);
+  LR1121_DIO_INIT_LOG(
+      "LR1121: Initializing DIO2 interrupt on GPIO_%d (HP domain)...\n",
+      DIO2_HP_GPIO);
 
   CLK_ENABLE_SET_REG2 = EGPIO_PCLK_ENABLE_BIT;
   CLK_ENABLE_SET_REG3 = EGPIO_CLK_ENABLE_BIT;
-  DEBUGOUT("  EGPIO clocks enabled\n");
+  LR1121_DIO_INIT_LOG("  EGPIO clocks enabled\n");
 
   status = sl_gpio_driver_init();
   if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
     DEBUGOUT("  sl_gpio_driver_init failed: 0x%04lX\n", (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  GPIO driver initialized\n");
+  LR1121_DIO_INIT_LOG("  GPIO driver initialized\n");
 
   dio2_pin_config.port_pin.port = DIO2_HP_PORT;
   dio2_pin_config.port_pin.pin = DIO2_HP_PIN;
@@ -4368,8 +4493,8 @@ lr1121_status_t lr1121_dio2_init(void) {
              (unsigned long)status);
     return LR1121_ERROR_GPIO_INIT;
   }
-  DEBUGOUT("  Rising-edge interrupt configured on channel %d\n",
-           DIO2_INT_CHANNEL);
+  LR1121_DIO_INIT_LOG("  Rising-edge interrupt configured on channel %d\n",
+                      DIO2_INT_CHANNEL);
 
 #if SIW917_ELRS_DIRECT_DIO_VECTOR
   (void)lr1121_dio2_install_direct_vector();
@@ -4379,9 +4504,10 @@ lr1121_status_t lr1121_dio2_init(void) {
 
   uint8_t sdk_pin_value = 0;
   sl_gpio_driver_get_pin(&dio2_pin_config.port_pin, &sdk_pin_value);
-  DEBUGOUT("  SDK pin read: GPIO_%d = %d\n", DIO2_HP_GPIO, sdk_pin_value);
-  DEBUGOUT("LR1121: DIO2 interrupt initialized (currently %s)\n",
-           sdk_pin_value ? "HIGH" : "LOW");
+  LR1121_DIO_INIT_LOG("  SDK pin read: GPIO_%d = %d\n", DIO2_HP_GPIO,
+                      sdk_pin_value);
+  LR1121_DIO_INIT_LOG("LR1121: DIO2 interrupt initialized (currently %s)\n",
+                      sdk_pin_value ? "HIGH" : "LOW");
 
   return LR1121_OK;
 #else
@@ -4404,10 +4530,10 @@ void lr1121_dio2_enable(void) {
 
   dio2_callback_enabled = true;
 
-  DEBUGOUT("LR1121: DIO2 interrupt enabled on GPIO_%d (IRQ channel %d, "
-           "priority %u)\n",
-           DIO2_HP_GPIO, DIO2_INT_CHANNEL,
-           (unsigned)SIW917_ELRS_DIO_IRQ_PRIORITY);
+  LR1121_DIO_INIT_LOG("LR1121: DIO2 interrupt enabled on GPIO_%d "
+                      "(IRQ channel %d, priority %u)\n",
+                      DIO2_HP_GPIO, DIO2_INT_CHANNEL,
+                      (unsigned)SIW917_ELRS_DIO_IRQ_PRIORITY);
 #endif
 }
 
@@ -4422,7 +4548,7 @@ void lr1121_dio2_disable(void) {
 
   dio2_callback_enabled = false;
 
-  DEBUGOUT("LR1121: DIO2 interrupt disabled\n");
+  LR1121_DIO_INIT_LOG("LR1121: DIO2 interrupt disabled\n");
 #endif
 }
 
@@ -4457,8 +4583,8 @@ int lr1121_dio2_read(void) {
 void lr1121_dio2_set_callback(lr1121_dio1_callback_t callback) {
 #if LR1121_HAS_RADIO2
   dio2_callback = callback;
-  DEBUGOUT("LR1121: DIO2 callback %s\n",
-           callback ? "registered" : "unregistered");
+  LR1121_DIO_INIT_LOG("LR1121: DIO2 callback %s\n",
+                      callback ? "registered" : "unregistered");
 #else
   (void)callback;
 #endif

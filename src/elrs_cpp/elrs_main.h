@@ -113,9 +113,9 @@ void elrs_exit_binding_mode(void);
  * This function blocks until device is rebooted from web UI.
  * 
  * Access points:
- *   SSID: ELRS_TEST_AP
- *   Password: elrs1234
- *   URL: http://192.168.10.10/
+ *   SSID: ExpressLRS RX
+ *   Password: expresslrs
+ *   URL: http://10.0.0.1/
  */
 void elrs_enter_wifi_mode(void);
 

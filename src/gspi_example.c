@@ -714,9 +714,9 @@ static void elrs_main_task(void *argument) {
       DEBUGOUT("========================================\n");
       DEBUGOUT("\n");
       DEBUGOUT("[ELRS_MAIN] Starting WiFi AP + HTTP Server...\n");
-      DEBUGOUT("[ELRS_MAIN] Connect to SSID: ELRS_TEST_AP\n");
-      DEBUGOUT("[ELRS_MAIN] Password: elrs1234\n");
-      DEBUGOUT("[ELRS_MAIN] Web UI: http://192.168.10.10/\n");
+      DEBUGOUT("[ELRS_MAIN] Connect to SSID: ExpressLRS RX\n");
+      DEBUGOUT("[ELRS_MAIN] Password: expresslrs\n");
+      DEBUGOUT("[ELRS_MAIN] Web UI: http://10.0.0.1/\n");
       DEBUGOUT("\n");
 
       /* Start WiFi HTTP server - this function runs the server
@@ -1065,9 +1065,9 @@ void elrs_cpp_task(void *argument) {
       DEBUGOUT("========================================\n");
       DEBUGOUT("  Entering WiFi Configuration Mode\n");
       DEBUGOUT("========================================\n");
-      DEBUGOUT("  SSID: ELRS_TEST_AP\n");
-      DEBUGOUT("  Password: elrs1234\n");
-      DEBUGOUT("  Web UI: http://192.168.10.10/\n");
+      DEBUGOUT("  SSID: ExpressLRS RX\n");
+      DEBUGOUT("  Password: expresslrs\n");
+      DEBUGOUT("  Web UI: http://10.0.0.1/\n");
       DEBUGOUT("========================================\n");
       DEBUGOUT("\n");
 

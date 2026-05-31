@@ -37,7 +37,8 @@ extern "C" {
  * 
  * Increment this when the config structure changes to trigger migration/reset.
  ******************************************************************************/
-#define ELRS_CONFIG_VERSION      16  /* v16: Use TX UID BE:93:67:27:D6:9C for "matthew" build flag method */
+#define ELRS_CONFIG_VERSION      17  /* v17: force-tlm now matches upstream "force telemetry off" semantics */
+#define ELRS_CONFIG_PREVIOUS_VERSION 16
 
 /*******************************************************************************
  * NVM3 Key Definitions
@@ -69,6 +70,18 @@ typedef enum {
   ELRS_SERIAL_DISPLAYPORT    = 8,   /* MSP DisplayPort */
   ELRS_SERIAL_GPS            = 9,   /* GPS */
 } elrs_serial_protocol_t;
+
+/*
+ * SiW917 currently has real USART service implementations for CRSF, SBUS,
+ * SUMD, and MAVLink. Keep enum values matching upstream, but only expose
+ * working choices through Lua/web config until the other backends exist.
+ */
+#define ELRS_SERIAL_PROTOCOL_LUA_OPTIONS       "CRSF;SBUS;SUMD;MAVLink"
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_CRSF    0
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SBUS    1
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_SUMD    2
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK 3
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAX     3
 
 /*******************************************************************************
  * Failsafe Mode Options
@@ -148,7 +161,7 @@ typedef struct __attribute__((packed)) {
   uint8_t  model_id;             /* Model match ID (0-63, 255=disabled) */
   
   /* Telemetry */
-  uint8_t  force_tlm;            /* Force telemetry on */
+  uint8_t  force_tlm;            /* Upstream force-tlm: force RF telemetry off */
   uint8_t  tlm_interval;         /* Telemetry interval ratio */
   
   /* Voltage-based binding */
@@ -161,8 +174,8 @@ typedef struct __attribute__((packed)) {
   uint8_t  rate_index;           /* Packet rate index */
   
   /* WiFi Settings */
-  char     wifi_ssid[33];        /* WiFi AP SSID (max 32 chars + null) */
-  char     wifi_password[65];    /* WiFi password (max 64 chars + null) */
+  char     wifi_ssid[33];        /* Home WiFi SSID (max 32 chars + null) */
+  char     wifi_password[65];    /* Home WiFi password (max 64 chars + null) */
   uint8_t  wifi_channel;         /* WiFi channel (1-13) */
 
   /* RX Lua / CRSF parameter settings */
@@ -295,6 +308,38 @@ int elrs_config_from_json(const char* json, size_t json_len);
  * @brief Print current configuration to debug output
  */
 void elrs_config_print(void);
+
+/**
+ * @brief WebUI runtime option helpers matching upstream options.json fields.
+ */
+uint8_t elrs_config_get_web_domain(void);
+void elrs_config_set_web_domain(uint8_t domain);
+bool elrs_config_get_lock_on_first_connection(void);
+void elrs_config_set_lock_on_first_connection(bool enabled);
+uint32_t elrs_config_get_uart_baud(void);
+void elrs_config_set_uart_baud(uint32_t baud);
+int32_t elrs_config_get_wifi_on_interval(void);
+void elrs_config_set_wifi_on_interval(int32_t interval_seconds);
+bool elrs_config_get_is_airport(void);
+void elrs_config_set_is_airport(bool enabled);
+bool elrs_config_get_dji_permanently_armed(void);
+void elrs_config_set_dji_permanently_armed(bool enabled);
+bool elrs_config_web_options_customised(void);
+
+/**
+ * @brief Check whether this SiW917 target has a real backend for a protocol.
+ */
+bool elrs_serial_protocol_is_supported(uint8_t protocol);
+
+/**
+ * @brief Convert stored upstream enum value to this target's Lua selection.
+ */
+uint8_t elrs_serial_protocol_to_lua_selection(uint8_t protocol);
+
+/**
+ * @brief Convert this target's Lua selection to stored upstream enum value.
+ */
+uint8_t elrs_serial_protocol_from_lua_selection(uint8_t selection);
 
 #ifdef __cplusplus
 }

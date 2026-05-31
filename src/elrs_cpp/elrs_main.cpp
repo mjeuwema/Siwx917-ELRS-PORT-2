@@ -7,8 +7,9 @@
  *
  * Key differences from upstream:
  * - CRSF serial output uses the SiW917 platform UART driver
- * - No device management (LEDs, buttons handled separately)
- * - Simplified for single LR1121 radio (no Gemini/dual radio)
+ * - Board services (LEDs, button, WiFi/NVM) are provided by SiW917 modules
+ * - Dual LR1121 operation supports FCC915 normal, same-band Gemini, and
+ *   LR1121 crossband with SiW917-specific HAL timing adaptations
  */
 
 #include "elrs_main.h"
@@ -73,6 +74,7 @@ uint32_t lr1121_get_busy_fast_fail_count(void);
 uint32_t lr1121_get_raw_gspi_max_us(void);
 uint32_t lr1121_get_raw_gspi_count(void);
 uint32_t lr1121_get_raw_gspi_fail_count(void);
+bool lr1121_hal_prepare_radio2_image_calibration(bool highBand);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
@@ -88,12 +90,15 @@ void elrs_enter_binding_mode(void);
 // upstream ELRS; platform latency belongs in the HAL/timer adapter, not here.
 #define PACKET_TO_TOCK_SLACK 200
 #define CRSF_RC_OUTPUT_INTERVAL 4 // Output RC channels every 4ms (~250Hz)
+#define SBUS_RC_OUTPUT_INTERVAL 9 // Upstream SBUS period is 9ms
+#define SUMD_RC_OUTPUT_INTERVAL 10 // Upstream SUMD period is 10ms
 #define RFmodeCycleMultiplierSlow 10
 #define BindingRateChangeCyclePeriodMs 125U
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM SIW917_ELRS_DISABLE_DOWNLINK_TLM
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL SIW917_ELRS_DISABLE_CRSF_SERIAL
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP SIW917_ELRS_DIO_PFD_TIMESTAMP
-#define ELRS_DIAG_CRC_NONCE_WINDOW 64
+#define ELRS_DIAG_CRC_NONCE_WINDOW (!SIW917_ELRS_TIMING_TEST_BUILD ? 64 : 0)
+#define ELRS_DIAG_PACKET_CAPTURE (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_TX_TURNAROUND (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_TLM_RATE_LOG SIW917_ELRS_TLM_RATE_DIAG
 #define ELRS_DIAG_TLM_STALE_RX 0
@@ -124,9 +129,14 @@ void elrs_enter_binding_mode(void);
 
 // Model match ID (0xFF = disabled, 0-63 = specific model)
 static uint8_t modelMatchId = 0xFF;
+static volatile bool forceTelemetryOff = false;
 
 extern "C" void siw917_rx_set_model_match_id(uint8_t modelId) {
   modelMatchId = modelId;
+}
+
+extern "C" void siw917_rx_set_force_telemetry_off(uint8_t forceOff) {
+  forceTelemetryOff = forceOff != 0;
 }
 
 // Link statistics (for external API)
@@ -309,6 +319,13 @@ static volatile uint8_t dataUlLastFrameLen = 0;
 static volatile uint32_t crcFailTypeCount[4] = {};
 static volatile uint32_t crcPassTypeCount[4] = {};
 static volatile uint32_t rxLqCurrentSetSkipCount = 0;
+#if SIW917_ELRS_PACKET_STATS_DIAG
+#define ELRS_PACKET_STAT_INC(var_) ((var_)++)
+#define ELRS_PACKET_STAT_SET(var_, value_) ((var_) = (value_))
+#else
+#define ELRS_PACKET_STAT_INC(var_) do { } while (0)
+#define ELRS_PACKET_STAT_SET(var_, value_) do { } while (0)
+#endif
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
 static volatile uint32_t telemetryBuildMaxUs = 0;
 static volatile uint32_t telemetrySendMaxUs = 0;
@@ -323,8 +340,10 @@ static inline void updateHotpathMax(volatile uint32_t &maxValue,
 #endif
 #if SIW917_ELRS_PREBUILD_TLM_PACKET
 static WORD_ALIGNED_ATTR OTA_Packet_s prebuiltTelemetryPacket = {};
+static WORD_ALIGNED_ATTR OTA_Packet_s prebuiltTelemetryGeminiPacket = {};
 static StubbornSenderPreparedPayload prebuiltTelemetryPayload = {};
 static bool prebuiltTelemetryValid = false;
+static bool prebuiltTelemetrySendGemini = false;
 static uint8_t prebuiltTelemetryNonce = 0;
 static uint8_t prebuiltNextTelemetryType = PACKET_TYPE_LINKSTATS;
 static uint8_t prebuiltTelemetryBurstCount = 0;
@@ -334,7 +353,9 @@ static volatile uint32_t telemetryPrebuildMissCount = 0;
 #endif
 #if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
 static WORD_ALIGNED_ATTR OTA_Packet_s deferredTelemetryPacket = {};
+static WORD_ALIGNED_ATTR OTA_Packet_s deferredTelemetryGeminiPacket = {};
 static volatile bool deferredTelemetryPending = false;
+static volatile bool deferredTelemetrySendGemini = false;
 static volatile uint8_t deferredTelemetryNonce = 0;
 static volatile uint8_t deferredTelemetryFhss = 0;
 static volatile uint32_t telemetryDeferredQueueCount = 0;
@@ -507,9 +528,17 @@ static void updateRxDownlinkPower(bool initialize) {
   // just before the next telemetry TX instead of from TX_DONE.
   Radio.SetOutputPower(subGhzDbm, true);
   Radio.SetOutputPower(highBandDbm, false);
-  DBGLN("RX downlink power scheduled: %d dBm%s", subGhzDbm,
-        capped ? (matchTxPower ? " (matching TX, capped)" : " (capped)")
-               : (matchTxPower ? " (matching TX)" : ""));
+  if (initialize
+#if SIW917_ELRS_LOG_CONNECTED_PWR_UPDATES
+      || true
+#else
+      || !hwTimer::isRunning()
+#endif
+  ) {
+    DBGLN("RX downlink power scheduled: %d dBm%s", subGhzDbm,
+          capped ? (matchTxPower ? " (matching TX, capped)" : " (capped)")
+                 : (matchTxPower ? " (matching TX)" : ""));
+  }
 }
 
 static void ICACHE_RAM_ATTR noteDecodedUplinkTxPower() {
@@ -610,7 +639,8 @@ enum RxLuaParamId : uint8_t {
   RX_LUA_PARAM_TLM_RATIO = 13,
   RX_LUA_PARAM_VERSION = 14,
   RX_LUA_PARAM_TLM_POWER = 15,
-  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_TLM_POWER,
+  RX_LUA_PARAM_ACTIVE_MODE = 16,
+  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_ACTIVE_MODE,
 };
 
 static uint8_t getConfiguredBindStorage();
@@ -626,6 +656,7 @@ static const char *rxLuaBindCommandName() {
 
 static char rxLuaModelIdValue[8] = "Off";
 static char rxLuaTlmRatioValue[8] = "1:1";
+static char rxLuaActiveModeValue[24] = "CRSF";
 static uint8_t rxLuaWifiCommandStep = RX_LUA_CMD_IDLE;
 static uint8_t rxLuaBindCommandStep = RX_LUA_CMD_IDLE;
 static const char *rxLuaWifiCommandInfo = "";
@@ -1059,10 +1090,10 @@ static void rxLuaQueueFrame(const uint8_t *frame, uint8_t len) {
 
 static uint8_t getProtocolSelectionFromConfig(const elrs_config_t *cfg) {
   if (cfg == nullptr) {
-    return 0;
+    return ELRS_SERIAL_PROTOCOL_LUA_SELECTION_CRSF;
   }
 
-  return cfg->serial_protocol <= ELRS_SERIAL_GPS ? cfg->serial_protocol : 0;
+  return elrs_serial_protocol_to_lua_selection(cfg->serial_protocol);
 }
 
 static uint8_t activeSerialProtocol = ELRS_SERIAL_CRSF;
@@ -1071,8 +1102,50 @@ extern "C" uint8_t siw917_rx_get_active_serial_protocol(void) {
   return activeSerialProtocol;
 }
 
+static const char *serialProtocolName(uint8_t protocol) {
+  switch (protocol) {
+  case ELRS_SERIAL_MAVLINK:
+    return "MAVLink";
+  case ELRS_SERIAL_SBUS:
+    return "SBUS";
+  case ELRS_SERIAL_SUMD:
+    return "SUMD";
+  case ELRS_SERIAL_CRSF:
+  default:
+    return "CRSF";
+  }
+}
+
+static const char *activeSerialProtocolName() {
+  return serialProtocolName(activeSerialProtocol);
+}
+
+static void formatActiveModeString(char *buffer, size_t bufferLen) {
+  if (buffer == nullptr || bufferLen == 0) {
+    return;
+  }
+
+  const char *rfMode = FHSSuseDualBand ? " Crossband"
+                       : geminiMode   ? " Gemini"
+                                      : "";
+  snprintf(buffer, bufferLen, "%s%s", activeSerialProtocolName(), rfMode);
+  buffer[bufferLen - 1] = '\0';
+}
+
+extern "C" const char *siw917_rx_get_active_mode_string(void) {
+  static char activeModeString[24] = "CRSF";
+  formatActiveModeString(activeModeString, sizeof(activeModeString));
+  return activeModeString;
+}
+
 static uint8_t getStoredSerialProtocol() {
-  return getProtocolSelectionFromConfig(elrs_config_get());
+  const elrs_config_t *cfg = elrs_config_get();
+  if (cfg == nullptr ||
+      !elrs_serial_protocol_is_supported(cfg->serial_protocol)) {
+    return ELRS_SERIAL_CRSF;
+  }
+
+  return cfg->serial_protocol;
 }
 
 static uint8_t getConfiguredSerialProtocol() {
@@ -1084,8 +1157,9 @@ static uint8_t getNormalOtaSerialProtocol(uint8_t storedProtocol) {
     return ELRS_SERIAL_CRSF;
   }
 
-  return storedProtocol <= ELRS_SERIAL_GPS ? storedProtocol
-                                           : (uint8_t)ELRS_SERIAL_CRSF;
+  return elrs_serial_protocol_is_supported(storedProtocol)
+             ? storedProtocol
+             : (uint8_t)ELRS_SERIAL_CRSF;
 }
 
 static uint8_t getDesiredActiveSerialProtocol() {
@@ -1111,14 +1185,79 @@ static bool serialProtocolUsesCrsf(uint8_t protocol) {
          protocol == ELRS_SERIAL_INVERTED_CRSF;
 }
 
+static bool serialProtocolUsesSbus(uint8_t protocol) {
+  return protocol == ELRS_SERIAL_SBUS;
+}
+
+static bool serialProtocolUsesSumd(uint8_t protocol) {
+  return protocol == ELRS_SERIAL_SUMD;
+}
+
+static bool serialProtocolSendsRc(uint8_t protocol) {
+  return serialProtocolUsesCrsf(protocol) || serialProtocolUsesSbus(protocol) ||
+         serialProtocolUsesSumd(protocol);
+}
+
 static bool configuredSerialProtocolUsesCrsf() {
   return serialProtocolUsesCrsf(getConfiguredSerialProtocol());
+}
+
+static bool configuredSerialProtocolSendsRc() {
+  return serialProtocolSendsRc(getConfiguredSerialProtocol());
+}
+
+static uint32_t serialRcOutputIntervalMs(uint8_t protocol) {
+  if (serialProtocolUsesSbus(protocol)) {
+    return SBUS_RC_OUTPUT_INTERVAL;
+  }
+  if (serialProtocolUsesSumd(protocol)) {
+    return SUMD_RC_OUTPUT_INTERVAL;
+  }
+  return CRSF_RC_OUTPUT_INTERVAL;
+}
+
+static int32_t mapInt32(int32_t x, int32_t inMin, int32_t inMax,
+                        int32_t outMin, int32_t outMax) {
+  if (inMax == inMin) {
+    return outMin;
+  }
+  return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+}
+
+static void prepareCrsfSerialChannels(uint32_t *outChannels) {
+  if (outChannels == nullptr) {
+    return;
+  }
+
+  memcpy(outChannels, ChannelData, CRSF_NUM_CHANNELS * sizeof(outChannels[0]));
+
+  // Upstream CRSF serial uses channels 15/16 for LQ/RSSI unless the OTA mode is
+  // carrying a real 16-channel payload.
+  if (OtaIsFullRes && OtaSwitchModeCurrent == smHybridOr16ch) {
+    return;
+  }
+
+  outChannels[14] = UINT10_to_CRSF(
+      fmap((uint16_t)constrain(linkStats.uplink_Link_quality, 0, 100), 0, 100,
+           0, 1023));
+
+  const int32_t sensitivity =
+      ExpressLRS_currAirRate_RFperfParams != nullptr
+          ? ExpressLRS_currAirRate_RFperfParams->RXsensitivity
+          : -130;
+  const int32_t rssiDbm = linkStats.active_antenna == 0
+                              ? -(int32_t)linkStats.uplink_RSSI_1
+                              : -(int32_t)linkStats.uplink_RSSI_2;
+  const int32_t clampedRssi = constrain(rssiDbm, sensitivity, -50);
+  outChannels[15] =
+      UINT10_to_CRSF((uint16_t)mapInt32(clampedRssi, sensitivity, -50, 0, 1023));
 }
 
 static volatile bool serialProtocolApplyRequested = false;
 static volatile bool serialProtocolApplyRequiresConnected = false;
 static uint32_t serialProtocolApplyDueMs = 0;
 static uint8_t appliedSerialProtocol = 0xFF;
+static bool serialRxEnabled = false;
 static uint32_t mavlinkSerialPendingSinceMs = 0;
 
 static constexpr uint32_t SERIAL_PROTOCOL_SYNC_APPLY_DELAY_MS = 100;
@@ -1126,6 +1265,9 @@ static constexpr uint8_t MAVLINK_SERIAL_PAYLOAD_MAX =
     ELRS_DATA_UL_BUFFER - CRSF_FRAME_NOT_COUNTED_BYTES;
 static constexpr uint8_t MAVLINK_SERIAL_MIN_CHUNK = 24;
 static constexpr uint32_t MAVLINK_SERIAL_MAX_WAIT_MS = 4;
+#if SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
+static constexpr uint32_t CRSF_SERIAL_RX_BYTES_PER_LOOP = 128;
+#endif
 
 static void ICACHE_RAM_ATTR requestSerialProtocolApply() {
   serialProtocolApplyRequested = true;
@@ -1143,25 +1285,35 @@ requestSerialProtocolApplyAfter(uint32_t nowMs, uint32_t delayMs) {
 static void applyConfiguredSerialProtocol() {
   const uint8_t protocol = getConfiguredSerialProtocol();
   const bool wantsCrsf = serialProtocolUsesCrsf(protocol);
+  const bool wantsSbus = serialProtocolUsesSbus(protocol);
+  const bool wantsSumd = serialProtocolUsesSumd(protocol);
+  const bool wantsRcSerial = wantsCrsf || wantsSbus || wantsSumd;
   const bool wantsMavlink = protocol == ELRS_SERIAL_MAVLINK;
 
 #if ELRS_DIAG_DISABLE_CRSF_SERIAL
   (void)wantsCrsf;
+  (void)wantsSbus;
+  (void)wantsSumd;
+  (void)wantsRcSerial;
   (void)wantsMavlink;
   if (crsf_serial_is_ready()) {
     crsf_serial_deinit();
   }
+  const bool changed = appliedSerialProtocol != protocol;
   appliedSerialProtocol = protocol;
-  DBGLN("FC serial UART disabled for RF-only build");
+  if (changed) {
+    DBGLN("FC serial UART disabled for RF-only build");
+  }
   return;
 #endif
 
-  if (!wantsCrsf && !wantsMavlink) {
+  if (!wantsRcSerial && !wantsMavlink) {
     if (crsf_serial_is_ready()) {
       crsf_serial_deinit();
     }
+    serialRxEnabled = false;
     appliedSerialProtocol = protocol;
-    DBGLN("Serial protocol %u selected; CRSF UART output inactive", protocol);
+    DBGLN("Serial protocol %u selected; UART output inactive", protocol);
     return;
   }
 
@@ -1169,28 +1321,39 @@ static void applyConfiguredSerialProtocol() {
     if (crsf_serial_is_ready()) {
       crsf_serial_deinit();
     }
+    serialRxEnabled = false;
     appliedSerialProtocol = 0xFF;
     DBGLN("MAVLink serial output deferred until TX MAVLink OTA mode");
     return;
   }
 
-  if (crsf_serial_is_ready() && appliedSerialProtocol != protocol) {
-    crsf_serial_deinit();
+  const bool wasReady = crsf_serial_is_ready();
+  const uint32_t baud = wantsMavlink   ? 460800U
+                        : wantsSbus    ? SBUS_SERIAL_BAUDRATE
+                        : wantsSumd    ? SUMD_SERIAL_BAUDRATE
+                                       : firmwareOptions.uart_baud;
+  const crsf_serial_format_t format =
+      wantsSbus ? CRSF_SERIAL_FORMAT_8E2 : CRSF_SERIAL_FORMAT_8N1;
+  const bool serialReady = (crsf_serial_init_ex(baud, format) == 0);
+  if (!serialReady) {
+    DBGLN("WARNING: serial init failed for protocol %u", protocol);
+  } else if (!wasReady) {
+    DBGLN("%s serial output initialized at %lu baud",
+          serialProtocolName(protocol), (unsigned long)baud);
+  } else if (appliedSerialProtocol != protocol) {
+    DBGLN("%s serial output reconfigured at %lu baud",
+          serialProtocolName(protocol), (unsigned long)baud);
   }
 
-  if (!crsf_serial_is_ready()) {
-    const uint32_t baud = wantsMavlink ? 460800U : 420000U;
-    if (crsf_serial_init(baud) != 0) {
-      DBGLN("WARNING: serial init failed for protocol %u", protocol);
-    } else {
-      DBGLN("%s serial output initialized at %lu baud",
-            wantsMavlink ? "MAVLink" : "CRSF", (unsigned long)baud);
-    }
-  }
-
-  if (crsf_serial_is_ready()) {
-    if (crsf_serial_set_rx_enabled(wantsMavlink) != 0) {
+  if (serialReady && crsf_serial_is_ready()) {
+    // MAVLink needs UART RX as soon as the serial mode is active. CRSF FC
+    // telemetry RX is armed after RF lock so a floating/no-FC RX pin cannot
+    // flood DMA/parser work while the receiver is scanning.
+    const bool enableSerialRx = wantsMavlink;
+    if (crsf_serial_set_rx_enabled(enableSerialRx) != 0) {
       DBGLN("WARNING: serial RX enable failed for protocol %u", protocol);
+    } else {
+      serialRxEnabled = enableSerialRx;
     }
   }
 
@@ -1227,6 +1390,7 @@ static void processSerialProtocolApply() {
   serialProtocolApplyDueMs = 0;
   (void)updateActiveSerialProtocol();
   applyConfiguredSerialProtocol();
+  crsfReceiver.requestActiveModeRefresh();
 }
 
 static bool queueMavlinkSerialPayload(uint32_t nowMs) {
@@ -1280,6 +1444,113 @@ static bool queueMavlinkSerialPayload(uint32_t nowMs) {
   return true;
 }
 
+static void updateSerialRxState() {
+#if ELRS_DIAG_DISABLE_CRSF_SERIAL
+  serialRxEnabled = false;
+  return;
+#else
+  bool shouldEnable = false;
+  const uint8_t protocol = getConfiguredSerialProtocol();
+
+  if (protocol == ELRS_SERIAL_MAVLINK) {
+    shouldEnable = TxOtaProtocol == TX_MAVLINK_MODE && crsf_serial_is_ready();
+  }
+#if SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
+  else if (serialProtocolUsesCrsf(protocol)) {
+    shouldEnable = TxOtaProtocol == TX_NORMAL_MODE &&
+                   connectionState == connected && crsf_serial_is_ready();
+  }
+#endif
+
+  if (shouldEnable == serialRxEnabled) {
+    return;
+  }
+
+  if (crsf_serial_set_rx_enabled(shouldEnable) == 0) {
+    serialRxEnabled = shouldEnable;
+  } else {
+    DBGLN("WARNING: serial RX %s failed for protocol %u",
+          shouldEnable ? "enable" : "disable", protocol);
+  }
+#endif
+}
+
+#if SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
+static bool crsfSerialShouldForwardFrame(const uint8_t *frame, uint8_t frameLen) {
+  (void)frameLen;
+  const uint8_t frameType = frame[CRSF_TELEMETRY_TYPE_INDEX];
+
+  // These are generated by this RX toward the FC. If the UART wiring echoes
+  // them, do not send our own control/link frames back to the handset.
+  return frameType != CRSF_FRAMETYPE_RC_CHANNELS_PACKED &&
+         frameType != CRSF_FRAMETYPE_LINK_STATISTICS;
+}
+
+static void serviceCrsfSerialTelemetry() {
+  if (TxOtaProtocol != TX_NORMAL_MODE ||
+      connectionState != connected ||
+      !configuredSerialProtocolUsesCrsf() ||
+      !serialRxEnabled ||
+      !crsf_serial_is_ready()) {
+    return;
+  }
+
+  uint8_t bytes[CRSF_SERIAL_RX_BYTES_PER_LOOP];
+  const uint32_t available = crsf_serial_rx_available();
+  if (available == 0) {
+    return;
+  }
+
+  const uint32_t toRead = available > sizeof(bytes) ? sizeof(bytes) : available;
+  const uint32_t read = crsf_serial_read(bytes, toRead);
+
+  static uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
+  static uint8_t pos = 0;
+  static uint8_t expectedLen = 0;
+
+  for (uint32_t i = 0; i < read; ++i) {
+    const uint8_t byte = bytes[i];
+
+    if (pos == 0) {
+      if (byte != CRSF_SYNC_BYTE) {
+        continue;
+      }
+      frame[pos++] = byte;
+      continue;
+    }
+
+    frame[pos++] = byte;
+
+    if (pos == CRSF_TELEMETRY_TYPE_INDEX) {
+      const uint8_t frameSize = frame[CRSF_TELEMETRY_LENGTH_INDEX];
+      if (frameSize < 2 ||
+          frameSize > (CRSF_FRAME_SIZE_MAX - CRSF_FRAME_NOT_COUNTED_BYTES)) {
+        pos = 0;
+        expectedLen = 0;
+        continue;
+      }
+      expectedLen = frameSize + CRSF_FRAME_NOT_COUNTED_BYTES;
+    }
+
+    if (expectedLen != 0 && pos >= expectedLen) {
+      uint8_t frameLen = 0;
+      if (validateCrsfFrame(frame, &frameLen) &&
+          crsfSerialShouldForwardFrame(frame, frameLen)) {
+        crsfRouter.processMessage(nullptr,
+                                  reinterpret_cast<const crsf_header_t *>(frame));
+      }
+      pos = 0;
+      expectedLen = 0;
+    } else if (pos >= sizeof(frame)) {
+      pos = 0;
+      expectedLen = 0;
+    }
+  }
+}
+#else
+static void serviceCrsfSerialTelemetry() {}
+#endif
+
 static void rxLuaRefreshDynamicValues() {
   elrs_config_t *cfg = elrs_config_get();
   const uint8_t modelId = cfg != nullptr ? cfg->model_id : modelMatchId;
@@ -1294,6 +1565,8 @@ static void rxLuaRefreshDynamicValues() {
   snprintf(rxLuaTlmRatioValue, sizeof(rxLuaTlmRatioValue), "1:%u",
            ExpressLRS_currTlmDenom);
   rxLuaTlmRatioValue[sizeof(rxLuaTlmRatioValue) - 1] = '\0';
+
+  formatActiveModeString(rxLuaActiveModeValue, sizeof(rxLuaActiveModeValue));
 }
 
 static bool rxLuaBuildDeviceInfo(crsf_addr_e destAddr, uint8_t *frame,
@@ -1354,6 +1627,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     {
       static const uint8_t rootChildren[] = {
           RX_LUA_PARAM_PROTOCOL,
+          RX_LUA_PARAM_ACTIVE_MODE,
           RX_LUA_PARAM_FAILSAFE,
           RX_LUA_PARAM_TARGET_SYS_ID,
           RX_LUA_PARAM_SOURCE_SYS_ID,
@@ -1374,9 +1648,14 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
   case RX_LUA_PARAM_PROTOCOL:
     paramType = CRSF_TEXT_SELECTION;
     name = "Protocol";
-    options = "CRSF;Inverted CRSF;SBUS;Inverted SBUS;SUMD;DJI RS Pro;HoTT Telemetry;MAVLink;DisplayPort;GPS";
+    options = ELRS_SERIAL_PROTOCOL_LUA_OPTIONS;
     selectionValue = getProtocolSelectionFromConfig(cfg);
     selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_ACTIVE_MODE:
+    paramType = CRSF_INFO;
+    name = "Active Mode";
+    value = rxLuaActiveModeValue;
     break;
   case RX_LUA_PARAM_FAILSAFE:
     paramType = CRSF_TEXT_SELECTION;
@@ -1387,6 +1666,8 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
             ? cfg->failsafe_mode
             : (uint8_t)ELRS_FAILSAFE_NO_PULSES;
     selectionMax = selectionOptionMax(options);
+    hidden = (cfg == nullptr || cfg->serial_protocol != ELRS_SERIAL_SBUS) &&
+             getConfiguredSerialProtocol() != ELRS_SERIAL_SBUS;
     break;
   case RX_LUA_PARAM_TARGET_SYS_ID:
     paramType = CRSF_UINT8;
@@ -1396,7 +1677,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     intMax = 255;
     intDefault = 1;
     units = "";
-    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK &&
+    hidden = (cfg == nullptr || cfg->serial_protocol != ELRS_SERIAL_MAVLINK) &&
              getConfiguredSerialProtocol() != ELRS_SERIAL_MAVLINK;
     break;
   case RX_LUA_PARAM_SOURCE_SYS_ID:
@@ -1407,12 +1688,12 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     intMax = 255;
     intDefault = 255;
     units = "";
-    hidden = getProtocolSelectionFromConfig(cfg) != ELRS_SERIAL_MAVLINK &&
+    hidden = (cfg == nullptr || cfg->serial_protocol != ELRS_SERIAL_MAVLINK) &&
              getConfiguredSerialProtocol() != ELRS_SERIAL_MAVLINK;
     break;
   case RX_LUA_PARAM_FORCE_TLM:
     paramType = CRSF_TEXT_SELECTION;
-    name = "Force Tlm";
+    name = "Tlm Off";
     options = "Off;On";
     selectionValue = (cfg != nullptr && cfg->force_tlm != 0) ? 1 : 0;
     selectionMax = selectionOptionMax(options);
@@ -1625,8 +1906,8 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
   switch (parameterIndex) {
   case RX_LUA_PARAM_PROTOCOL:
     if (cfg != nullptr) {
-      cfg->serial_protocol =
-          (arg <= ELRS_SERIAL_GPS) ? arg : (uint8_t)ELRS_SERIAL_CRSF;
+      cfg->serial_protocol = elrs_serial_protocol_from_lua_selection(
+          clampU8(arg, 0, ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAX));
       rxLuaSaveConfig(true);
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
@@ -1656,6 +1937,7 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
   case RX_LUA_PARAM_FORCE_TLM:
     if (cfg != nullptr) {
       cfg->force_tlm = arg ? 1 : 0;
+      siw917_rx_set_force_telemetry_off(cfg->force_tlm);
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }
@@ -2077,9 +2359,9 @@ static bool updateTeamraceModelMatch() {
   return shouldForwardChannels;
 }
 
-static bool shouldOutputCrsfRcFrames() {
+static bool shouldOutputSerialRcFrames() {
   if (InBindingMode || InWiFiMode || !crsf_serial_is_ready() ||
-      !configuredSerialProtocolUsesCrsf() ||
+      !configuredSerialProtocolSendsRc() ||
       (TxOtaProtocol != TX_NORMAL_MODE)) {
     return false;
   }
@@ -2386,8 +2668,32 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
-  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
-                        SIW917_ELRS_FHSS_SET_FREQ_RX);
+  if (isDualRadio() && geminiMode) {
+    if (FHSSuseDualBand) {
+      Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_1,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+      Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_2,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+    } else if (((OtaNonce /
+                 ExpressLRS_currAirRate_Modparams->FHSShopInterval) %
+                2U) == 0U) {
+      Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_1,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+      Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_2,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+    } else {
+      // Match upstream Gemini: alternate which physical radio tracks the
+      // offset frequency so both antennas see both hop positions over time.
+      const uint32_t freqRadio2 = FHSSgetNextFreq();
+      Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_1,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+      Radio.SetFrequencyReg(freqRadio2, SX12XX_Radio_2,
+                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+    }
+  } else {
+    Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
+                          SIW917_ELRS_FHSS_SET_FREQ_RX);
+  }
 }
 
 static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HWtimerCallbackTick() {
@@ -2586,6 +2892,22 @@ static void ICACHE_RAM_ATTR updateSwitchModePendingFromOta(uint8_t newSwitchMode
   }
 }
 
+static uint8_t ICACHE_RAM_ATTR
+ClampTelemetryDenomForSiw917(uint8_t denom, uint8_t rateIndex) {
+  if (!isDualRadio() || !geminiMode ||
+      (denom >= SIW917_ELRS_MIN_TLM_DENOM_200HZ_FULL_GEMINI)) {
+    return denom;
+  }
+
+  const expresslrs_mod_settings_s *const params =
+      get_elrs_airRateConfig(rateIndex);
+  if (params->enum_rate != RATE_LORA_900_200HZ_8CH) {
+    return denom;
+  }
+
+  return SIW917_ELRS_MIN_TLM_DENOM_200HZ_FULL_GEMINI;
+}
+
 static bool ICACHE_RAM_ATTR
 ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   // Verify the binding ID
@@ -2622,7 +2944,12 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
 
   // A single-LR1121 RX must not mirror the TX's Gemini request locally. The
   // link-stat trueDiversityAvailable bit tells a Gemini TX to step down.
-  geminiMode = isDualRadio() ? otaSync->geminiMode : 0;
+  const uint8_t nextGeminiMode = isDualRadio() ? otaSync->geminiMode : 0;
+  if (nextGeminiMode != geminiMode) {
+    DBGLN("Gemini mode changed: %u -> %u", (unsigned)geminiMode,
+          (unsigned)nextGeminiMode);
+  }
+  geminiMode = nextGeminiMode;
 
   // Will change the packet air rate in loop() if this changes
   ExpressLRS_nextAirRateIndex =
@@ -2633,7 +2960,10 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   expresslrs_tlm_ratio_e TLMrateIn =
       (expresslrs_tlm_ratio_e)(otaSync->newTlmRatio +
                                (uint8_t)TLM_RATIO_NO_TLM);
-  uint8_t TlmDenom = TLMratioEnumToValue(TLMrateIn);
+  const uint8_t requestedTlmDenom = TLMratioEnumToValue(TLMrateIn);
+  uint8_t TlmDenom =
+      ClampTelemetryDenomForSiw917(requestedTlmDenom,
+                                   ExpressLRS_nextAirRateIndex);
   if (ExpressLRS_currTlmDenom != TlmDenom) {
 #if ELRS_DIAG_TLM_RATE_LOG
     const uint8_t previousTlmDenom = ExpressLRS_currTlmDenom;
@@ -2702,6 +3032,10 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
       prevBoostTraceUlMalformed = ulMalformed;
     }
 #endif
+    if (requestedTlmDenom != TlmDenom) {
+      DBGLN("TLM denom clamped 1:%u -> 1:%u for 200Hz Full Gemini",
+            requestedTlmDenom, TlmDenom);
+    }
     ExpressLRS_currTlmDenom = TlmDenom;
     telemBurstValid = false;
     InvalidatePrebuiltTelemetry();
@@ -3216,13 +3550,14 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   }
 
   uint32_t const beginProcessing = micros();
+  uint32_t packetTimeUs = beginProcessing;
+  uint8_t pfdSourceForPacket = 0;
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG || ELRS_DIAG_USE_DIO_PFD_TIMESTAMP
   uint32_t const dio1EdgeUs = lr1121_hal_get_last_dio1_edge_us();
   uint32_t const deferredUs = lr1121_hal_get_last_deferred_us();
   uint32_t const rxIsrEntryUs = lr1121_get_last_rxnbisr_entry_us();
   uint32_t const packetReadyUs = lr1121_get_last_packet_ready_us();
   const bool timerRunningForPfd = hwTimer::isRunning();
-  uint32_t packetTimeUs = beginProcessing;
-  uint8_t pfdSourceForPacket = 0;
   if (dio1EdgeUs != 0U) {
     const uint32_t irqLatencyUs = beginProcessing - dio1EdgeUs;
     if (irqLatencyUs < 10000U) {
@@ -3257,26 +3592,26 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
       lastPacketToCallbackUs = packetToCallback;
     }
   }
-  uint32_t const now = millis();
-
+#endif
   OTA_Packet_s *const otaPktPtr = (OTA_Packet_s *const)Radio.RXdataBuffer;
   uint8_t const type = Radio.RXdataBuffer[0] & 0x03;
 
   // Validate CRC
   if (!OtaValidatePacketCrc(otaPktPtr)) {
-    crcFailCount++;
-    crcFailTypeCount[type]++;
+    ELRS_PACKET_STAT_INC(crcFailCount);
+    ELRS_PACKET_STAT_INC(crcFailTypeCount[type]);
     diagnoseCrcFailureNonce(otaPktPtr, type);
     return false;
   }
 
-  crcPassCount++;
-  crcPassTypeCount[type]++;
-  lastValidPacketType = type;
-  lastValidExpectedNonce = OtaNonce;
-  lastValidExpectedFhss = FHSSgetCurrIndex();
-  lastValidFreq = Radio.currFreq;
-  lastPfdUsedEdgeTimestamp = pfdSourceForPacket;
+  ELRS_PACKET_STAT_INC(crcPassCount);
+  ELRS_PACKET_STAT_INC(crcPassTypeCount[type]);
+  ELRS_PACKET_STAT_SET(lastValidPacketType, type);
+  ELRS_PACKET_STAT_SET(lastValidExpectedNonce, OtaNonce);
+  ELRS_PACKET_STAT_SET(lastValidExpectedFhss, FHSSgetCurrIndex());
+  ELRS_PACKET_STAT_SET(lastValidFreq, Radio.currFreq);
+  ELRS_PACKET_STAT_SET(lastPfdUsedEdgeTimestamp, pfdSourceForPacket);
+  uint32_t const now = millis();
 
   if (ExpressLRS_currAirRate_Modparams != nullptr &&
       ExpressLRS_currAirRate_RFperfParams != nullptr) {
@@ -3288,12 +3623,13 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     PFDloop.extEvent(packetTimeUs + slack);
   }
 
-  // Capture this packet
+#if ELRS_DIAG_PACKET_CAPTURE
   uint32_t cidx = pkt_capture_idx % PKT_CAPTURE_SIZE;
   memcpy((void *)pkt_capture_buf[cidx], (void *)Radio.RXdataBuffer, 8);
   pkt_capture_len[cidx] = 8;
   pkt_capture_idx++;
   pkt_capture_count++;
+#endif
 
   // Record valid packet time
   LastValidPacket = now;
@@ -3309,8 +3645,8 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   case PACKET_TYPE_SYNC: {
     OTA_Sync_s const *const sync =
         OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync;
-    lastValidSyncNonce = sync->nonce;
-    lastValidSyncFhss = sync->fhssIndex;
+    ELRS_PACKET_STAT_SET(lastValidSyncNonce, sync->nonce);
+    ELRS_PACKET_STAT_SET(lastValidSyncFhss, sync->fhssIndex);
     doStartTimer = ProcessRfPacket_SYNC(now, sync) && !InBindingMode;
     break;
   }
@@ -3336,7 +3672,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   if (LQCalc.currentIsSet() && connectionState == connected) {
-    rxLqCurrentSetSkipCount++;
+    ELRS_PACKET_STAT_INC(rxLqCurrentSetSkipCount);
 #if ELRS_DIAG_TX_TURNAROUND
     if (telemetryAwaitingRx) {
       telemetryLqSetWhileAwaitingCount++;
@@ -3549,6 +3885,11 @@ static void maybePrintTelemetry150Snapshot(unsigned long now) { (void)now; }
 //=============================================================================
 // RF Link rate setting
 //=============================================================================
+static inline bool isCrossbandRate(const expresslrs_mod_settings_s *params) {
+  return params != nullptr &&
+         params->radio_type == RADIO_TYPE_LR1121_LORA_DUAL;
+}
+
 static void SetRFLinkRate(uint8_t index, bool bindMode) {
 #if ELRS_DIAG_RF_RATE_LOG
   DBGLN("SetRFLinkRate begin: index=%d bind=%d", index, bindMode ? 1 : 0);
@@ -3573,10 +3914,12 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 #endif
 
   // Configure FHSS band selection
+  const bool crossbandRate = isDualRadio() && isCrossbandRate(ModParams);
   FHSSusePrimaryFreqBand =
-      !(ModParams->radio_type == RADIO_TYPE_LR1121_LORA_2G4) &&
-      !(ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4);
-  FHSSuseDualBand = false; // No dual band support
+      crossbandRate ||
+      ((ModParams->radio_type != RADIO_TYPE_LR1121_LORA_2G4) &&
+       (ModParams->radio_type != RADIO_TYPE_LR1121_GFSK_2G4));
+  FHSSuseDualBand = crossbandRate;
 
   uint32_t initFreq = FHSSgetInitialFreq();
 #if ELRS_DIAG_RF_RATE_LOG
@@ -3588,11 +3931,45 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   updateRxDownlinkPower(false);
 
   // Configure radio
-  Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, initFreq,
-               ModParams->PreambleLen, invertIQ, ModParams->PayloadLength,
-               ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_900 ||
-                   ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4,
-               (uint8_t)UID[5], (uint8_t)UID[4]);
+  if (crossbandRate) {
+    const uint32_t radio2InitFreq = FHSSgetInitialGeminiFreq();
+    if (!lr1121_hal_prepare_radio2_image_calibration(true)) {
+      DBGLN("Crossband warning: radio2 2.4GHz image calibration failed");
+    }
+    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, initFreq,
+                 ModParams->PreambleLen, invertIQ, ModParams->PayloadLength,
+                 false, (uint8_t)UID[5], (uint8_t)UID[4], SX12XX_Radio_1);
+    Radio.Config(ModParams->bw2, ModParams->sf2, ModParams->cr2,
+                 radio2InitFreq, ModParams->PreambleLen2, invertIQ,
+                 ModParams->PayloadLength, false, (uint8_t)UID[5],
+                 (uint8_t)UID[4], SX12XX_Radio_2);
+#if ELRS_DIAG_RF_RATE_LOG
+    DBGLN("SetRFLinkRate crossband radio1=%u radio2=%u",
+          (unsigned int)initFreq, (unsigned int)radio2InitFreq);
+#endif
+#if SIW917_ELRS_CROSSBAND_TEST_LOG
+    DBGLN("Crossband active: idx=%u radio1=%u radio2=%u", index,
+          (unsigned int)initFreq, (unsigned int)radio2InitFreq);
+#endif
+  } else {
+    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, initFreq,
+                 ModParams->PreambleLen, invertIQ, ModParams->PayloadLength,
+                 ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_900 ||
+                     ModParams->radio_type == RADIO_TYPE_LR1121_GFSK_2G4,
+                 (uint8_t)UID[5], (uint8_t)UID[4]);
+  }
+  if (!crossbandRate && isDualRadio() && geminiMode) {
+    const uint32_t geminiInitFreq = FHSSgetInitialGeminiFreq();
+    if (geminiInitFreq < 1000000000UL &&
+        !lr1121_hal_prepare_radio2_image_calibration(false)) {
+      DBGLN("Gemini warning: radio2 sub-GHz image calibration failed");
+    }
+    Radio.SetFrequencyReg(geminiInitFreq, SX12XX_Radio_2, false);
+#if ELRS_DIAG_RF_RATE_LOG
+    DBGLN("SetRFLinkRate Gemini radio2 initFreq=%u mode=%u",
+          (unsigned int)geminiInitFreq, (unsigned)geminiMode);
+#endif
+  }
   Radio.FuzzySNRThreshold =
       (RFperf->DynpowerSnrThreshUp == DYNPOWER_SNR_THRESH_NONE)
           ? 0
@@ -3644,36 +4021,109 @@ static void ICACHE_RAM_ATTR GenerateTelemetryPacketCrcForNonce(OTA_Packet_s *pkt
   OtaNonce = savedNonce;
 }
 
+static bool ICACHE_RAM_ATTR shouldSendGeminiTelemetry() {
+  return isDualRadio() && geminiMode;
+}
+
+static bool ICACHE_RAM_ATTR isRxTelemetryForcedOff() {
+  return forceTelemetryOff;
+}
+
+static bool ICACHE_RAM_ATTR shouldDeferPowerCommitForTelemetrySlot() {
+#if SIW917_ELRS_DEFER_PWR_COMMIT_200HZ_FULL_GEMINI
+  return isDualRadio() && geminiMode && OtaIsFullRes &&
+         ExpressLRS_currAirRate_Modparams &&
+         ExpressLRS_currAirRate_Modparams->enum_rate ==
+             RATE_LORA_900_200HZ_8CH &&
+         ExpressLRS_currTlmDenom <= 2U;
+#else
+  return false;
+#endif
+}
+
+static uint8_t ICACHE_RAM_ATTR PrepareTelemetryPayloadSpan(
+    uint8_t *primaryPayload, uint8_t *geminiPayload, uint8_t payloadLen,
+    bool useGemini, StubbornSenderPreparedPayload *preparedPayload) {
+  if (useGemini) {
+    WORD_ALIGNED_ATTR uint8_t geminiSpanBuffer[2 * ELRS8_DATA_DL_BYTES_PER_CALL] =
+        {};
+    const uint8_t spanLen = (uint8_t)(payloadLen * 2U);
+    const uint8_t packageIndex = TelemetrySender.PrepareCurrentPayload(
+        geminiSpanBuffer, spanLen, preparedPayload);
+    memcpy(primaryPayload, geminiSpanBuffer, payloadLen);
+    if (geminiPayload) {
+      memcpy(geminiPayload, &geminiSpanBuffer[payloadLen], payloadLen);
+    }
+    return packageIndex;
+  }
+
+  return TelemetrySender.PrepareCurrentPayload(primaryPayload, payloadLen,
+                                               preparedPayload);
+}
+
 static bool ICACHE_RAM_ATTR
-BuildTelemetryPacket(OTA_Packet_s *otaPkt,
+BuildTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
+                     bool *sendGeminiBuffer,
                      StubbornSenderPreparedPayload *preparedPayload,
                      uint8_t nonce, uint8_t *nextTelemetryType,
                      uint8_t *nextTelemetryBurstCount) {
   memset(otaPkt, 0, sizeof(*otaPkt));
+  if (otaPktGemini) {
+    memset(otaPktGemini, 0, sizeof(*otaPktGemini));
+  }
+  if (sendGeminiBuffer) {
+    *sendGeminiBuffer = false;
+  }
 
   uint8_t localNextTelemetryType = NextTelemetryType;
   uint8_t localTelemetryBurstCount = telemetryBurstCount;
   bool tlmQueued = TelemetrySender.IsActive();
+  const bool useGemini =
+      shouldSendGeminiTelemetry() && otaPktGemini && sendGeminiBuffer;
 
   if ((localNextTelemetryType == PACKET_TYPE_LINKSTATS) || !tlmQueued) {
     otaPkt->std.type = PACKET_TYPE_LINKSTATS;
 
     if (OtaIsFullRes) {
       otaPkt->full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt->full.data_dl.packageIndex =
-          TelemetrySender.PrepareCurrentPayload(
-              otaPkt->full.data_dl.ul_link_stats.payload,
-              sizeof(otaPkt->full.data_dl.ul_link_stats.payload),
-              preparedPayload);
+      const uint8_t payloadLen =
+          sizeof(otaPkt->full.data_dl.ul_link_stats.payload);
+      if (useGemini) {
+        *otaPktGemini = *otaPkt;
+      }
+      otaPkt->full.data_dl.packageIndex = PrepareTelemetryPayloadSpan(
+          otaPkt->full.data_dl.ul_link_stats.payload,
+          useGemini ? otaPktGemini->full.data_dl.ul_link_stats.payload
+                    : nullptr,
+          payloadLen, useGemini, preparedPayload);
       LinkStatsToOta(&otaPkt->full.data_dl.ul_link_stats.stats);
+      if (useGemini) {
+        otaPktGemini->full.data_dl.packageIndex =
+            otaPkt->full.data_dl.packageIndex;
+        otaPktGemini->full.data_dl.ul_link_stats.stats =
+            otaPkt->full.data_dl.ul_link_stats.stats;
+        *sendGeminiBuffer = true;
+      }
     } else {
       otaPkt->std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt->std.data_dl.packageIndex =
-          TelemetrySender.PrepareCurrentPayload(
-              otaPkt->std.data_dl.ul_link_stats.payload,
-              sizeof(otaPkt->std.data_dl.ul_link_stats.payload),
-              preparedPayload);
+      const uint8_t payloadLen =
+          sizeof(otaPkt->std.data_dl.ul_link_stats.payload);
+      if (useGemini) {
+        *otaPktGemini = *otaPkt;
+      }
+      otaPkt->std.data_dl.packageIndex = PrepareTelemetryPayloadSpan(
+          otaPkt->std.data_dl.ul_link_stats.payload,
+          useGemini ? otaPktGemini->std.data_dl.ul_link_stats.payload
+                    : nullptr,
+          payloadLen, useGemini, preparedPayload);
       LinkStatsToOta(&otaPkt->std.data_dl.ul_link_stats.stats);
+      if (useGemini) {
+        otaPktGemini->std.data_dl.packageIndex =
+            otaPkt->std.data_dl.packageIndex;
+        otaPktGemini->std.data_dl.ul_link_stats.stats =
+            otaPkt->std.data_dl.ul_link_stats.stats;
+        *sendGeminiBuffer = true;
+      }
     }
 
     localNextTelemetryType = PACKET_TYPE_DATA;
@@ -3688,27 +4138,49 @@ BuildTelemetryPacket(OTA_Packet_s *otaPkt,
     otaPkt->std.type = PACKET_TYPE_DATA;
     if (OtaIsFullRes) {
       otaPkt->full.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt->full.data_dl.packageIndex =
-          TelemetrySender.PrepareCurrentPayload(
-              otaPkt->full.data_dl.payload, sizeof(otaPkt->full.data_dl.payload),
-              preparedPayload);
+      const uint8_t payloadLen = sizeof(otaPkt->full.data_dl.payload);
+      if (useGemini) {
+        *otaPktGemini = *otaPkt;
+      }
+      otaPkt->full.data_dl.packageIndex = PrepareTelemetryPayloadSpan(
+          otaPkt->full.data_dl.payload,
+          useGemini ? otaPktGemini->full.data_dl.payload : nullptr, payloadLen,
+          useGemini, preparedPayload);
+      if (useGemini) {
+        otaPktGemini->full.data_dl.packageIndex =
+            otaPkt->full.data_dl.packageIndex;
+        *sendGeminiBuffer = true;
+      }
     } else {
       otaPkt->std.data_dl.stubbornAck = DataUlReceiver.GetCurrentConfirm();
-      otaPkt->std.data_dl.packageIndex =
-          TelemetrySender.PrepareCurrentPayload(
-              otaPkt->std.data_dl.payload, sizeof(otaPkt->std.data_dl.payload),
-              preparedPayload);
+      const uint8_t payloadLen = sizeof(otaPkt->std.data_dl.payload);
+      if (useGemini) {
+        *otaPktGemini = *otaPkt;
+      }
+      otaPkt->std.data_dl.packageIndex = PrepareTelemetryPayloadSpan(
+          otaPkt->std.data_dl.payload,
+          useGemini ? otaPktGemini->std.data_dl.payload : nullptr, payloadLen,
+          useGemini, preparedPayload);
+      if (useGemini) {
+        otaPktGemini->std.data_dl.packageIndex =
+            otaPkt->std.data_dl.packageIndex;
+        *sendGeminiBuffer = true;
+      }
     }
   }
 
   GenerateTelemetryPacketCrcForNonce(otaPkt, nonce);
+  if (useGemini) {
+    GenerateTelemetryPacketCrcForNonce(otaPktGemini, nonce);
+  }
   *nextTelemetryType = localNextTelemetryType;
   *nextTelemetryBurstCount = localTelemetryBurstCount;
   return true;
 }
 
 static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
-SendTelemetryPacket(OTA_Packet_s *otaPkt, uint8_t diagNonce = OtaNonce,
+SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
+                    bool sendGeminiBuffer, uint8_t diagNonce = OtaNonce,
                     uint8_t diagFhss = FHSSgetCurrIndex()) {
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t sendStartUs = micros();
@@ -3731,11 +4203,36 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, uint8_t diagNonce = OtaNonce,
   telemetryTxNonce = diagNonce;
   telemetryTxFhss = diagFhss;
 #endif
-  if (Radio.HasPendingOutputPower()) {
+  if (Radio.HasPendingOutputPower() &&
+      !shouldDeferPowerCommitForTelemetrySlot()) {
     Radio.SetTxIdleMode();
     Radio.CommitOutputPowerForNextTx();
   }
-  Radio.TXnb((uint8_t *)otaPkt, false, nullptr, SX12XX_Radio_All);
+
+  const SX12XX_Radio_Number_t transmittingRadio =
+      isRxTelemetryForcedOff() ? SX12XX_Radio_NONE : SX12XX_Radio_All;
+
+  if (sendGeminiBuffer && otaPktGemini) {
+    const bool swapGemini =
+        ExpressLRS_currAirRate_Modparams &&
+        (ExpressLRS_currAirRate_Modparams->FHSShopInterval != 0) &&
+        (((diagNonce / ExpressLRS_currAirRate_Modparams->FHSShopInterval) %
+          2U) != 0U) &&
+        !FHSSuseDualBand;
+    if (swapGemini) {
+      Radio.TXnb((uint8_t *)otaPktGemini, true, (uint8_t *)otaPkt,
+                 transmittingRadio);
+    } else {
+      Radio.TXnb((uint8_t *)otaPkt, true, (uint8_t *)otaPktGemini,
+                 transmittingRadio);
+    }
+  } else {
+    Radio.TXnb((uint8_t *)otaPkt, false, nullptr, transmittingRadio);
+  }
+
+  if (transmittingRadio == SX12XX_Radio_NONE) {
+    TXdoneISR();
+  }
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   updateHotpathMax(telemetrySendMaxUs, micros() - sendStartUs);
 #endif
@@ -3749,11 +4246,18 @@ static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() {
   return hasRoom;
 }
 
-static bool ICACHE_RAM_ATTR QueueTelemetryPacketForTask(OTA_Packet_s *otaPkt) {
+static bool ICACHE_RAM_ATTR QueueTelemetryPacketForTask(
+    OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
+    bool sendGeminiBuffer) {
   bool queued = false;
   const uint32_t primask = telemetryEnterCritical();
   if (!deferredTelemetryPending) {
     memcpy(&deferredTelemetryPacket, otaPkt, sizeof(deferredTelemetryPacket));
+    deferredTelemetrySendGemini = sendGeminiBuffer;
+    if (sendGeminiBuffer && otaPktGemini) {
+      memcpy(&deferredTelemetryGeminiPacket, otaPktGemini,
+             sizeof(deferredTelemetryGeminiPacket));
+    }
     deferredTelemetryNonce = OtaNonce;
     deferredTelemetryFhss = FHSSgetCurrIndex();
     deferredTelemetryPending = true;
@@ -3773,6 +4277,8 @@ static bool ICACHE_RAM_ATTR QueueTelemetryPacketForTask(OTA_Packet_s *otaPkt) {
 
 static void ServiceDeferredTelemetryTx() {
   WORD_ALIGNED_ATTR OTA_Packet_s packet = {};
+  WORD_ALIGNED_ATTR OTA_Packet_s geminiPacket = {};
+  bool sendGeminiBuffer = false;
   uint8_t diagNonce = 0;
   uint8_t diagFhss = 0;
 
@@ -3783,24 +4289,33 @@ static void ServiceDeferredTelemetryTx() {
   }
 
   memcpy(&packet, &deferredTelemetryPacket, sizeof(packet));
+  sendGeminiBuffer = deferredTelemetrySendGemini;
+  if (sendGeminiBuffer) {
+    memcpy(&geminiPacket, &deferredTelemetryGeminiPacket, sizeof(geminiPacket));
+  }
   diagNonce = deferredTelemetryNonce;
   diagFhss = deferredTelemetryFhss;
   deferredTelemetryPending = false;
   telemetryExitCritical(primask);
 
-  SendTelemetryPacket(&packet, diagNonce, diagFhss);
+  SendTelemetryPacket(&packet, sendGeminiBuffer ? &geminiPacket : nullptr,
+                      sendGeminiBuffer, diagNonce, diagFhss);
   telemetryDeferredSendCount++;
   telemetryTxCount++;
 }
 
-static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(OTA_Packet_s *otaPkt) {
-  return QueueTelemetryPacketForTask(otaPkt);
+static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(
+    OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
+    bool sendGeminiBuffer) {
+  return QueueTelemetryPacketForTask(otaPkt, otaPktGemini, sendGeminiBuffer);
 }
 #else
 static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() { return true; }
 static void ServiceDeferredTelemetryTx() {}
-static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(OTA_Packet_s *otaPkt) {
-  SendTelemetryPacket(otaPkt);
+static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(
+    OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
+    bool sendGeminiBuffer) {
+  SendTelemetryPacket(otaPkt, otaPktGemini, sendGeminiBuffer);
   return true;
 }
 #endif
@@ -3822,8 +4337,11 @@ static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {
     return;
   }
 
-  if (BuildTelemetryPacket(&prebuiltTelemetryPacket, &prebuiltTelemetryPayload,
-                           targetNonce, &prebuiltNextTelemetryType,
+  if (BuildTelemetryPacket(&prebuiltTelemetryPacket,
+                           &prebuiltTelemetryGeminiPacket,
+                           &prebuiltTelemetrySendGemini,
+                           &prebuiltTelemetryPayload, targetNonce,
+                           &prebuiltNextTelemetryType,
                            &prebuiltTelemetryBurstCount)) {
     prebuiltTelemetryNonce = targetNonce;
     prebuiltTelemetryValid = true;
@@ -3868,7 +4386,11 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
       NextTelemetryType = prebuiltNextTelemetryType;
       telemetryBurstCount = prebuiltTelemetryBurstCount;
       telemetryPrebuildHitCount++;
-      if (DispatchTelemetryPacket(&prebuiltTelemetryPacket)) {
+      if (DispatchTelemetryPacket(
+              &prebuiltTelemetryPacket,
+              prebuiltTelemetrySendGemini ? &prebuiltTelemetryGeminiPacket
+                                          : nullptr,
+              prebuiltTelemetrySendGemini)) {
         return true;
       }
       telemetrySuppressedCount++;
@@ -3883,6 +4405,8 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
 #endif
 
   WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {};
+  WORD_ALIGNED_ATTR OTA_Packet_s otaPktGemini = {};
+  bool sendGeminiBuffer = false;
   StubbornSenderPreparedPayload preparedPayload = {};
   uint8_t nextTelemetryType = NextTelemetryType;
   uint8_t nextTelemetryBurstCount = telemetryBurstCount;
@@ -3890,8 +4414,9 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t buildStartUs = micros();
 #endif
-  if (!BuildTelemetryPacket(&otaPkt, &preparedPayload, OtaNonce,
-                            &nextTelemetryType, &nextTelemetryBurstCount) ||
+  if (!BuildTelemetryPacket(&otaPkt, &otaPktGemini, &sendGeminiBuffer,
+                            &preparedPayload, OtaNonce, &nextTelemetryType,
+                            &nextTelemetryBurstCount) ||
       !TelemetrySender.CommitPreparedPayload(preparedPayload)) {
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     updateHotpathMax(telemetryBuildMaxUs, micros() - buildStartUs);
@@ -3906,7 +4431,8 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
   alreadyTLMresp = true;
   NextTelemetryType = nextTelemetryType;
   telemetryBurstCount = nextTelemetryBurstCount;
-  if (!DispatchTelemetryPacket(&otaPkt)) {
+  if (!DispatchTelemetryPacket(&otaPkt, sendGeminiBuffer ? &otaPktGemini : nullptr,
+                               sendGeminiBuffer)) {
     telemetrySuppressedCount++;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
@@ -4362,6 +4888,7 @@ bool elrs_init(void) {
   elrs_config_t *cfg = elrs_config_get();
   if (cfg) {
     modelMatchId = cfg->model_id;
+    siw917_rx_set_force_telemetry_off(cfg->force_tlm);
     DBGLN("Model match ID: %d (%s)", modelMatchId,
           modelMatchId == 0xFF ? "disabled" : "enabled");
   }
@@ -4847,6 +5374,9 @@ void elrs_loop(void) {
     RXtimerState = tim_locked;
   }
 
+  updateSerialRxState();
+  serviceCrsfSerialTelemetry();
+
   if (!TelemetrySender.IsActive()) {
     uint8_t nextPayloadSize = 0;
     if (otaConnector.GetNextPayload(&nextPayloadSize, TelemetryBuffer) &&
@@ -4920,12 +5450,23 @@ void elrs_loop(void) {
   processDecodedUplinkTxPower();
   updateRxDownlinkPower(false);
 
-  // Send CRSF RC channels, honoring the configured failsafe mode after RF loss.
+  // Send serial RC channels, honoring the configured failsafe mode after RF loss.
   static uint32_t lastRcOutput = 0;
-  if (shouldOutputCrsfRcFrames() &&
-      (now - lastRcOutput) >= CRSF_RC_OUTPUT_INTERVAL) {
+  const uint8_t serialProtocol = getConfiguredSerialProtocol();
+  if (shouldOutputSerialRcFrames() &&
+      (now - lastRcOutput) >= serialRcOutputIntervalMs(serialProtocol)) {
     lastRcOutput = now;
-    crsf_serial_send_channels(ChannelData);
+    if (serialProtocolUsesSbus(serialProtocol)) {
+      const bool failsafeActive = connectionState != connected;
+      (void)crsf_serial_send_sbus_channels(ChannelData, failsafeActive,
+                                           failsafeActive);
+    } else if (serialProtocolUsesSumd(serialProtocol)) {
+      (void)crsf_serial_send_sumd_channels(ChannelData);
+    } else {
+      uint32_t crsfChannels[CRSF_NUM_CHANNELS] = {};
+      prepareCrsfSerialChannels(crsfChannels);
+      (void)crsf_serial_send_channels(crsfChannels);
+    }
   }
 
   // Update external link stats and send to FC periodically

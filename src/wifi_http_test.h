@@ -10,9 +10,9 @@
  * This tests the WiFi and HTTP server functionality needed for ELRS OTA updates.
  *
  * Test Procedure:
- * 1. Start WiFi in Access Point mode (creates "ELRS_TEST_AP" network)
+ * 1. Start WiFi in Access Point mode (creates "ExpressLRS RX" network)
  * 2. Start HTTP server on port 80
- * 3. Serve test page at http://192.168.10.10/
+ * 3. Serve test page at http://10.0.0.1/
  * 4. Log client connections and HTTP requests
  *
  * Citation: Silicon Labs WiseConnect SDK 3.5.2
@@ -36,14 +36,14 @@ extern "C" {
  ******************************************************************************/
 
 /* WiFi AP Settings */
-#define WIFI_TEST_AP_SSID        "ELRS_TEST_AP"
-#define WIFI_TEST_AP_PASSWORD    "elrs1234"       /* Minimum 8 characters for WPA2 */
+#define WIFI_TEST_AP_SSID        "ExpressLRS RX"
+#define WIFI_TEST_AP_PASSWORD    "expresslrs"     /* Upstream ELRS AP password */
 #define WIFI_TEST_AP_CHANNEL     6                /* 2.4GHz channel */
 
 /* IP Configuration (Static for AP mode) */
-#define WIFI_TEST_IP_ADDRESS     0x0A0AA8C0       /* 192.168.10.10 */
+#define WIFI_TEST_IP_ADDRESS     0x0100000A       /* 10.0.0.1 */
 #define WIFI_TEST_SUBNET_MASK    0x00FFFFFF       /* 255.255.255.0 */
-#define WIFI_TEST_GATEWAY        0x0A0AA8C0       /* 192.168.10.10 (self) */
+#define WIFI_TEST_GATEWAY        0x0100000A       /* 10.0.0.1 (self) */
 
 /* HTTP Server Settings */
 #define WIFI_TEST_HTTP_PORT      80
@@ -56,8 +56,8 @@ extern "C" {
  * @brief Initialize and start WiFi AP + HTTP server test
  *
  * This function:
- * 1. Initializes WiFi in AP mode with SSID "ELRS_TEST_AP"
- * 2. Configures static IP 192.168.10.10
+ * 1. Initializes WiFi in AP mode with SSID "ExpressLRS RX"
+ * 2. Configures static IP 10.0.0.1
  * 3. Starts HTTP server on port 80
  * 4. Registers request handlers for test endpoints
  *

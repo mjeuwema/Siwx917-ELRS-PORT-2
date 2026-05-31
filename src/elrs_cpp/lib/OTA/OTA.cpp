@@ -12,6 +12,10 @@
 
 #include <cassert>
 
+#ifndef SIW917_ELRS_OTA_SERIALIZER_LOG
+#define SIW917_ELRS_OTA_SERIALIZER_LOG 0
+#endif
+
 static_assert(sizeof(OTA_Packet4_s) == OTA4_PACKET_SIZE, "OTA4 packet stuct is invalid!");
 static_assert(sizeof(OTA_Packet8_s) == OTA8_PACKET_SIZE, "OTA8 packet stuct is invalid!");
 
@@ -39,12 +43,13 @@ void OtaUpdateCrcInitFromUid()
     // xor-ing in the nonce in the GenerateCRC and ValidateCRC function
     OtaCrcInitializer ^= (uint16_t)OTA_VERSION_ID << 8;
     
-    // Debug output
+#if SIW917_ELRS_OTA_SERIALIZER_LOG
     extern void debugPrintf(const char* fmt, ...);
     debugPrintf("[OTA] CRC Init from UID: %02X:%02X:%02X:%02X:%02X:%02X\n",
                 UID[0], UID[1], UID[2], UID[3], UID[4], UID[5]);
     debugPrintf("[OTA] OtaCrcInitializer = 0x%04X (OTA_VERSION_ID=%d)\n", 
                 OtaCrcInitializer, OTA_VERSION_ID);
+#endif
 }
 
 static inline uint8_t ICACHE_RAM_ATTR HybridWideNonceToSwitchIndex(uint8_t const nonce)
@@ -533,17 +538,20 @@ void OtaUpdateSerializers(OtaSwitchMode_e const switchMode, uint8_t packetSize)
 {
     OtaIsFullRes = (packetSize == OTA8_PACKET_SIZE);
     
-    // Debug output
+#if SIW917_ELRS_OTA_SERIALIZER_LOG
     extern void debugPrintf(const char* fmt, ...);
     debugPrintf("[OTA] UpdateSerializers: packetSize=%d, OtaIsFullRes=%d\n", 
                 packetSize, OtaIsFullRes);
+#endif
 
     if (OtaIsFullRes)
     {
         OtaValidatePacketCrc = &ValidatePacketCrcFull;
         OtaGeneratePacketCrc = &GeneratePacketCrcFull;
         ota_crc.init(16, ELRS_CRC16_POLY);
+#if SIW917_ELRS_OTA_SERIALIZER_LOG
         debugPrintf("[OTA] Using CRC16 (Full resolution)\n");
+#endif
 
         #if defined(TARGET_TX) || defined(UNIT_TEST)
         if (switchMode == smWideOr8ch)
@@ -561,7 +569,9 @@ void OtaUpdateSerializers(OtaSwitchMode_e const switchMode, uint8_t packetSize)
         OtaValidatePacketCrc = &ValidatePacketCrcStd;
         OtaGeneratePacketCrc = &GeneratePacketCrcStd;
         ota_crc.init(14, ELRS_CRC14_POLY);
+#if SIW917_ELRS_OTA_SERIALIZER_LOG
         debugPrintf("[OTA] Using CRC14 (Standard resolution)\n");
+#endif
 
         if (switchMode == smWideOr8ch)
         {

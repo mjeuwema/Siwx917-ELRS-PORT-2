@@ -28,6 +28,8 @@ extern "C" {
  ******************************************************************************/
 
 #define CRSF_SERIAL_BAUDRATE_DEFAULT   420000  /* ELRS standard */
+#define SBUS_SERIAL_BAUDRATE           100000
+#define SUMD_SERIAL_BAUDRATE           115200
 
 /* Use existing CRSF definitions from crsf_protocol.h if available */
 #ifndef CRSF_SYNC_BYTE
@@ -52,6 +54,11 @@ extern "C" {
 #define CRSF_SERIAL_CHANNEL_MID        992     /* 1500us */
 #define CRSF_SERIAL_CHANNEL_MAX        1811    /* 2012us */
 #define CRSF_SERIAL_MAX_FRAME_SIZE     64
+
+typedef enum {
+    CRSF_SERIAL_FORMAT_8N1 = 0,
+    CRSF_SERIAL_FORMAT_8E2 = 1,
+} crsf_serial_format_t;
 
 /*******************************************************************************
  * Data Structures
@@ -88,6 +95,14 @@ typedef struct {
 int crsf_serial_init(uint32_t baud_rate);
 
 /**
+ * @brief Initialize/reconfigure USART0 with an explicit serial frame format
+ *
+ * This keeps CRSF/MAVLink on 8N1 while allowing SBUS to use upstream's 8E2
+ * framing without adding a second UART driver path.
+ */
+int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format);
+
+/**
  * @brief Deinitialize CRSF serial output
  */
 void crsf_serial_deinit(void);
@@ -107,6 +122,24 @@ bool crsf_serial_is_ready(void);
  * @return 0 on success, negative on error
  */
 int crsf_serial_send_channels(const uint32_t *channels);
+
+/**
+ * @brief Send RC channels in SBUS format
+ *
+ * @param channels Array of 16 channel values in CRSF channel units
+ * @param failsafe_active Set SBUS failsafe flag
+ * @param frame_lost Set SBUS frame lost flag
+ */
+int crsf_serial_send_sbus_channels(const uint32_t *channels,
+                                   bool failsafe_active,
+                                   bool frame_lost);
+
+/**
+ * @brief Send RC channels in SUMD format
+ *
+ * @param channels Array of 16 channel values in CRSF channel units
+ */
+int crsf_serial_send_sumd_channels(const uint32_t *channels);
 
 /**
  * @brief Send link statistics to flight controller

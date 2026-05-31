@@ -28,6 +28,8 @@ protected:
   void parameterUpdateReq(crsf_addr_e origin, bool isElrs,
                           uint8_t parameterType, uint8_t parameterIndex,
                           void *payload);
+  void sendParameterUpdate(uint8_t parameterIndex, uint8_t fieldChunk = 0,
+                           bool isElrs = false);
   void sendCommandResponse(commandParameter *cmd, commandStep_e step,
                            const char *message);
 

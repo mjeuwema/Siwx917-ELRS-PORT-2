@@ -198,6 +198,18 @@ void CRSFEndpoint::pushResponseChunk(commandParameter *cmd, bool isElrs) {
   }
 }
 
+void CRSFEndpoint::sendParameterUpdate(uint8_t parameterIndex,
+                                       uint8_t fieldChunk, bool isElrs) {
+  if (parameterIndex >= MAX_CRSF_PARAMETERS ||
+      paramDefinitions[parameterIndex] == nullptr) {
+    return;
+  }
+
+  (void)sendParameter(requestOrigin, isElrs,
+                      CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY, fieldChunk,
+                      paramDefinitions[parameterIndex]);
+}
+
 void CRSFEndpoint::sendCommandResponse(commandParameter *cmd,
                                        commandStep_e step,
                                        const char *message) {

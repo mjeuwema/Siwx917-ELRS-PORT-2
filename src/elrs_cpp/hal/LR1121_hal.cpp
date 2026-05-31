@@ -60,6 +60,67 @@ static inline void dio1UpdateMax(volatile uint32_t &maxValue,
 }
 #endif
 
+#if SIW917_ELRS_DIO_EDGE_TIMESTAMPS
+#define SIW917_DIO_TIMESTAMP(var_) ((var_) = micros())
+#else
+#define SIW917_DIO_TIMESTAMP(var_) do { } while (0)
+#endif
+
+#if SIW917_ELRS_DIO_STATS_DIAG
+#define SIW917_DIO_STAT_INC(var_) ((var_)++)
+#else
+#define SIW917_DIO_STAT_INC(var_) do { } while (0)
+#endif
+
+#if SIW917_ELRS_DIRECT_DIO_HAL_IO
+#define SIW917_HAL_EGPIO_BASE 0x46130000UL
+#define SIW917_HAL_EGPIO_BIT_LOAD_REG(pin_)                                  \
+  (*(volatile uint32_t *)(SIW917_HAL_EGPIO_BASE + 0x004UL +                  \
+                          (0x10UL * (uint32_t)(pin_))))
+#define SIW917_HAL_DIO1_GPIO 46U
+#define SIW917_HAL_DIO1_INT_CHANNEL 2U
+#define SIW917_HAL_DIO2_INT_CHANNEL 3U
+#define SIW917_HAL_DIO1_IRQN                                                  \
+  ((IRQn_Type)(EGPIO_PIN_0_IRQn + SIW917_HAL_DIO1_INT_CHANNEL))
+#define SIW917_HAL_DIO2_IRQN                                                  \
+  ((IRQn_Type)(EGPIO_PIN_0_IRQn + SIW917_HAL_DIO2_INT_CHANNEL))
+
+static inline int siw917HalDio1Read() {
+  return (int)(SIW917_HAL_EGPIO_BIT_LOAD_REG(SIW917_HAL_DIO1_GPIO) & 1U);
+}
+
+static inline void siw917HalDio1Pause() {
+  NVIC_DisableIRQ(SIW917_HAL_DIO1_IRQN);
+}
+
+static inline void siw917HalDio1Resume() {
+  NVIC_EnableIRQ(SIW917_HAL_DIO1_IRQN);
+}
+
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+static inline int siw917HalDio2Read() {
+  return (int)(SIW917_HAL_EGPIO_BIT_LOAD_REG(LR1121_PIN_DIO_2) & 1U);
+}
+
+static inline void siw917HalDio2Pause() {
+  NVIC_DisableIRQ(SIW917_HAL_DIO2_IRQN);
+}
+
+static inline void siw917HalDio2Resume() {
+  NVIC_EnableIRQ(SIW917_HAL_DIO2_IRQN);
+}
+#endif
+
+#define lr1121_dio1_read siw917HalDio1Read
+#define lr1121_dio1_pause_isr siw917HalDio1Pause
+#define lr1121_dio1_resume_isr siw917HalDio1Resume
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#define lr1121_dio2_read siw917HalDio2Read
+#define lr1121_dio2_pause_isr siw917HalDio2Pause
+#define lr1121_dio2_resume_isr siw917HalDio2Resume
+#endif
+#endif
+
 extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
 
@@ -101,6 +162,46 @@ static inline void siw917SelectRadio(SX12XX_Radio_Number_t radioNumber) {
 static inline bool siw917IsValidLr1121Version(
     const lr1121_firmware_version_t &version) {
   return version.hardware == 0x22 && version.type != 0x00;
+}
+
+static bool siw917SetSelectedRadioStandbyXosc() {
+  const uint8_t standbyXosc = ELRS_STANDBY_XOSC;
+  if (!lr1121_wait_busy_timeout(100)) {
+    return false;
+  }
+  if (!lr1121_send_command(ELRS_CMD_SET_STANDBY, &standbyXosc, 1)) {
+    return false;
+  }
+  return lr1121_wait_busy_timeout(200);
+}
+
+extern "C" bool lr1121_hal_prepare_radio2_image_calibration(bool highBand) {
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  static int8_t radio2ImageBand =
+#if LR1121_BAND_24GHZ
+      1;
+#else
+      0;
+#endif
+  const int8_t requestedBand = highBand ? 1 : 0;
+  if (radio2ImageBand == requestedBand) {
+    return true;
+  }
+
+  lr1121_select_radio(LR1121_RADIO_2);
+  const uint32_t freqMin = highBand ? 2400400000UL : 902000000UL;
+  const uint32_t freqMax = highBand ? 2479400000UL : 928000000UL;
+  const bool ok = lr1121_elrs_calib_image(freqMin, freqMax) &&
+                  siw917SetSelectedRadioStandbyXosc();
+  lr1121_select_radio(LR1121_RADIO_1);
+  if (ok) {
+    radio2ImageBand = requestedBand;
+  }
+  return ok;
+#else
+  (void)highBand;
+  return false;
+#endif
 }
 
 // Static instance pointer
@@ -154,10 +255,12 @@ void LR1121Hal::init() {
   }
 
 #if SIW917_ELRS_DUAL_RADIO_PROBE || SIW917_ELRS_UPSTREAM_DUAL_RADIO
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("LR1121Hal Radio2 probe enabled: NSS=GPIO_%u BUSY=GPIO_%u "
         "DIO9=GPIO_%u RST=GPIO_%u",
         (unsigned)LR1121_PIN_NSS_2, (unsigned)LR1121_PIN_BUSY_2,
         (unsigned)LR1121_PIN_DIO_2, (unsigned)LR1121_PIN_RST_2);
+#endif
   lr1121_select_radio(LR1121_RADIO_2);
   const bool radio2PinsOk = lr1121_debug_exercise_radio2_pins();
   if (!radio2PinsOk) {
@@ -180,8 +283,10 @@ void LR1121Hal::init() {
     if (status == LR1121_OK &&
         lr1121_get_firmware_version(&radio2Version, LR1121_OPCODE_GET_VERSION)) {
       if (siw917IsValidLr1121Version(radio2Version)) {
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
         DBGLN("LR1121 #2 Probe Ready: HW=0x%02X Type=0x%02X FW=0x%04X",
               radio2Version.hardware, radio2Version.type, radio2Version.version);
+#endif
       } else {
         DBGLN("LR1121 #2 probe invalid version: HW=0x%02X Type=0x%02X "
               "FW=0x%04X (check NSS2/BUSY2/RST2/MISO wiring)",
@@ -225,6 +330,7 @@ void LR1121Hal::init() {
   lr1121_dio2_enable();
 #endif
 
+#if SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("LR1121Hal DIO hot path: %s",
         SIW917_ELRS_TWO_STAGE_DIO_ISR
             ? (dioStageReady ? (SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
@@ -234,6 +340,7 @@ void LR1121Hal::init() {
             : (SIW917_ELRS_DIRECT_DIO_ISR ? "direct-when-link-active"
                                             : "deferred-task"));
   DBGLN("LR1121Hal initialized");
+#endif
 }
 
 void LR1121Hal::end() {
@@ -682,17 +789,17 @@ static void SIW917_ELRS_RAMFUNC_ATTR processDio2IrqNow() {
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static void SIW917_ELRS_RAMFUNC_ATTR dio1PendStageFromIsr() {
-  dio1_stage_pend_count++;
+  SIW917_DIO_STAT_INC(dio1_stage_pend_count);
   NVIC_SetPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
 }
 
 static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
-  dio1_stage_irq_count++;
+  SIW917_DIO_STAT_INC(dio1_stage_irq_count);
 
-  const bool dio1Seen = dio1_isr_pending || (lr1121_dio1_read() != 0);
+  bool dio1Seen = dio1_isr_pending || (lr1121_dio1_read() != 0);
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
-  const bool dio2Seen = dio2_isr_pending || (lr1121_dio2_read() != 0);
+  bool dio2Seen = dio2_isr_pending || (lr1121_dio2_read() != 0);
 #else
   constexpr bool dio2Seen = false;
 #endif
@@ -716,13 +823,13 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
 
   if (dio1_isr_processing || dio2_isr_processing) {
     if (dio1Seen) {
-      dio1_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
     }
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
     if (dio2Seen) {
-      dio2_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio2_direct_reentrant_count);
       dio2_isr_pending = true;
       isr_2_pending = true;
     }
@@ -738,8 +845,8 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   if (dio1Seen) {
     dio1_isr_pending = false;
     isr_1_pending = false;
-    dio1_direct_count++;
-    dio1_last_deferred_us = micros();
+    SIW917_DIO_STAT_INC(dio1_direct_count);
+    SIW917_DIO_TIMESTAMP(dio1_last_deferred_us);
     dio1_isr_processing = true;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     const uint32_t processStartUs = micros();
@@ -752,7 +859,7 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -761,18 +868,27 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   }
 
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  // Radio1 processing may already clear radio2's paired IRQ via
+  // CheckForSecondPacket() or TX_DONE cleanup. Do not spend another SPI
+  // transaction on a stale radio2 edge if its DIO line is no longer asserted.
+  if (dio2Seen && lr1121_dio2_read() == 0) {
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+    dio2Seen = false;
+  }
+
   if (dio2Seen) {
     dio2_isr_pending = false;
     isr_2_pending = false;
-    dio2_direct_count++;
-    dio2_last_deferred_us = micros();
+    SIW917_DIO_STAT_INC(dio2_direct_count);
+    SIW917_DIO_TIMESTAMP(dio2_last_deferred_us);
     dio2_isr_processing = true;
     processDio2IrqNow();
     dio2_isr_processing = false;
 
     lr1121_dio2_resume_isr();
     if (lr1121_dio2_read() != 0) {
-      dio2_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio2_level_requeue_count);
       dio2_isr_pending = true;
       isr_2_pending = true;
       lr1121_dio2_pause_isr();
@@ -819,12 +935,16 @@ static bool dio1StageInit() {
   NVIC_EnableIRQ((IRQn_Type)DIO1_STAGE_IRQ);
   dio1_stage_irq_installed = true;
 
+#if SIW917_ELRS_DIO_INIT_VERBOSE
   DBGLN("LR1121Hal DIO stage vector installed irq=%d priority=%u "
         "oldVTOR=0x%08lX newVTOR=0x%08lX oldStage=0x%08lX newStage=0x%08lX",
         (int)DIO1_STAGE_IRQ, (unsigned)SIW917_ELRS_DIO_STAGE_IRQ_PRIORITY,
         (unsigned long)oldVtor, (unsigned long)newVtor,
         (unsigned long)oldStageVector,
         (unsigned long)(uintptr_t)dio1StageIrqHandler);
+#else
+  (void)oldStageVector;
+#endif
   return true;
 }
 #else
@@ -876,8 +996,8 @@ extern "C" uint32_t lr1121_hal_get_deferred_max_us(void) {
 }
 
 void LR1121Hal::dioISR_1() {
-  dio1_last_edge_us = micros();
-  isr_1_total_count++;
+  SIW917_DIO_TIMESTAMP(dio1_last_edge_us);
+  SIW917_DIO_STAT_INC(isr_1_total_count);
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
   dio1_isr_pending = true;
@@ -887,14 +1007,14 @@ void LR1121Hal::dioISR_1() {
 #if SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
   if (dio1_stage_irq_installed && dio1GpioDirectPathAllowed()) {
     if (dio1_isr_processing) {
-      dio1_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
       dio1PendStageFromIsr();
       return;
     }
 
     dio1_isr_pending = false;
     isr_1_pending = false;
-    dio1_direct_count++;
+    SIW917_DIO_STAT_INC(dio1_direct_count);
     dio1_last_deferred_us = dio1_last_edge_us;
     dio1_isr_processing = true;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
@@ -908,7 +1028,7 @@ void LR1121Hal::dioISR_1() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -930,7 +1050,7 @@ void LR1121Hal::dioISR_1() {
 
   if (dio1GpioDirectPathAllowed()) {
     if (dio1_isr_processing) {
-      dio1_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -938,7 +1058,7 @@ void LR1121Hal::dioISR_1() {
       return;
     }
 
-    dio1_direct_count++;
+    SIW917_DIO_STAT_INC(dio1_direct_count);
     dio1_isr_processing = true;
     lr1121_dio1_pause_isr();
     processDio1IrqNow();
@@ -946,7 +1066,7 @@ void LR1121Hal::dioISR_1() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -968,14 +1088,14 @@ void LR1121Hal::dioISR_1() {
 void LR1121Hal::handleDeferredISR() {
   const bool dio1High = lr1121_dio1_read() != 0;
   if (dio1_isr_pending || dio1High) {
-    dio1_last_deferred_us = micros();
+    SIW917_DIO_TIMESTAMP(dio1_last_deferred_us);
   }
 
   if (!dio1_isr_pending && dio1High) {
     // DIO1 is level-high until the LR1121 IRQ is cleared. If a new IRQ arrives
     // while the GPIO edge is masked, there may be no fresh rising edge to wake
     // us, so synthesize one from the level.
-    dio1_level_requeue_count++;
+    SIW917_DIO_STAT_INC(dio1_level_requeue_count);
     dio1_last_edge_us = dio1_last_deferred_us;
     dio1_isr_pending = true;
     isr_1_pending = true;
@@ -999,7 +1119,7 @@ void LR1121Hal::handleDeferredISR() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -1009,11 +1129,11 @@ void LR1121Hal::handleDeferredISR() {
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
   const bool dio2High = lr1121_dio2_read() != 0;
   if (dio2_isr_pending || dio2High) {
-    dio2_last_deferred_us = micros();
+    SIW917_DIO_TIMESTAMP(dio2_last_deferred_us);
   }
 
   if (!dio2_isr_pending && dio2High) {
-    dio2_level_requeue_count++;
+    SIW917_DIO_STAT_INC(dio2_level_requeue_count);
     dio2_last_edge_us = dio2_last_deferred_us;
     dio2_isr_pending = true;
     isr_2_pending = true;
@@ -1030,7 +1150,7 @@ void LR1121Hal::handleDeferredISR() {
 
     lr1121_dio2_resume_isr();
     if (lr1121_dio2_read() != 0) {
-      dio2_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio2_level_requeue_count);
       dio2_isr_pending = true;
       isr_2_pending = true;
       lr1121_dio2_pause_isr();
@@ -1041,8 +1161,8 @@ void LR1121Hal::handleDeferredISR() {
 
 void LR1121Hal::dioISR_2() {
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
-  dio2_last_edge_us = micros();
-  isr_2_pending_count++;
+  SIW917_DIO_TIMESTAMP(dio2_last_edge_us);
+  SIW917_DIO_STAT_INC(isr_2_pending_count);
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
   dio2_isr_pending = true;
@@ -1052,14 +1172,14 @@ void LR1121Hal::dioISR_2() {
 #if SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
   if (dio1_stage_irq_installed && dio1GpioDirectPathAllowed()) {
     if (dio2_isr_processing) {
-      dio2_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio2_direct_reentrant_count);
       dio1PendStageFromIsr();
       return;
     }
 
     dio2_isr_pending = false;
     isr_2_pending = false;
-    dio2_direct_count++;
+    SIW917_DIO_STAT_INC(dio2_direct_count);
     dio2_last_deferred_us = dio2_last_edge_us;
     dio2_isr_processing = true;
     processDio2IrqNow();
@@ -1067,7 +1187,7 @@ void LR1121Hal::dioISR_2() {
 
     lr1121_dio2_resume_isr();
     if (lr1121_dio2_read() != 0) {
-      dio2_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio2_level_requeue_count);
       dio2_isr_pending = true;
       isr_2_pending = true;
       lr1121_dio2_pause_isr();
@@ -1086,7 +1206,7 @@ void LR1121Hal::dioISR_2() {
 #endif
 
   if (dio2_isr_processing) {
-    dio2_direct_reentrant_count++;
+    SIW917_DIO_STAT_INC(dio2_direct_reentrant_count);
     dio2_isr_pending = true;
     isr_2_pending = true;
     lr1121_dio2_pause_isr();
@@ -1098,7 +1218,7 @@ void LR1121Hal::dioISR_2() {
   isr_2_pending = true;
   lr1121_dio2_pause_isr();
   if (dio1GpioDirectPathAllowed()) {
-    dio2_direct_count++;
+    SIW917_DIO_STAT_INC(dio2_direct_count);
     dio2_isr_pending = false;
     isr_2_pending = false;
     dio2_isr_processing = true;
@@ -1107,7 +1227,7 @@ void LR1121Hal::dioISR_2() {
 
     lr1121_dio2_resume_isr();
     if (lr1121_dio2_read() != 0) {
-      dio2_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio2_level_requeue_count);
       dio2_isr_pending = true;
       isr_2_pending = true;
       lr1121_dio2_pause_isr();

@@ -1,0 +1,13 @@
+{
+  "version": "0.1.0",
+  "apiVersion": "1.0.0",
+  "author": "Codex + mjeuw",
+  "description": "Decode LR1121 and ExpressLRS custom SPI command frames.",
+  "name": "LR1121 ELRS Tools",
+  "extensions": {
+    "LR1121 ELRS SPI": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.LR1121ElrsSpi"
+    }
+  }
+}

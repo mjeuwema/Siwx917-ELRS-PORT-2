@@ -17,20 +17,30 @@ extern "C" int elrs_config_save_with_rf_rearm(void);
 extern "C" void elrs_apply_bind_storage_change(uint8_t bindStorage);
 extern "C" bool elrs_is_on_loan(void);
 extern "C" void siw917_rx_set_model_match_id(uint8_t modelId);
+extern "C" void siw917_rx_set_force_telemetry_off(uint8_t forceOff);
 extern "C" uint8_t siw917_rx_get_active_serial_protocol(void);
+extern "C" const char *siw917_rx_get_active_mode_string(void);
 
 extern uint8_t ExpressLRS_currTlmDenom;
 
 static char modelString[8] = "Off";
 static char tlmRatioString[8] = "1:1";
+static char activeModeString[24] = "CRSF";
+static char activeModeOverrideString[24] = {};
+static bool activeModeOverrideValid = false;
 static char modelIdOptions[200] = {};
 static bool modelIdOptionsInitialized = false;
 
 static selectionParameter luaSerialProtocol = {
     {"Protocol", CRSF_TEXT_SELECTION, 0, 0},
     0,
-    "CRSF;Inverted CRSF;SBUS;Inverted SBUS;SUMD;DJI RS Pro;HoTT Telemetry;MAVLink;DisplayPort;GPS",
+    ELRS_SERIAL_PROTOCOL_LUA_OPTIONS,
     STR_EMPTYSPACE,
+};
+
+static stringParameter luaActiveMode = {
+    {"Active Mode", CRSF_INFO, 0, 0},
+    activeModeString,
 };
 
 static selectionParameter luaSBUSFailsafeMode = {
@@ -53,7 +63,7 @@ static int8Parameter luaSourceSysId = {
 };
 
 static selectionParameter luaForceTlm = {
-    {"Force Tlm", CRSF_TEXT_SELECTION, 0, 0},
+    {"Tlm Off", CRSF_TEXT_SELECTION, 0, 0},
     0,
     "Off;On",
     STR_EMPTYSPACE,
@@ -110,6 +120,38 @@ static selectionParameter luaModelId = {
     modelIdOptions,
     STR_EMPTYSPACE,
 };
+
+static const char *serialProtocolDisplayName(uint8_t protocol) {
+  switch (protocol) {
+  case ELRS_SERIAL_MAVLINK:
+    return "MAVLink";
+  case ELRS_SERIAL_SBUS:
+    return "SBUS";
+  case ELRS_SERIAL_SUMD:
+    return "SUMD";
+  case ELRS_SERIAL_CRSF:
+  default:
+    return "CRSF";
+  }
+}
+
+static const char *currentRfModeSuffix() {
+  const char *activeMode = siw917_rx_get_active_mode_string();
+  const char *suffix = strstr(activeMode, " Crossband");
+  if (suffix == nullptr) {
+    suffix = strstr(activeMode, " Gemini");
+  }
+  return suffix != nullptr ? suffix : "";
+}
+
+static void setActiveModeOverrideForProtocol(uint8_t protocol) {
+  snprintf(activeModeOverrideString, sizeof(activeModeOverrideString),
+           "%s%s", serialProtocolDisplayName(protocol), currentRfModeSuffix());
+  activeModeOverrideString[sizeof(activeModeOverrideString) - 1] = '\0';
+  activeModeOverrideValid = true;
+}
+
+static void clearActiveModeOverride() { activeModeOverrideValid = false; }
 
 static stringParameter luaLiveTlm = {
     {"Live Tlm", CRSF_INFO, 0, 0},
@@ -299,14 +341,21 @@ void SiW917RXEndpoint::registerParameters() {
   registerParameter(&luaSerialProtocol, [this](propertiesCommon *, int32_t arg) {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
-      cfg->serial_protocol =
-          (uint8_t)clampU8((uint8_t)arg, ELRS_SERIAL_CRSF, ELRS_SERIAL_GPS);
+      const uint8_t protocol = elrs_serial_protocol_from_lua_selection(
+          clampU8((uint8_t)arg, 0, ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAX));
+      cfg->serial_protocol = protocol;
+      setActiveModeOverrideForProtocol(protocol);
+      updateParameters();
+      sendParameterUpdate(luaSerialProtocol.common.id);
+      sendParameterUpdate(luaActiveMode.common.id);
 #if RX_EP_EVENT_LOG
       logParameterWrite("Protocol", cfg->serial_protocol);
 #endif
       requestConfigSave(true);
     }
   });
+
+  registerParameter(&luaActiveMode);
 
   registerParameter(&luaSBUSFailsafeMode, [this](propertiesCommon *, int32_t arg) {
     elrs_config_t *cfg = elrs_config_get();
@@ -347,8 +396,9 @@ void SiW917RXEndpoint::registerParameters() {
     elrs_config_t *cfg = elrs_config_get();
     if (cfg != nullptr) {
       cfg->force_tlm = arg != 0 ? 1 : 0;
+      siw917_rx_set_force_telemetry_off(cfg->force_tlm);
 #if RX_EP_EVENT_LOG
-      logParameterWrite("Force Tlm", cfg->force_tlm);
+      logParameterWrite("Tlm Off", cfg->force_tlm);
 #endif
       requestConfigSave();
     }
@@ -429,13 +479,23 @@ void SiW917RXEndpoint::registerParameters() {
 void SiW917RXEndpoint::updateParameters() {
   elrs_config_t *cfg = elrs_config_get();
   const uint8_t protocol =
-      cfg != nullptr && cfg->serial_protocol <= ELRS_SERIAL_GPS
+      cfg != nullptr && elrs_serial_protocol_is_supported(cfg->serial_protocol)
           ? cfg->serial_protocol
           : (uint8_t)ELRS_SERIAL_CRSF;
 
-  setTextSelectionValue(&luaSerialProtocol, protocol);
+  setTextSelectionValue(&luaSerialProtocol,
+                        elrs_serial_protocol_to_lua_selection(protocol));
+  snprintf(activeModeString, sizeof(activeModeString), "%s",
+           activeModeOverrideValid ? activeModeOverrideString
+                                   : siw917_rx_get_active_mode_string());
+  activeModeString[sizeof(activeModeString) - 1] = '\0';
+  setStringValue(&luaActiveMode, activeModeString);
   setTextSelectionValue(&luaSBUSFailsafeMode,
                         cfg != nullptr ? clampU8(cfg->failsafe_mode, 0, 1) : 0);
+  const bool sbusFieldsVisible =
+      protocol == ELRS_SERIAL_SBUS ||
+      siw917_rx_get_active_serial_protocol() == ELRS_SERIAL_SBUS;
+  LUA_FIELD_VISIBLE(luaSBUSFailsafeMode, sbusFieldsVisible);
   setUint8Value(&luaTargetSysId,
                 cfg != nullptr ? clampU8(cfg->mavlink_target_sys_id, 1, 255)
                                : 1);
@@ -444,6 +504,7 @@ void SiW917RXEndpoint::updateParameters() {
                                : 255);
   setTextSelectionValue(&luaForceTlm,
                         cfg != nullptr && cfg->force_tlm != 0 ? 1 : 0);
+  siw917_rx_set_force_telemetry_off(cfg != nullptr ? cfg->force_tlm : 0);
   setTextSelectionValue(
       &luaTlmPower,
       cfg != nullptr ? powerDbmToSelection(cfg->tx_power) : 3);
@@ -544,6 +605,12 @@ void SiW917RXEndpoint::handleBindCommand(propertiesCommon *item, int32_t arg) {
 void SiW917RXEndpoint::processPending(bool telemetryBusy) {
   const uint32_t now = millis();
 
+  if (activeModeRefreshPending && !telemetryBusy) {
+    activeModeRefreshPending = false;
+    updateParameters();
+    sendParameterUpdate(luaActiveMode.common.id);
+  }
+
   if (configSavePending &&
       (uint32_t)(now - configSaveAtMs) < 0x80000000UL && !telemetryBusy) {
     const bool applySerial = serialApplyPending;
@@ -594,4 +661,9 @@ bool SiW917RXEndpoint::consumeSerialApplyRequest() {
   const bool requested = serialApplyRequested;
   serialApplyRequested = false;
   return requested;
+}
+
+void SiW917RXEndpoint::requestActiveModeRefresh() {
+  clearActiveModeOverride();
+  activeModeRefreshPending = true;
 }

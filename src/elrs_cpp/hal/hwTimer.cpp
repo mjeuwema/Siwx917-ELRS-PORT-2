@@ -217,8 +217,10 @@ static void hwTimerTockBridge(void) {
 //-----------------------------------------------------------------------------
 
 void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf(">>> hwTimer::init ENTRY (interval=%lu) <<<\n",
          (unsigned long)HWtimerInterval);
+#endif
 
   callbackTick = cbTick;
   callbackTock = cbTock;
@@ -233,10 +235,14 @@ void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
   // Bypass removed - hwTimer now enabled
 
   // Initialize the underlying C timer with current interval
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init - calling hw_timer_init...\n");
+#endif
   sl_status_t status = hw_timer_init(HWtimerInterval);
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init - hw_timer_init returned 0x%04lX\n",
          (unsigned long)status);
+#endif
 
   if (status != SL_STATUS_OK) {
     printf("hwTimer::init FAILED!\n");
@@ -245,7 +251,9 @@ void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
   }
 
   // Register our bridge callbacks with the C implementation
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init - setting callbacks...\n");
+#endif
   hw_timer_set_tick_callback(hwTimerTickBridge);
   hw_timer_set_tock_callback(hwTimerTockBridge);
 #if SIW917_ELRS_DIRECT_TIMER_CALLBACKS
@@ -255,16 +263,24 @@ void hwTimer::init(hwTimerCallback_t cbTick, hwTimerCallback_t cbTock) {
 #else
   const char *timerCallbackPath = "queued-task";
 #endif
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init - timer callback path: %s\n", timerCallbackPath);
+#else
+  (void)timerCallbackPath;
+#endif
 
 #if SIW917_ELRS_DWT_MICROS
   (void)micros();
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init - micros source: %s\n",
          micros_uses_dwt() ? "DWT CYCCNT" : "SysTick fallback");
 #endif
+#endif
 
+#if SIW917_ELRS_TIMER_VERBOSE_INIT
   printf("hwTimer::init COMPLETE OK\n");
   DBGLN("hwTimer initialized (CT-based)");
+#endif
 }
 
 void hwTimer::stop() {

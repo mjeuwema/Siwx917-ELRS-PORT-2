@@ -13,6 +13,7 @@ public:
 
   void processPending(bool telemetryBusy);
   bool consumeSerialApplyRequest();
+  void requestActiveModeRefresh();
 
 protected:
   void devicePingCalled() override { updateParameters(); }
@@ -25,6 +26,7 @@ private:
   bool configSavePending = false;
   bool serialApplyPending = false;
   bool serialApplyRequested = false;
+  bool activeModeRefreshPending = false;
   bool wifiPending = false;
   bool bindPending = false;
   uint32_t configSaveAtMs = 0;

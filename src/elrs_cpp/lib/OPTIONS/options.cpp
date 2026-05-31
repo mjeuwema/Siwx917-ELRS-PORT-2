@@ -82,13 +82,33 @@ firmware_options_t firmwareOptions = {
 
 bool options_init()
 {
-    firmwareOptions.domain = FCC915;
+    elrs_config_t *cfg = elrs_config_get();
+    firmwareOptions.domain = cfg ? elrs_config_get_web_domain()
+                                 : static_cast<uint8_t>(FCC915);
+    firmwareOptions.uart_baud = cfg ? elrs_config_get_uart_baud() : 420000;
+#if defined(TARGET_RX)
+    firmwareOptions.wifi_auto_on_interval =
+        cfg ? elrs_config_get_wifi_on_interval() : 60;
+    memset(firmwareOptions.home_wifi_ssid, 0, sizeof(firmwareOptions.home_wifi_ssid));
+    memset(firmwareOptions.home_wifi_password, 0, sizeof(firmwareOptions.home_wifi_password));
+    if (cfg != nullptr) {
+        strncpy(firmwareOptions.home_wifi_ssid, cfg->wifi_ssid,
+                sizeof(firmwareOptions.home_wifi_ssid) - 1);
+        strncpy(firmwareOptions.home_wifi_password, cfg->wifi_password,
+                sizeof(firmwareOptions.home_wifi_password) - 1);
+    }
+    firmwareOptions.lock_on_first_connection =
+        cfg ? elrs_config_get_lock_on_first_connection() : true;
+    firmwareOptions.dji_permanently_armed =
+        cfg ? elrs_config_get_dji_permanently_armed() : false;
+    firmwareOptions.is_airport =
+        cfg ? elrs_config_get_is_airport() : false;
+#endif
     loadFlashedUid();
 
     // firmwareOptions.uid is the flashed/home UID. Runtime binding is loaded
     // from elrs_config by rx_main, matching upstream Returnable Bind Storage.
 #if OPTIONS_UID_DIAG
-    elrs_config_t* cfg = elrs_config_get();
     if (cfg != nullptr) {
         DBGLN("Config UID in NVM3: %02X:%02X:%02X:%02X:%02X:%02X",
               cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3],
