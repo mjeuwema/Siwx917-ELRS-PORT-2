@@ -73,7 +73,10 @@
   17 /* DIO1 HP GPIO interrupt test - NO TX REQUIRED */
 #define TEST_MODE_RX_TEST                                                      \
   18 /* Standalone LR1121 RX test - bypasses ELRS C++ stack */
-#define TEST_MODE TEST_MODE_ELRS_CPP_TEST /* ELRS C++ with fixed IsrCallback   \
+#define TEST_MODE_BLE_GATT_PROBE                                               \
+  19 /* Standalone BLE peripheral/GATT probe - no RF/WiFi Web UI */
+#define TEST_MODE TEST_MODE_ELRS_CPP_TEST /* Normal RX; BLE config API starts  \
+                                           * in WiFi/config mode               \
                                            */
 // #define TEST_MODE TEST_MODE_DIO1_HP_GPIO /* GPIO_46 interrupt test for LR1121
 // DIO9 */ #define TEST_MODE TEST_MODE_HW_TIMER_TEST  /* Configurable Timer
@@ -122,6 +125,10 @@
 /* Standalone RX Test (bypass ELRS C++, use proven C driver) */
 #include "lr1121_rx_test.h"
 
+/* Standalone BLE GATT probe */
+#include "ble_gatt_probe.h"
+#include "elrs_config.h"
+
 /* Radio Listen Test - MOVED TO old_c_code_backup (not used) */
 
 /* ELRS Protocol Stack (for TEST_MODE_ELRS_RX - legacy) */
@@ -161,7 +168,8 @@
  */
 #if (TEST_MODE == TEST_MODE_WIFI_HTTP) || (TEST_MODE == TEST_MODE_ELRS_RX) ||  \
     (TEST_MODE == TEST_MODE_ELRS_MAIN) ||                                      \
-    (TEST_MODE == TEST_MODE_ELRS_CPP_TEST)
+    (TEST_MODE == TEST_MODE_ELRS_CPP_TEST) ||                                  \
+    (TEST_MODE == TEST_MODE_BLE_GATT_PROBE)
 #include "cmsis_os2.h"
 #endif
 
@@ -972,13 +980,15 @@ void elrs_cpp_task(void *argument) {
   DEBUGOUT("========================================\n");
   DEBUGOUT("\n");
 
-  /* Initialize NWP for NVM3 access (binding phrase storage)
-   * CRITICAL: On SiWx917 with common flash, NVM3 requires NWP initialization
+  /* Initialize NWP for NVM3 access (binding phrase storage).
+   * CRITICAL: On SiWx917 with common flash, NVM3 requires NWP initialization.
+   * Use the BLE-capable AP boot config here because the NWP opermode cannot be
+   * upgraded later when WiFi/config mode starts the companion BLE API.
    */
-  DEBUGOUT("[ELRS] Initializing NWP for config storage...\n");
-  status = sl_net_init(SL_NET_WIFI_AP_INTERFACE, NULL, NULL, NULL);
+  DEBUGOUT("[ELRS] Initializing NWP for config storage + BLE config API...\n");
+  status = (sl_status_t)ble_gatt_config_api_prepare_nwp();
   if (status != SL_STATUS_OK) {
-    DEBUGOUT("[ELRS] WARNING: sl_net_init() failed: 0x%lX\n",
+    DEBUGOUT("[ELRS] WARNING: BLE-capable NWP init failed: 0x%lX\n",
              (unsigned long)status);
     DEBUGOUT("[ELRS]   Config storage may not work - using defaults\n");
   }
@@ -1016,6 +1026,21 @@ void elrs_cpp_task(void *argument) {
   DEBUGOUT("  Auto WiFi in 60s if no connection\n");
   DEBUGOUT("========================================\n");
   DEBUGOUT("\n");
+
+  int ble_status = ble_remote_id_service_prepare();
+  if (ble_status != 0) {
+    DEBUGOUT("[BLE] Remote ID standby prepare failed status=%d\n", ble_status);
+  } else {
+    for (uint32_t wait_ms = 0; wait_ms < 750U; wait_ms += 25U) {
+      if (ble_remote_id_service_is_ready()) {
+        break;
+      }
+      osDelay(25U);
+    }
+    if (!ble_remote_id_service_is_ready()) {
+      DEBUGOUT("[BLE] Remote ID standby still starting; continuing RX startup\n");
+    }
+  }
 
   elrs_rx_start();
 
@@ -1362,6 +1387,18 @@ void gspi_example_init(void) {
     DEBUGOUT("ELRS C++ task created - will start after scheduler\n");
   }
 
+  current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
+
+#elif (TEST_MODE == TEST_MODE_BLE_GATT_PROBE)
+  DEBUGOUT("\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  BLE GATT Probe Test Mode\n");
+  DEBUGOUT("========================================\n");
+  DEBUGOUT("  RF receiver and WiFi Web UI are not started in this build.\n");
+  DEBUGOUT("  Advertising name: ELRS-RX-BLE\n");
+  DEBUGOUT("========================================\n\n");
+
+  ble_gatt_probe_start_task();
   current_mode = SL_GSPI_TRANSMISSION_COMPLETED;
 
 #elif (TEST_MODE == TEST_MODE_DIO1_HP_GPIO)
@@ -2013,7 +2050,8 @@ void gspi_example_process_action(void) {
     (TEST_MODE == TEST_MODE_LR1121_SIMPLE) ||                                  \
     (TEST_MODE == TEST_MODE_HW_TIMER_TEST) ||                                  \
     (TEST_MODE == TEST_MODE_ELRS_CPP_TEST) ||                                  \
-    (TEST_MODE == TEST_MODE_DIO1_HP_GPIO) || (TEST_MODE == TEST_MODE_RX_TEST)
+    (TEST_MODE == TEST_MODE_DIO1_HP_GPIO) || (TEST_MODE == TEST_MODE_RX_TEST) || \
+    (TEST_MODE == TEST_MODE_BLE_GATT_PROBE)
   /* All non-loopback test modes - nothing to do, test runs in init or FreeRTOS
    * task */
   (void)current_mode; /* Suppress unused variable warning */

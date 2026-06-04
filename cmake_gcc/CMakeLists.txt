@@ -21,6 +21,31 @@ target_compile_definitions(slc PUBLIC
     SL_USART0_DMA_CONFIG_ENABLE=1
 )
 
+# Standalone BLE probe support. This is intentionally wired as a branch-local
+# experiment and does not alter the WiFi HTTP server flow.
+set(WISECONNECT3_SDK_DIR "${SDK_PATH}/../../wisece6a05cd369ee2/p")
+set(SIW917_BLE_SDK_SOURCES
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_ble_gap_apis.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_ble_gatt_apis.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_bt_ble.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_bt_common_apis.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_common_apis.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_utils.c"
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/sl_si91x_ble.c"
+)
+target_sources(slc PRIVATE ${SIW917_BLE_SDK_SOURCES})
+target_compile_definitions(slc PUBLIC
+    SLI_SI91X_ENABLE_BLE=1
+    SL_SI91X_ENABLE_LITTLE_ENDIAN=1
+)
+set_source_files_properties(${SIW917_BLE_SDK_SOURCES}
+    PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_LIST_DIR}/../src/ble_sdk_compat.h"
+)
+target_include_directories(slc BEFORE PUBLIC
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/inc"
+)
+
 #=============================================================================
 # ELRS C++ Platform Abstraction Layer for SiW917
 #=============================================================================
@@ -83,6 +108,8 @@ add_executable(wifi_gspi_merged
     ${ELRS_PLATFORM_SOURCES}
     # ELRS C++ libraries (upstream)
     ${ELRS_CPP_SOURCES}
+    "../src/ble_gatt_probe.c"
+    "../src/ble_remote_id.c"
 )
 
 #=============================================================================

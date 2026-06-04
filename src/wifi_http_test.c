@@ -67,6 +67,9 @@
 /* ELRS Configuration Storage (NVM3-backed persistent settings) */
 #include "elrs_config.h"
 
+/* Optional BLE companion config API. Failure here must not stop WiFi mode. */
+#include "ble_gatt_probe.h"
+
 /* LR1121 Driver for firmware OTA updates */
 #include "lr1121_driver.h"
 
@@ -4164,6 +4167,14 @@ void wifi_http_test_run(void)
   DEBUGOUT("\n");
   DEBUGOUT("Waiting for connections...\n");
   DEBUGOUT("============================================================\n");
+
+  DEBUGOUT("[BLE] Starting companion config API in WiFi mode...\n");
+  int ble_status = ble_gatt_config_api_start();
+  if (ble_status == 0) {
+    DEBUGOUT("[BLE] Companion config API task requested\n");
+  } else {
+    DEBUGOUT("[BLE] Companion config API unavailable: %d\n", ble_status);
+  }
 
   /* Main Loop */
   while (server_running) {

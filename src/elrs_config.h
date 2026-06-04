@@ -216,6 +216,7 @@ _Static_assert(sizeof(elrs_config_t) <= 254, "elrs_config_t exceeds NVM3 max obj
  * @return 0 on success, negative error code on failure
  */
 int elrs_config_init(void);
+bool elrs_config_is_initialized(void);
 
 /**
  * @brief Get pointer to the current configuration
@@ -324,6 +325,8 @@ bool elrs_config_get_is_airport(void);
 void elrs_config_set_is_airport(bool enabled);
 bool elrs_config_get_dji_permanently_armed(void);
 void elrs_config_set_dji_permanently_armed(bool enabled);
+bool elrs_config_get_ble_remote_id(void);
+void elrs_config_set_ble_remote_id(bool enabled);
 bool elrs_config_web_options_customised(void);
 
 /**

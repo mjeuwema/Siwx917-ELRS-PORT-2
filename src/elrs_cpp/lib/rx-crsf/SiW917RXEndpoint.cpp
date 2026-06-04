@@ -14,12 +14,15 @@
 extern "C" void elrs_cpp_request_wifi_mode(void);
 extern "C" void elrs_enter_binding_mode(void);
 extern "C" int elrs_config_save_with_rf_rearm(void);
+extern "C" int elrs_config_save(void);
 extern "C" void elrs_apply_bind_storage_change(uint8_t bindStorage);
+extern "C" bool elrs_is_connected(void);
 extern "C" bool elrs_is_on_loan(void);
 extern "C" void siw917_rx_set_model_match_id(uint8_t modelId);
 extern "C" void siw917_rx_set_force_telemetry_off(uint8_t forceOff);
 extern "C" uint8_t siw917_rx_get_active_serial_protocol(void);
 extern "C" const char *siw917_rx_get_active_mode_string(void);
+extern "C" void ble_remote_id_service_set_enabled(bool enabled);
 
 extern uint8_t ExpressLRS_currTlmDenom;
 
@@ -74,6 +77,13 @@ static selectionParameter luaTlmPower = {
     3,
     "10;25;50;100;MatchTX",
     "mW",
+};
+
+static selectionParameter luaBleRemoteId = {
+    {"BLE RemoteID", CRSF_TEXT_SELECTION, 0, 0},
+    0,
+    "Off;On",
+    STR_EMPTYSPACE,
 };
 
 static commandParameter luaWifiMode = {
@@ -415,6 +425,19 @@ void SiW917RXEndpoint::registerParameters() {
     }
   });
 
+  registerParameter(&luaBleRemoteId, [this](propertiesCommon *, int32_t arg) {
+    elrs_config_t *cfg = elrs_config_get();
+    if (cfg != nullptr) {
+      const bool enabled = arg != 0;
+      elrs_config_set_ble_remote_id(enabled);
+      ble_remote_id_service_set_enabled(enabled);
+#if RX_EP_EVENT_LOG
+      logParameterWrite("BLE RemoteID", enabled ? 1 : 0);
+#endif
+      requestConfigSaveWhenDisconnected();
+    }
+  });
+
   registerParameter(&luaWifiMode, [this](propertiesCommon *item, int32_t arg) {
     handleWiFiCommand(item, arg);
   });
@@ -508,6 +531,8 @@ void SiW917RXEndpoint::updateParameters() {
   setTextSelectionValue(
       &luaTlmPower,
       cfg != nullptr ? powerDbmToSelection(cfg->tx_power) : 3);
+  setTextSelectionValue(&luaBleRemoteId,
+                        cfg != nullptr && elrs_config_get_ble_remote_id() ? 1 : 0);
   setTextSelectionValue(&luaTeamraceChannel,
                         cfg != nullptr ? clampU8(cfg->teamrace_channel, 0, 10)
                                        : 0);
@@ -536,6 +561,7 @@ void SiW917RXEndpoint::updateParameters() {
 
 void SiW917RXEndpoint::requestConfigSave(bool applySerialAfterSave) {
   configSavePending = true;
+  configSaveWaitDisconnected = false;
   serialApplyPending = serialApplyPending || applySerialAfterSave;
   configSaveAtMs = millis() + 500U;
 #if RX_EP_EVENT_LOG
@@ -544,6 +570,18 @@ void SiW917RXEndpoint::requestConfigSave(bool applySerialAfterSave) {
 #endif
 #if RX_EP_DIAG
   DBGLN("[RX_EP] defer config save serial=%u", serialApplyPending ? 1 : 0);
+#endif
+}
+
+void SiW917RXEndpoint::requestConfigSaveWhenDisconnected() {
+  configSavePending = true;
+  configSaveWaitDisconnected = true;
+  configSaveAtMs = millis() + 500U;
+#if RX_EP_EVENT_LOG
+  DBGLN("[RX_LUA] CONFIG_SAVE_QUEUED deferred_until_disconnected=1");
+#endif
+#if RX_EP_DIAG
+  DBGLN("[RX_EP] defer config save until disconnected");
 #endif
 }
 
@@ -613,20 +651,27 @@ void SiW917RXEndpoint::processPending(bool telemetryBusy) {
 
   if (configSavePending &&
       (uint32_t)(now - configSaveAtMs) < 0x80000000UL && !telemetryBusy) {
-    const bool applySerial = serialApplyPending;
-    const int saveResult = elrs_config_save_with_rf_rearm();
-
-    if (saveResult == 1) {
+    if (configSaveWaitDisconnected && elrs_is_connected()) {
       configSaveAtMs = now + 1000U;
     } else {
-      configSavePending = false;
-      serialApplyPending = false;
+      const bool applySerial = serialApplyPending;
+      const int saveResult = configSaveWaitDisconnected
+                                 ? elrs_config_save()
+                                 : elrs_config_save_with_rf_rearm();
+
+      if (saveResult == 1) {
+        configSaveAtMs = now + 1000U;
+      } else {
+        configSavePending = false;
+        serialApplyPending = false;
+        configSaveWaitDisconnected = false;
 #if RX_EP_EVENT_LOG
-      DBGLN("[RX_LUA] CONFIG_SAVE_DONE result=%d serialApply=%u", saveResult,
-            applySerial ? 1 : 0);
+        DBGLN("[RX_LUA] CONFIG_SAVE_DONE result=%d serialApply=%u", saveResult,
+              applySerial ? 1 : 0);
 #endif
-      if (saveResult == 0 && applySerial) {
-        serialApplyRequested = true;
+        if (saveResult == 0 && applySerial) {
+          serialApplyRequested = true;
+        }
       }
     }
   }

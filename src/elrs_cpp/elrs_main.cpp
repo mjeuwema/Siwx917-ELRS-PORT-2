@@ -48,10 +48,12 @@
 // Status LED, bind button, persistent config, WiFi integration, and CRSF output
 extern "C" {
 #include "bind_button.h"
+#include "ble_remote_id.h"
 #include "crsf_serial.h"
 #include "elrs_config.h"
 #include "status_led.h"
 #include "wifi_http_test.h"
+int ble_remote_id_service_start(bool enabled);
 void elrs_cpp_request_wifi_mode(void);
 int lr1121_dio1_read(void);
 int lr1121_dio2_read(void);
@@ -640,7 +642,8 @@ enum RxLuaParamId : uint8_t {
   RX_LUA_PARAM_VERSION = 14,
   RX_LUA_PARAM_TLM_POWER = 15,
   RX_LUA_PARAM_ACTIVE_MODE = 16,
-  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_ACTIVE_MODE,
+  RX_LUA_PARAM_BLE_REMOTE_ID = 17,
+  RX_LUA_PARAM_COUNT = RX_LUA_PARAM_BLE_REMOTE_ID,
 };
 
 static uint8_t getConfiguredBindStorage();
@@ -1486,6 +1489,62 @@ static bool crsfSerialShouldForwardFrame(const uint8_t *frame, uint8_t frameLen)
          frameType != CRSF_FRAMETYPE_LINK_STATISTICS;
 }
 
+static uint16_t readBe16(const uint8_t *data) {
+  return (uint16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
+}
+
+static int32_t readBe32Signed(const uint8_t *data) {
+  const uint32_t raw = ((uint32_t)data[0] << 24) |
+                       ((uint32_t)data[1] << 16) |
+                       ((uint32_t)data[2] << 8) |
+                       (uint32_t)data[3];
+  return (int32_t)raw;
+}
+
+static uint16_t crsfGpsSpeedToCms(uint16_t speedDmh) {
+  const uint32_t cms = ((uint32_t)speedDmh * 25U + 4U) / 9U;
+  return cms > UINT16_MAX ? UINT16_MAX : (uint16_t)cms;
+}
+
+static void updateRemoteIdFromCrsfGpsFrame(const uint8_t *frame,
+                                           uint8_t frameLen) {
+  if (frame == nullptr || frameLen < (3U + sizeof(crsf_sensor_gps_t) + 1U) ||
+      frame[CRSF_TELEMETRY_TYPE_INDEX] != CRSF_FRAMETYPE_GPS) {
+    return;
+  }
+
+  const uint8_t payloadLen =
+      (uint8_t)(frame[CRSF_TELEMETRY_LENGTH_INDEX] - 2U);
+  if (payloadLen < sizeof(crsf_sensor_gps_t)) {
+    return;
+  }
+
+  const uint8_t *gps = &frame[CRSF_TELEMETRY_TYPE_INDEX + 1U];
+  const uint8_t satellites = gps[14];
+  if (satellites < 3U) {
+    return;
+  }
+
+  const int32_t latitudeE7 = readBe32Signed(&gps[0]);
+  const int32_t longitudeE7 = readBe32Signed(&gps[4]);
+  const uint16_t speedDmh = readBe16(&gps[8]);
+  uint16_t headingCdeg = readBe16(&gps[10]);
+  const uint16_t altitudeRaw = readBe16(&gps[12]);
+  const int32_t altitudeM = (int32_t)altitudeRaw - 1000;
+
+  if (headingCdeg > 36000U) {
+    headingCdeg = 36100U;
+  }
+
+  (void)ble_remote_id_update_from_crsf_gps(
+      latitudeE7,
+      longitudeE7,
+      (int16_t)constrain(altitudeM, -1000, 31767),
+      crsfGpsSpeedToCms(speedDmh),
+      headingCdeg,
+      millis());
+}
+
 static void serviceCrsfSerialTelemetry() {
   if (TxOtaProtocol != TX_NORMAL_MODE ||
       connectionState != connected ||
@@ -1534,10 +1593,13 @@ static void serviceCrsfSerialTelemetry() {
 
     if (expectedLen != 0 && pos >= expectedLen) {
       uint8_t frameLen = 0;
-      if (validateCrsfFrame(frame, &frameLen) &&
-          crsfSerialShouldForwardFrame(frame, frameLen)) {
-        crsfRouter.processMessage(nullptr,
-                                  reinterpret_cast<const crsf_header_t *>(frame));
+      if (validateCrsfFrame(frame, &frameLen)) {
+        updateRemoteIdFromCrsfGpsFrame(frame, frameLen);
+        if (crsfSerialShouldForwardFrame(frame, frameLen)) {
+          crsfRouter.processMessage(
+              nullptr,
+              reinterpret_cast<const crsf_header_t *>(frame));
+        }
       }
       pos = 0;
       expectedLen = 0;
@@ -1586,7 +1648,7 @@ static bool rxLuaBuildDeviceInfo(crsf_addr_e destAddr, uint8_t *frame,
   device->hardwareVer = 0;
   device->softwareVer = htobe32(versionStringToU32(version));
   device->fieldCnt = RX_LUA_PARAM_COUNT;
-  device->parameterVersion = 0;
+  device->parameterVersion = 3;
 
   setCrsfExtendedHeaderAndCrc(frame, CRSF_FRAMETYPE_DEVICE_INFO, frameSize,
                               destAddr, CRSF_ADDRESS_CRSF_RECEIVER);
@@ -1638,6 +1700,7 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
           RX_LUA_PARAM_BIND,
           RX_LUA_PARAM_MODEL_ID,
           RX_LUA_PARAM_TLM_POWER,
+          RX_LUA_PARAM_BLE_REMOTE_ID,
           RX_LUA_PARAM_TLM_RATIO,
           RX_LUA_PARAM_VERSION,
           0xFF,
@@ -1764,6 +1827,13 @@ static bool rxLuaBuildParameter(crsf_addr_e destAddr, uint8_t parameterIndex,
     selectionValue =
         rxTlmPowerDbmToSelection(cfg != nullptr ? cfg->tx_power
                                                 : ELRS_TX_POWER_DEFAULT_DBM);
+    selectionMax = selectionOptionMax(options);
+    break;
+  case RX_LUA_PARAM_BLE_REMOTE_ID:
+    paramType = CRSF_TEXT_SELECTION;
+    name = "BLE RemoteID";
+    options = "Off;On";
+    selectionValue = elrs_config_get_ble_remote_id() ? 1 : 0;
     selectionMax = selectionOptionMax(options);
     break;
   case RX_LUA_PARAM_TLM_RATIO:
@@ -1984,6 +2054,15 @@ static void rxLuaHandleParameterWrite(crsf_addr_e origin, uint8_t parameterIndex
   case RX_LUA_PARAM_TLM_POWER:
     if (cfg != nullptr) {
       cfg->tx_power = rxTlmPowerSelectionToDbm(arg);
+      rxLuaSaveConfig();
+      rxLuaQueueParameter(origin, parameterIndex, 0);
+    }
+    break;
+  case RX_LUA_PARAM_BLE_REMOTE_ID:
+    if (cfg != nullptr) {
+      const bool enabled = arg != 0;
+      elrs_config_set_ble_remote_id(enabled);
+      (void)ble_remote_id_service_start(enabled);
       rxLuaSaveConfig();
       rxLuaQueueParameter(origin, parameterIndex, 0);
     }

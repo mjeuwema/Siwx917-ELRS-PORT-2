@@ -306,6 +306,7 @@ static void normalize_config_fields(elrs_config_t* config)
   if (config->bind_storage > ELRS_BIND_STORAGE_ADMINISTERED) {
     config->bind_storage = ELRS_BIND_STORAGE_PERSISTENT;
   }
+  config->reserved[11] = (config->reserved[11] == 1U) ? 1U : 0U;
 
   if (config_uid_is_bound(config->uid)) {
     config->flags |= ELRS_CONFIG_FLAG_BOUND;
@@ -473,6 +474,11 @@ use_defaults:
   g_initialized = true;
   elrs_config_print();
   return 0;
+}
+
+bool elrs_config_is_initialized(void)
+{
+  return g_initialized;
 }
 
 elrs_config_t* elrs_config_get(void)
@@ -649,6 +655,7 @@ int elrs_config_set_wifi(const char* ssid, const char* password, uint8_t channel
 #define ELRS_RESERVED_IS_AIRPORT_OFFSET    5U
 #define ELRS_RESERVED_DJI_ARMED_OFFSET     6U
 #define ELRS_RESERVED_WIFI_INTERVAL_OFFSET 7U
+#define ELRS_RESERVED_BLE_REMOTE_ID_OFFSET 11U
 
 static uint32_t config_read_reserved_u32(uint8_t offset)
 {
@@ -773,6 +780,16 @@ void elrs_config_set_dji_permanently_armed(bool enabled)
   g_config.reserved[ELRS_RESERVED_DJI_ARMED_OFFSET] = enabled ? 1U : 0U;
 }
 
+bool elrs_config_get_ble_remote_id(void)
+{
+  return g_config.reserved[ELRS_RESERVED_BLE_REMOTE_ID_OFFSET] == 1U;
+}
+
+void elrs_config_set_ble_remote_id(bool enabled)
+{
+  g_config.reserved[ELRS_RESERVED_BLE_REMOTE_ID_OFFSET] = enabled ? 1U : 0U;
+}
+
 bool elrs_config_web_options_customised(void)
 {
   return (elrs_config_get_web_domain() != 1U) ||
@@ -781,6 +798,7 @@ bool elrs_config_web_options_customised(void)
          (elrs_config_get_wifi_on_interval() != 60) ||
          elrs_config_get_is_airport() ||
          elrs_config_get_dji_permanently_armed() ||
+         elrs_config_get_ble_remote_id() ||
          ((g_config.flags & ELRS_CONFIG_FLAG_WIFI_CUSTOM) != 0U);
 }
 
@@ -811,10 +829,11 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
         "\"force-tlm\":%s,"
         "\"target-sys-id\":%u,"
         "\"source-sys-id\":%u,"
-        "\"teamrace-channel\":%u,"
-        "\"teamrace-position\":%u,"
-        "\"bind-storage\":%u,"
-        "\"vbind\":%u"
+         "\"teamrace-channel\":%u,"
+         "\"teamrace-position\":%u,"
+         "\"bind-storage\":%u,"
+        "\"vbind\":%u,"
+        "\"ble-remote-id\":%s"
       "},"
       "\"settings\":{"
         "\"product_name\":\"ELRS SiWx917 LR1121 RX\","
@@ -856,6 +875,7 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
     cfg->teamrace_position,
     cfg->bind_storage,
     cfg->vbind,
+    elrs_config_get_ble_remote_id() ? "true" : "false",
     elrs_config_is_bound() ? "Bound" : "Not Bound",
     (cfg->reg_domain_low == ELRS_DOMAIN_FCC_915) ? "FCC_915" : "EU_868",
     (cfg->reg_domain_high == ELRS_DOMAIN_ISM_2400) ? "ISM_2400" : "CE_2400",
@@ -1106,7 +1126,26 @@ parse_other_fields:
       g_config.vbind = (uint8_t)vbind_val;
     }
   }
-  
+
+  const char* ble_remote_id_start = strstr(json, "\"ble-remote-id\":");
+  if (ble_remote_id_start != NULL) {
+    ble_remote_id_start += 16;
+    while (*ble_remote_id_start == ' ' || *ble_remote_id_start == '\t') {
+      ble_remote_id_start++;
+    }
+
+    if (strncmp(ble_remote_id_start, "true", 4) == 0) {
+      elrs_config_set_ble_remote_id(true);
+    } else if (strncmp(ble_remote_id_start, "false", 5) == 0) {
+      elrs_config_set_ble_remote_id(false);
+    } else {
+      int ble_remote_id_val;
+      if (sscanf(ble_remote_id_start, "%d", &ble_remote_id_val) == 1) {
+        elrs_config_set_ble_remote_id(ble_remote_id_val != 0);
+      }
+    }
+  }
+
   normalize_config_fields(&g_config);
 
   /* Mark as valid */
@@ -1139,6 +1178,7 @@ void elrs_config_print(void)
   DEBUGOUT("  Team Race:  ch=%d, pos=%d\n",
            cfg->teamrace_channel, cfg->teamrace_position);
   DEBUGOUT("  Bind Store: %d\n", cfg->bind_storage);
+  DEBUGOUT("  BLE RID:    %s\n", elrs_config_get_ble_remote_id() ? "On" : "Off");
   if (cfg->tx_power == ELRS_TX_POWER_MATCH_TX_DBM) {
     DEBUGOUT("  TX Power:   Match TX\n");
   } else {

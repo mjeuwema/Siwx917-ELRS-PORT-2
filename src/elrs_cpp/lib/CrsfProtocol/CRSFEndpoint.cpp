@@ -346,7 +346,7 @@ void CRSFEndpoint::sendDeviceInformationPacket() {
   device->hardwareVer = 0;
   device->softwareVer = htobe32(VersionStrToU32(version));
   device->fieldCnt = lastParameter;
-  device->parameterVersion = 0;
+  device->parameterVersion = 3;
   crsfRouter.SetExtendedHeaderAndCrc(
       (crsf_ext_header_t *)deviceInformation, CRSF_FRAMETYPE_DEVICE_INFO,
       DEVICE_INFORMATION_FRAME_SIZE, requestOrigin, device_id);

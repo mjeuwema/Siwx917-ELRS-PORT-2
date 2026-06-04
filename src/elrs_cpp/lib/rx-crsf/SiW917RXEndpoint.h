@@ -20,11 +20,13 @@ protected:
 
 private:
   void requestConfigSave(bool applySerialAfterSave = false);
+  void requestConfigSaveWhenDisconnected();
   void handleWiFiCommand(propertiesCommon *item, int32_t arg);
   void handleBindCommand(propertiesCommon *item, int32_t arg);
 
   bool configSavePending = false;
   bool serialApplyPending = false;
+  bool configSaveWaitDisconnected = false;
   bool serialApplyRequested = false;
   bool activeModeRefreshPending = false;
   bool wifiPending = false;
