@@ -77,7 +77,10 @@ extern bool device_initialized;
 #define BLE_AE_ADV_HANDLE 0x00U
 #define BLE_AE_ADV_INTERVAL_1S 0x0640U
 #define BLE_AE_TEST_PAYLOAD_MAX 96U
-#define BLE_REMOTE_ID_AE_PAYLOAD_MAX 64U
+#define BLE_REMOTE_ID_AE_PAYLOAD_MAX 160U
+#ifndef BLE_REMOTE_ID_USE_OFFICIAL_BT5
+#define BLE_REMOTE_ID_USE_OFFICIAL_BT5 1
+#endif
 
 typedef enum {
   BLE_ADV_MODE_ELRS_CONFIG = 0,
@@ -180,7 +183,11 @@ static bool ble_tick_reached(uint32_t now, uint32_t deadline)
 
 static const char *ble_remote_id_adv_kind_name(ble_remote_id_adv_kind_t kind)
 {
+#if BLE_REMOTE_ID_USE_OFFICIAL_BT5
+  return (kind == BLE_REMOTE_ID_ADV_LOCATION) ? "Remote ID BT5 Pack+Location" : "Remote ID BT5 Pack";
+#else
   return (kind == BLE_REMOTE_ID_ADV_LOCATION) ? "Remote ID Location" : "Remote ID Basic ID";
+#endif
 }
 
 static int32_t ble_apply_fixed_remote_id_power(void)
@@ -324,6 +331,24 @@ static uint8_t ble_build_remote_id_ae_payload(uint8_t *payload,
                                               uint8_t max_len,
                                               ble_remote_id_adv_kind_t kind)
 {
+#if BLE_REMOTE_ID_USE_OFFICIAL_BT5
+  bool include_location = kind == BLE_REMOTE_ID_ADV_LOCATION &&
+                          ble_remote_id_location_is_set();
+  uint16_t payload_len;
+
+  if (payload == NULL || max_len == 0U) {
+    return 0U;
+  }
+
+  payload_len = ble_remote_id_build_bt5_advertisement(payload,
+                                                      max_len,
+                                                      include_location);
+  if (payload_len == 0U || payload_len > 255U) {
+    return 0U;
+  }
+
+  return (uint8_t)payload_len;
+#else
   uint8_t len = 0U;
   uint8_t legacy_adv[BLE_REMOTE_ID_ADV_MAX] = { 0 };
   uint16_t legacy_len;
@@ -357,6 +382,7 @@ static uint8_t ble_build_remote_id_ae_payload(uint8_t *payload,
   len = (uint8_t)(len + name_len);
 
   return len;
+#endif
 }
 
 static int32_t ble_apply_remote_id_ae_advertisement(ble_remote_id_adv_kind_t kind)
@@ -422,7 +448,7 @@ static int32_t ble_apply_remote_id_ae_advertisement(ble_remote_id_adv_kind_t kin
   data.type = AE_ADV_DATA;
   data.adv_handle = BLE_AE_ADV_HANDLE;
   data.operation = 0x03U;
-  data.frag_pref = 0x00U;
+  data.frag_pref = 0x01U;
   data.data_len = payload_len;
   memcpy(data.data, payload, payload_len);
 
@@ -2144,6 +2170,102 @@ static void ble_handle_remote_id_location_command(char *args)
   ble_publish_ephemeral_response(response);
 }
 
+static void ble_handle_remote_id_self_command(char *args)
+{
+  char response[BLE_VALUE_MAX];
+  char *cursor = trim_ascii(args);
+
+  if (*cursor == '\0' || ascii_equal_ignore_case(cursor, "status")) {
+    snprintf(response,
+             sizeof(response),
+             "rid self=%s",
+             ble_remote_id_get_self_id_text());
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(cursor, "default") ||
+      ascii_equal_ignore_case(cursor, "reset") ||
+      ascii_equal_ignore_case(cursor, "off") ||
+      ascii_equal_ignore_case(cursor, "clear")) {
+    ble_remote_id_reset_self_id_text();
+    snprintf(response,
+             sizeof(response),
+             "ok rid self=%s",
+             ble_remote_id_get_self_id_text());
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ble_remote_id_set_self_id_text(cursor)) {
+    snprintf(response,
+             sizeof(response),
+             "ok rid self=%s",
+             ble_remote_id_get_self_id_text());
+    ble_publish_ephemeral_response(response);
+  } else {
+    ble_publish_ephemeral_response("err rid self 1..23 printable ASCII chars");
+  }
+}
+
+static void ble_handle_remote_id_operator_id_command(char *args)
+{
+  char response[BLE_VALUE_MAX];
+  char *cursor = trim_ascii(args);
+
+  if (*cursor == '\0' || ascii_equal_ignore_case(cursor, "status")) {
+    if (ble_remote_id_operator_id_is_set()) {
+      snprintf(response,
+               sizeof(response),
+               "rid opid=%s",
+               ble_remote_id_get_operator_id_text());
+    } else {
+      snprintf(response, sizeof(response), "rid opid=unset");
+    }
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(cursor, "off") ||
+      ascii_equal_ignore_case(cursor, "clear") ||
+      ascii_equal_ignore_case(cursor, "unset")) {
+    ble_remote_id_clear_operator_id_text();
+    ble_publish_ephemeral_response("ok rid opid cleared");
+    return;
+  }
+
+  if (ble_remote_id_set_operator_id_text(cursor)) {
+    snprintf(response,
+             sizeof(response),
+             "ok rid opid=%s",
+             ble_remote_id_get_operator_id_text());
+    ble_publish_ephemeral_response(response);
+  } else {
+    ble_publish_ephemeral_response("err rid opid 1..20 printable ASCII chars");
+  }
+}
+
+static void ble_handle_remote_id_takeoff_command(char *args)
+{
+  char *cursor = trim_ascii(args);
+  char response[BLE_VALUE_MAX];
+
+  if (*cursor == '\0' || ascii_equal_ignore_case(cursor, "status")) {
+    ble_remote_id_format_takeoff(response, sizeof(response));
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(cursor, "reset") ||
+      ascii_equal_ignore_case(cursor, "clear")) {
+    ble_remote_id_clear_takeoff_location();
+    ble_publish_ephemeral_response("ok rid takeoff reset; next GPS fix will capture new takeoff");
+    return;
+  }
+
+  ble_publish_ephemeral_response("err rid takeoff status|reset");
+}
+
 static void ble_handle_remote_id_command(char *args)
 {
   char response[BLE_VALUE_MAX];
@@ -2155,7 +2277,7 @@ static void ble_handle_remote_id_command(char *args)
                                 ble_adv_mode == BLE_ADV_MODE_REMOTE_ID_BASIC);
     ble_publish_ephemeral_response(response);
   } else if (ascii_equal_ignore_case(args, "help")) {
-    ble_publish_ephemeral_response("rid: status,id <1..20>,loc <lat> <lon> [alt],preview [basic|loc],adv [sec],elrs");
+    ble_publish_ephemeral_response("rid: status,id,self,opid,takeoff,loc,preview [basic|loc],adv [sec],elrs");
   } else if (ascii_starts_with_ignore_case(args, "id ")) {
     char *id = trim_ascii(args + 3);
     if (ble_remote_id_set_uas_id(id)) {
@@ -2167,21 +2289,30 @@ static void ble_handle_remote_id_command(char *args)
     } else {
       ble_publish_ephemeral_response("err rid id 1..20 chars A-Z 0-9 - _ .");
     }
+  } else if (ascii_equal_ignore_case(args, "self") ||
+             ascii_starts_with_ignore_case(args, "self ")) {
+    ble_handle_remote_id_self_command((args[4] == '\0') ? "" : args + 5);
+  } else if (ascii_equal_ignore_case(args, "opid") ||
+             ascii_starts_with_ignore_case(args, "opid ")) {
+    ble_handle_remote_id_operator_id_command((args[4] == '\0') ? "" : args + 5);
+  } else if (ascii_equal_ignore_case(args, "takeoff") ||
+             ascii_starts_with_ignore_case(args, "takeoff ")) {
+    ble_handle_remote_id_takeoff_command((args[7] == '\0') ? "" : args + 8);
   } else if (ascii_equal_ignore_case(args, "loc") ||
              ascii_starts_with_ignore_case(args, "loc ")) {
     ble_handle_remote_id_location_command((args[3] == '\0') ? "" : args + 4);
   } else if (ascii_starts_with_ignore_case(args, "preview") ||
              ascii_starts_with_ignore_case(args, "hex")) {
-    char hex[96];
+    char hex[300];
     bool is_hex = ascii_starts_with_ignore_case(args, "hex");
     char *kind_text = trim_ascii(args + (is_hex ? 3 : 7));
     ble_remote_id_adv_kind_t kind = BLE_REMOTE_ID_ADV_BASIC_ID;
-    const char *name = "basic";
+    const char *name = BLE_REMOTE_ID_USE_OFFICIAL_BT5 ? "bt5_basic_pack" : "basic";
 
     if (ascii_equal_ignore_case(kind_text, "loc") ||
         ascii_equal_ignore_case(kind_text, "location")) {
       kind = BLE_REMOTE_ID_ADV_LOCATION;
-      name = "loc";
+      name = BLE_REMOTE_ID_USE_OFFICIAL_BT5 ? "bt5_location_pack" : "loc";
       if (!ble_remote_id_location_is_set()) {
         ble_publish_ephemeral_response("err rid loc unset");
         return;
@@ -2192,8 +2323,22 @@ static void ble_handle_remote_id_command(char *args)
       return;
     }
 
+#if BLE_REMOTE_ID_USE_OFFICIAL_BT5
+    ble_remote_id_format_bt5_adv_hex(hex, sizeof(hex), kind == BLE_REMOTE_ID_ADV_LOCATION);
+#else
     ble_remote_id_format_adv_hex(hex, sizeof(hex), kind);
-    snprintf(response, sizeof(response), "rid %s_advhex=%s", name, hex);
+#endif
+    {
+      int hex_len = (int)strnlen(hex, sizeof(hex));
+      int max_hex_len = (int)sizeof(response) - 24 - (int)strlen(name);
+      if (max_hex_len < 0) {
+        max_hex_len = 0;
+      }
+      if (hex_len > max_hex_len) {
+        hex_len = max_hex_len;
+      }
+      snprintf(response, sizeof(response), "rid %s_advhex=%.*s", name, hex_len, hex);
+    }
     ble_publish_ephemeral_response(response);
   } else if (ascii_equal_ignore_case(args, "elrs") ||
              ascii_equal_ignore_case(args, "off")) {
@@ -2620,7 +2765,7 @@ static void ble_task(void *argument)
   ble_service_ready = true;
 
   if (ble_remote_id_requested_enabled) {
-    BLE_LOG_DEBUGOUT("[BLE] Remote ID enabled by RX config; initial advertisement is ODID Basic ID id=%s\n",
+    BLE_LOG_DEBUGOUT("[BLE] Remote ID enabled by RX config; initial advertisement is ODID BT5 Message Pack id=%s\n",
                      ble_remote_id_get_uas_id());
   }
 
@@ -2633,10 +2778,10 @@ static void ble_task(void *argument)
   }
 
   if (ble_adv_mode == BLE_ADV_MODE_REMOTE_ID_BASIC) {
-    DEBUGOUT("[BLE] Advertising Remote ID over BLE AE (fixed 0 dBm setting, id=%s)\n",
+    DEBUGOUT("[BLE] Advertising Remote ID over BLE AE BT5 Message Pack (fixed 0 dBm, id=%s)\n",
              ble_remote_id_get_uas_id());
-    BLE_LOG_DEBUGOUT("[BLE] Remote ID AE payload includes ODID service data UUID 0xFFFA\n");
-    BLE_LOG_DEBUGOUT("[BLE] AE test payload includes flags/name plus the ODID service data element\n");
+    BLE_LOG_DEBUGOUT("[BLE] Remote ID AE payload is Service Data UUID 0xFFFA + ODID Message Pack\n");
+    BLE_LOG_DEBUGOUT("[BLE] AE test payload is separate and is not Remote ID\n");
     BLE_LOG_DEBUGOUT("[BLE] Use 'rid elrs' to restore normal %s advertising for config-app discovery\n",
                      BLE_PROBE_NAME);
   } else {

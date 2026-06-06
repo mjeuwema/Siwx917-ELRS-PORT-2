@@ -1562,10 +1562,20 @@ static void serviceCrsfSerialTelemetry() {
 
   const uint32_t toRead = available > sizeof(bytes) ? sizeof(bytes) : available;
   const uint32_t read = crsf_serial_read(bytes, toRead);
+  static uint8_t serialRxByteDiagCount = 0;
+  if (serialRxByteDiagCount < 12U) {
+    DBGLN("CRSF_RX_BYTES avail=%lu read=%lu first=0x%02X overrun=%lu",
+          (unsigned long)available,
+          (unsigned long)read,
+          read > 0 ? bytes[0] : 0,
+          (unsigned long)crsf_serial_get_rx_overrun_count());
+    serialRxByteDiagCount++;
+  }
 
   static uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
   static uint8_t pos = 0;
   static uint8_t expectedLen = 0;
+  static uint8_t serialRxFrameDiagCount = 0;
 
   for (uint32_t i = 0; i < read; ++i) {
     const uint8_t byte = bytes[i];
@@ -1594,6 +1604,11 @@ static void serviceCrsfSerialTelemetry() {
     if (expectedLen != 0 && pos >= expectedLen) {
       uint8_t frameLen = 0;
       if (validateCrsfFrame(frame, &frameLen)) {
+        if (serialRxFrameDiagCount < 12U) {
+          DBGLN("CRSF_RX_FRAME type=0x%02X len=%u", frame[CRSF_TELEMETRY_TYPE_INDEX],
+                frameLen);
+          serialRxFrameDiagCount++;
+        }
         updateRemoteIdFromCrsfGpsFrame(frame, frameLen);
         if (crsfSerialShouldForwardFrame(frame, frameLen)) {
           crsfRouter.processMessage(
@@ -5532,8 +5547,27 @@ void elrs_loop(void) {
   // Send serial RC channels, honoring the configured failsafe mode after RF loss.
   static uint32_t lastRcOutput = 0;
   const uint8_t serialProtocol = getConfiguredSerialProtocol();
-  if (shouldOutputSerialRcFrames() &&
-      (now - lastRcOutput) >= serialRcOutputIntervalMs(serialProtocol)) {
+  const bool shouldSendSerialRc = shouldOutputSerialRcFrames();
+  const uint32_t rcOutputAge = now - lastRcOutput;
+
+  static uint8_t serialRcGateDiagCount = 0;
+  static uint32_t serialRcGateDiagLastMs = 0;
+  if (connectionState == connected && serialRcGateDiagCount < 8U &&
+      (uint32_t)(now - serialRcGateDiagLastMs) >= 500U) {
+    serialRcGateDiagLastMs = now;
+    serialRcGateDiagCount++;
+    DBGLN("CRSF_RC_GATE send=%u bind=%u wifi=%u ready=%u proto=%u sendsRc=%u ota=%u model=%u teamEn=%u team=%u age=%lu tx=%lu",
+          shouldSendSerialRc ? 1 : 0, InBindingMode ? 1 : 0,
+          InWiFiMode ? 1 : 0, crsf_serial_is_ready() ? 1 : 0,
+          serialProtocol, configuredSerialProtocolSendsRc() ? 1 : 0,
+          TxOtaProtocol, connectionHasModelMatch ? 1 : 0,
+          teamraceIsEnabled() ? 1 : 0, teamraceHasModelMatch ? 1 : 0,
+          (unsigned long)rcOutputAge,
+          (unsigned long)crsf_serial_get_tx_count());
+  }
+
+  if (shouldSendSerialRc &&
+      rcOutputAge >= serialRcOutputIntervalMs(serialProtocol)) {
     lastRcOutput = now;
     if (serialProtocolUsesSbus(serialProtocol)) {
       const bool failsafeActive = connectionState != connected;

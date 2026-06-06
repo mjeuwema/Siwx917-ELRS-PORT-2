@@ -3,7 +3,7 @@
  * @brief CRSF Serial Output Implementation for SiW917
  *
  * Implements CRSF protocol output to flight controllers using the generated
- * CMSIS USART0 driver configuration already present in this project.
+ * CMSIS UART driver configuration already present in this project.
  *
  * Citation: TBS CRSF Protocol Specification
  * Citation: ExpressLRS src/lib/CrsfProtocol/crsf_protocol.h
@@ -13,7 +13,9 @@
 #include "Driver_USART.h"
 #include "RTE_Device_917.h"
 #include "cmsis_gcc.h"
+#include "rsi_egpio.h"
 #include "rsi_debug.h"
+#include "rsi_rom_egpio.h"
 #include "rsi_udma.h"
 #include <string.h>
 
@@ -25,6 +27,9 @@ static bool g_initialized = false;
 static uint32_t g_baud_rate = 0;
 static crsf_serial_format_t g_serial_format = CRSF_SERIAL_FORMAT_8N1;
 static uint32_t g_tx_count = 0;
+static uint32_t g_tx_diag_count = 0;
+static uint32_t g_tx_stuck_recover_count = 0;
+static uint8_t g_tx_busy_skip_count = 0;
 static volatile bool g_tx_in_progress = false;
 static ARM_DRIVER_USART *g_usart = NULL;
 
@@ -40,11 +45,52 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_RX_RING_MASK (CRSF_SERIAL_RX_RING_SIZE - 1U)
 #define CRSF_SERIAL_RX_DMA_CHUNK_SIZE 64U
 #define CRSF_SERIAL_RX_DMA_CHUNK_COUNT 2U
+#define CRSF_SERIAL_TX_STUCK_SKIP_LIMIT 8U
 
-#if defined(SL_USART0_DMA_CONFIG_ENABLE) && (SL_USART0_DMA_CONFIG_ENABLE == 1)
-#define CRSF_SERIAL_USART0_DMA_ENABLED 1
+/*
+ * BRD2708A's DEBUGOUT console uses the native ULP UART route. Keep CRSF on
+ * USART0 so FC serial experiments cannot steal the USB debug console.
+ */
+#define CRSF_SERIAL_USE_ULP_UART 0
+
+#if CRSF_SERIAL_USE_ULP_UART
+#define CRSF_SERIAL_DRIVER_NAME "ULP_UART"
+#define CRSF_SERIAL_ROUTE_NAME "BRD2708A mikroBUS native ULP UART"
+#define CRSF_SERIAL_TX_PIN RTE_ULP_UART_TX_PIN
+#define CRSF_SERIAL_TX_MUX RTE_ULP_UART_TX_MUX
+#define CRSF_SERIAL_TX_PAD RTE_ULP_UART_TX_PAD
+#define CRSF_SERIAL_RX_PIN RTE_ULP_UART_RX_PIN
+#define CRSF_SERIAL_RX_MUX RTE_ULP_UART_RX_MUX
+#define CRSF_SERIAL_RX_PAD RTE_ULP_UART_RX_PAD
+#define CRSF_SERIAL_TX_DMA_CH RTE_ULPUART_CHNL_UDMA_TX_CH
+#define CRSF_SERIAL_RX_DMA_CH RTE_ULPUART_CHNL_UDMA_RX_CH
+#if defined(SL_ULPUART_DMA_CONFIG_ENABLE) && (SL_ULPUART_DMA_CONFIG_ENABLE == 1)
+#define CRSF_SERIAL_DMA_ENABLED 1
 #else
-#define CRSF_SERIAL_USART0_DMA_ENABLED 0
+#define CRSF_SERIAL_DMA_ENABLED 0
+#endif
+#else
+#define CRSF_SERIAL_DRIVER_NAME "USART0"
+#define CRSF_SERIAL_ROUTE_NAME "BRD2708A mikroBUS via USART0 ULP pad route"
+#define CRSF_SERIAL_TX_PIN RTE_USART0_TX_PIN
+#define CRSF_SERIAL_TX_MUX RTE_USART0_TX_MUX
+#define CRSF_SERIAL_TX_PAD RTE_USART0_TX_PAD
+#define CRSF_SERIAL_RX_PIN RTE_USART0_RX_PIN
+#define CRSF_SERIAL_RX_MUX RTE_USART0_RX_MUX
+#define CRSF_SERIAL_RX_PAD RTE_USART0_RX_PAD
+#define CRSF_SERIAL_TX_DMA_CH RTE_USART0_CHNL_UDMA_TX_CH
+#define CRSF_SERIAL_RX_DMA_CH RTE_USART0_CHNL_UDMA_RX_CH
+#if defined(SL_USART0_DMA_CONFIG_ENABLE) && (SL_USART0_DMA_CONFIG_ENABLE == 1)
+#define CRSF_SERIAL_DMA_ENABLED 1
+#else
+#define CRSF_SERIAL_DMA_ENABLED 0
+#endif
+#endif
+
+#if CRSF_SERIAL_DMA_ENABLED
+#define CRSF_SERIAL_DMA_MODE_NAME "UDMA"
+#else
+#define CRSF_SERIAL_DMA_MODE_NAME "IRQ"
 #endif
 
 static uint8_t g_rx_ring[CRSF_SERIAL_RX_RING_SIZE];
@@ -54,8 +100,14 @@ static volatile bool g_rx_enabled = false;
 static volatile bool g_rx_armed = false;
 static volatile uint32_t g_rx_overrun_count = 0;
 
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_USE_ULP_UART
+extern RSI_UDMA_DESC_T UDMA1_Table[];
+#define CRSF_SERIAL_UDMA_TABLE UDMA1_Table
+#else
 extern RSI_UDMA_DESC_T UDMA0_Table[];
+#define CRSF_SERIAL_UDMA_TABLE UDMA0_Table
+#endif
 static volatile uint8_t g_rx_dma_buffer[CRSF_SERIAL_RX_DMA_CHUNK_COUNT][CRSF_SERIAL_RX_DMA_CHUNK_SIZE] CRSF_SERIAL_DMA_ALIGN;
 static volatile uint8_t g_rx_dma_active_index = 0;
 static volatile uint8_t g_rx_dma_next_index = 0;
@@ -70,6 +122,7 @@ static uint8_t crc8_table[256];
 static bool crc_table_initialized = false;
 
 extern ARM_DRIVER_USART Driver_USART0;
+extern ARM_DRIVER_USART Driver_ULP_UART;
 
 #define CRSF_SERIAL_PAD_CONFIG_BASE 0x46004000UL
 #define CRSF_SERIAL_PAD_CONFIG_REG(pin_) \
@@ -95,6 +148,89 @@ extern ARM_DRIVER_USART Driver_USART0;
 #ifndef ARM_USART_EVENT_RX_OVERFLOW
 #define ARM_USART_EVENT_RX_OVERFLOW 0U
 #endif
+
+static const char *crsf_serial_pin_domain(uint32_t sdk_pin)
+{
+    return (sdk_pin >= GPIO_MAX_PIN) ? "ULP_GPIO" : "GPIO";
+}
+
+static uint32_t crsf_serial_module_pin(uint32_t sdk_pin)
+{
+    return (sdk_pin >= GPIO_MAX_PIN) ? (sdk_pin - GPIO_MAX_PIN) : sdk_pin;
+}
+
+static void crsf_serial_log_status(const char *stage)
+{
+    if (g_usart == NULL) {
+        return;
+    }
+
+    ARM_USART_STATUS status = g_usart->GetStatus();
+    CRSF_DBG("%s status: tx_busy=%u rx_busy=%u rx_overflow=%u framing=%u parity=%u\n",
+             stage,
+             (unsigned)status.tx_busy,
+             (unsigned)status.rx_busy,
+             (unsigned)status.rx_overflow,
+             (unsigned)status.rx_framing_error,
+             (unsigned)status.rx_parity_error);
+}
+
+static void crsf_serial_log_route(void)
+{
+    CRSF_DBG("%s route: mikroBUS TX=%s_%lu (SDK GPIO_%lu) -> FC RX\n",
+             CRSF_SERIAL_ROUTE_NAME,
+             crsf_serial_pin_domain(CRSF_SERIAL_TX_PIN),
+             (unsigned long)crsf_serial_module_pin(CRSF_SERIAL_TX_PIN),
+             (unsigned long)CRSF_SERIAL_TX_PIN);
+    CRSF_DBG("%s route: mikroBUS RX=%s_%lu (SDK GPIO_%lu) <- FC TX\n",
+             CRSF_SERIAL_ROUTE_NAME,
+             crsf_serial_pin_domain(CRSF_SERIAL_RX_PIN),
+             (unsigned long)crsf_serial_module_pin(CRSF_SERIAL_RX_PIN),
+             (unsigned long)CRSF_SERIAL_RX_PIN);
+#if CRSF_SERIAL_USE_ULP_UART
+    CRSF_DBG("%s detail: TX GPIO_%lu mux=%lu pad=%lu; RX GPIO_%lu mux=%lu pad=%lu\n",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned long)CRSF_SERIAL_TX_PIN,
+             (unsigned long)CRSF_SERIAL_TX_MUX,
+             (unsigned long)CRSF_SERIAL_TX_PAD,
+             (unsigned long)CRSF_SERIAL_RX_PIN,
+             (unsigned long)CRSF_SERIAL_RX_MUX,
+             (unsigned long)CRSF_SERIAL_RX_PAD);
+#else
+    CRSF_DBG("%s detail: CLK GPIO_%lu mux=%lu pad=%lu; TX GPIO_%lu mux=%lu pad=%lu; RX GPIO_%lu mux=%lu pad=%lu\n",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned long)RTE_USART0_CLK_PIN,
+             (unsigned long)RTE_USART0_CLK_MUX,
+             (unsigned long)RTE_USART0_CLK_PAD,
+             (unsigned long)CRSF_SERIAL_TX_PIN,
+             (unsigned long)CRSF_SERIAL_TX_MUX,
+             (unsigned long)CRSF_SERIAL_TX_PAD,
+             (unsigned long)CRSF_SERIAL_RX_PIN,
+             (unsigned long)CRSF_SERIAL_RX_MUX,
+             (unsigned long)CRSF_SERIAL_RX_PAD);
+#endif
+}
+
+static void crsf_serial_configure_rx_idle_bias(void)
+{
+    if (CRSF_SERIAL_RX_PIN >= GPIO_MAX_PIN) {
+        const uint8_t ulp_pin = (uint8_t)(CRSF_SERIAL_RX_PIN - GPIO_MAX_PIN);
+        RSI_EGPIO_UlpPadDriverDisableState(ulp_pin, ulp_Pullup);
+        RSI_EGPIO_UlpPadReceiverEnable(ulp_pin);
+        CRSF_DBG("RX idle bias: ULP_GPIO_%u pull-up/receiver enabled\n",
+                 (unsigned)ulp_pin);
+        return;
+    }
+
+    uint32_t rx_pad = CRSF_SERIAL_PAD_CONFIG_REG(CRSF_SERIAL_RX_PIN);
+    rx_pad &= ~CRSF_SERIAL_PAD_PULL_MASK;
+    rx_pad |= CRSF_SERIAL_PAD_REN_ENABLE | CRSF_SERIAL_PAD_SMT_ENABLE |
+              CRSF_SERIAL_PAD_PULLUP;
+    CRSF_SERIAL_PAD_CONFIG_REG(CRSF_SERIAL_RX_PIN) = rx_pad;
+    CRSF_DBG("RX idle bias: GPIO_%lu PAD_CONFIG_REG=0x%08lX\n",
+             (unsigned long)CRSF_SERIAL_RX_PIN,
+             (unsigned long)CRSF_SERIAL_PAD_CONFIG_REG(CRSF_SERIAL_RX_PIN));
+}
 
 /*******************************************************************************
  * CRC Calculation
@@ -203,7 +339,7 @@ static void rx_ring_push_block_from_isr(const volatile uint8_t *data, uint32_t l
 
 static void rx_dma_state_reset(void)
 {
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
     g_rx_dma_active_len = 0;
     g_rx_dma_pushed_len = 0;
     g_rx_dma_active_index = 0;
@@ -211,14 +347,14 @@ static void rx_dma_state_reset(void)
 #endif
 }
 
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
 static uint32_t rx_dma_completed_len(void)
 {
     if (!g_rx_armed || g_rx_dma_active_len == 0U) {
         return 0;
     }
 
-    const RSI_UDMA_DESC_T *desc = &UDMA0_Table[RTE_USART0_CHNL_UDMA_RX_CH];
+    const RSI_UDMA_DESC_T *desc = &CRSF_SERIAL_UDMA_TABLE[CRSF_SERIAL_RX_DMA_CH];
     RSI_UDMA_CHA_CONFIG_DATA_T control = desc->vsUDMAChaConfigData1;
 
     if (control.transferType == UDMA_MODE_STOP) {
@@ -271,7 +407,7 @@ static void rx_arm_receive_from_isr(void)
         return;
     }
 
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
     const uint8_t next = g_rx_dma_next_index;
     g_rx_dma_active_index = next;
     g_rx_dma_next_index = (uint8_t)((next + 1U) % CRSF_SERIAL_RX_DMA_CHUNK_COUNT);
@@ -298,7 +434,7 @@ static void usart_callback(uint32_t event)
     }
 
     if (event & ARM_USART_EVENT_RECEIVE_COMPLETE) {
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
         rx_dma_harvest_to_ring_unlocked();
         if (g_rx_dma_pushed_len < g_rx_dma_active_len) {
             const uint8_t index = g_rx_dma_active_index;
@@ -313,7 +449,7 @@ static void usart_callback(uint32_t event)
     }
 
     if (event & (ARM_USART_EVENT_RX_OVERFLOW | ARM_USART_EVENT_RX_TIMEOUT)) {
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
         rx_dma_harvest_to_ring_unlocked();
 #endif
         g_rx_overrun_count++;
@@ -329,9 +465,33 @@ static int wait_for_tx_idle(void)
 {
     ARM_USART_STATUS status = g_usart->GetStatus();
 
+    /*
+     * The Si91x USART driver can report tx_busy immediately after TX enable,
+     * before this module has queued any bytes. Do not let that stale hardware
+     * bit starve the first CRSF frame forever.
+     */
+    if (!g_tx_in_progress) {
+        g_tx_busy_skip_count = 0;
+        return 0;
+    }
+
     /* Recover if the completion callback lagged but hardware is already idle. */
     if (!status.tx_busy) {
         g_tx_in_progress = false;
+        g_tx_busy_skip_count = 0;
+        return 0;
+    }
+
+    if (++g_tx_busy_skip_count >= CRSF_SERIAL_TX_STUCK_SKIP_LIMIT) {
+        (void)g_usart->Control(ARM_USART_ABORT_SEND, 0);
+        g_tx_in_progress = false;
+        g_tx_busy_skip_count = 0;
+        g_tx_stuck_recover_count++;
+        if (g_tx_stuck_recover_count <= 4U) {
+            CRSF_DBG("TX busy recovery #%lu\n",
+                     (unsigned long)g_tx_stuck_recover_count);
+        }
+        return 0;
     }
 
     /*
@@ -339,7 +499,7 @@ static int wait_for_tx_idle(void)
      * frame, and a busy-wait in the FreeRTOS task can starve hwTimer::service()
      * long enough to drop Tick/Tock events.
      */
-    return (!g_tx_in_progress && !status.tx_busy) ? 0 : -1;
+    return -1;
 }
 
 static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
@@ -354,10 +514,22 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
 
     memcpy(g_tx_buffer, frame, frame_len);
     g_tx_in_progress = true;
+    g_tx_busy_skip_count = 0;
 
     if (g_usart->Send(g_tx_buffer, frame_len) != ARM_DRIVER_OK) {
         g_tx_in_progress = false;
         return -3;
+    }
+
+    if (g_tx_diag_count < 8U) {
+        const uint8_t addr = (frame_len > 0U) ? frame[0] : 0U;
+        const uint8_t type = (frame_len > 2U) ? frame[2] : 0U;
+        CRSF_DBG("TX frame OK #%lu len=%lu addr=0x%02X type=0x%02X\n",
+                 (unsigned long)(g_tx_diag_count + 1U),
+                 (unsigned long)frame_len,
+                 addr,
+                 type);
+        g_tx_diag_count++;
     }
 
     return 0;
@@ -385,15 +557,12 @@ static int configure_usart(uint32_t baud_rate, crsf_serial_format_t format)
         CRSF_DBG("USART TX enable failed\n");
         return -2;
     }
+    crsf_serial_log_status("After TX enable");
 
-    /* UART RX idles high. Keep GPIO_55 pulled up so an unplugged FC does not
-     * feed continuous noise into the DMA receiver when RX is armed.
+    /* UART RX idles high. Keep the configured RX pad pulled up so an
+     * unplugged FC does not feed continuous noise into the DMA receiver.
      */
-    uint32_t rx_pad = CRSF_SERIAL_PAD_CONFIG_REG(RTE_USART0_RX_PIN);
-    rx_pad &= ~CRSF_SERIAL_PAD_PULL_MASK;
-    rx_pad |= CRSF_SERIAL_PAD_REN_ENABLE | CRSF_SERIAL_PAD_SMT_ENABLE |
-              CRSF_SERIAL_PAD_PULLUP;
-    CRSF_SERIAL_PAD_CONFIG_REG(RTE_USART0_RX_PIN) = rx_pad;
+    crsf_serial_configure_rx_idle_bias();
 
     g_baud_rate = baud_rate;
     g_serial_format = format;
@@ -420,7 +589,8 @@ static int reconfigure_usart(uint32_t baud_rate, crsf_serial_format_t format)
         return -2;
     }
 
-    CRSF_DBG("Reconfigured USART0 to %lu baud (%s)\n",
+    CRSF_DBG("Reconfigured %s to %lu baud (%s)\n",
+             CRSF_SERIAL_DRIVER_NAME,
              (unsigned long)baud_rate,
              format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1");
     return 0;
@@ -452,10 +622,13 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
     /* Initialize CRC table */
     init_crc8_table();
 
-    g_usart = &Driver_USART0;
+    g_usart = CRSF_SERIAL_USE_ULP_UART ? &Driver_ULP_UART : &Driver_USART0;
 
-    CRSF_DBG("Init USART0 on CLK GPIO_%d, TX GPIO_%d, RX GPIO_%d\n",
-             RTE_USART0_CLK_PIN, RTE_USART0_TX_PIN, RTE_USART0_RX_PIN);
+    CRSF_DBG("Init %s on TX GPIO_%lu, RX GPIO_%lu\n",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned long)CRSF_SERIAL_TX_PIN,
+             (unsigned long)CRSF_SERIAL_RX_PIN);
+    crsf_serial_log_route();
 
     if (g_usart->Initialize(usart_callback) != ARM_DRIVER_OK) {
         CRSF_DBG("USART init failed\n");
@@ -486,20 +659,24 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
     g_rx_armed = false;
     rx_dma_state_reset();
     rx_ring_reset();
-#if CRSF_SERIAL_USART0_DMA_ENABLED
-    CRSF_DBG("Initialized at %lu baud %s (USART0 UDMA TX ch %u RX ch %u)\n",
+#if CRSF_SERIAL_DMA_ENABLED
+    CRSF_DBG("Initialized at %lu baud %s (%s %s TX ch %u RX ch %u)\n",
              (unsigned long)baud_rate,
              format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1",
-             (unsigned)RTE_USART0_CHNL_UDMA_TX_CH,
-             (unsigned)RTE_USART0_CHNL_UDMA_RX_CH);
+             CRSF_SERIAL_DRIVER_NAME,
+             CRSF_SERIAL_DMA_MODE_NAME,
+             (unsigned)CRSF_SERIAL_TX_DMA_CH,
+             (unsigned)CRSF_SERIAL_RX_DMA_CH);
 #else
-    CRSF_DBG("Initialized at %lu baud %s (USART0 IRQ RX/TX)\n",
+    CRSF_DBG("Initialized at %lu baud %s (%s IRQ RX/TX)\n",
              (unsigned long)baud_rate,
-             format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1");
+             format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1",
+             CRSF_SERIAL_DRIVER_NAME);
 #endif
     
     g_initialized = true;
     g_tx_count = 0;
+    g_tx_diag_count = 0;
     return 0;
 }
 
@@ -753,12 +930,13 @@ int crsf_serial_set_rx_enabled(bool enable)
     }
 
     CRSF_DBG("RX enabled\n");
+    crsf_serial_log_status("After RX enable");
     return 0;
 }
 
 uint32_t crsf_serial_rx_available(void)
 {
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
     rx_dma_harvest_to_ring();
 #endif
     const uint16_t head = g_rx_head;
@@ -772,7 +950,7 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
         return 0;
     }
 
-#if CRSF_SERIAL_USART0_DMA_ENABLED
+#if CRSF_SERIAL_DMA_ENABLED
     rx_dma_harvest_to_ring();
 #endif
     uint32_t copied = 0;

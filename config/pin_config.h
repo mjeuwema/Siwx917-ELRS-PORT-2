@@ -2,12 +2,31 @@
 #define PIN_CONFIG_H
 
 // $[USART0]
+// Legacy USART0 route for CRSF FC serial on BRD2708A mikroBUS UART:
+//   USART0_TX -> ULP_GPIO_7 / mikroBUS TX
+//   USART0_RX -> ULP_GPIO_6 / mikroBUS RX
+// The SDK represents these ULP pins as GPIO_71 and GPIO_70 in USART0 routing.
+#ifndef USART0_TX_PIN
+#define USART0_TX_PIN                          7
+#endif
+#ifndef USART0_TX_LOC
+#define USART0_TX_LOC                          8
+#endif
+#ifndef USART0_RX_PIN
+#define USART0_RX_PIN                          6
+#endif
+#ifndef USART0_RX_LOC
+#define USART0_RX_LOC                          13
+#endif
+
 // [USART0]$
 
 // $[UART1]
 // [UART1]$
 
 // $[ULP_UART]
+// Intentionally leave ULP_UART on the SDK/board default route.
+// DEBUGINIT()/DEBUGOUT use this path for the USB serial console on BRD2708A.
 // [ULP_UART]$
 
 // $[I2C0]
