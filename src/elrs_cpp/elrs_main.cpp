@@ -1479,6 +1479,10 @@ static void updateSerialRxState() {
 }
 
 #if SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
+#ifndef SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS
+#define SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS 0
+#endif
+
 static bool crsfSerialShouldForwardFrame(const uint8_t *frame, uint8_t frameLen) {
   (void)frameLen;
   const uint8_t frameType = frame[CRSF_TELEMETRY_TYPE_INDEX];
@@ -1562,6 +1566,7 @@ static void serviceCrsfSerialTelemetry() {
 
   const uint32_t toRead = available > sizeof(bytes) ? sizeof(bytes) : available;
   const uint32_t read = crsf_serial_read(bytes, toRead);
+#if SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS
   static uint8_t serialRxByteDiagCount = 0;
   if (serialRxByteDiagCount < 12U) {
     DBGLN("CRSF_RX_BYTES avail=%lu read=%lu first=0x%02X overrun=%lu",
@@ -1571,11 +1576,14 @@ static void serviceCrsfSerialTelemetry() {
           (unsigned long)crsf_serial_get_rx_overrun_count());
     serialRxByteDiagCount++;
   }
+#endif
 
   static uint8_t frame[CRSF_FRAME_SIZE_MAX] = {};
   static uint8_t pos = 0;
   static uint8_t expectedLen = 0;
+#if SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS
   static uint8_t serialRxFrameDiagCount = 0;
+#endif
 
   for (uint32_t i = 0; i < read; ++i) {
     const uint8_t byte = bytes[i];
@@ -1604,11 +1612,13 @@ static void serviceCrsfSerialTelemetry() {
     if (expectedLen != 0 && pos >= expectedLen) {
       uint8_t frameLen = 0;
       if (validateCrsfFrame(frame, &frameLen)) {
+#if SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS
         if (serialRxFrameDiagCount < 12U) {
           DBGLN("CRSF_RX_FRAME type=0x%02X len=%u", frame[CRSF_TELEMETRY_TYPE_INDEX],
                 frameLen);
           serialRxFrameDiagCount++;
         }
+#endif
         updateRemoteIdFromCrsfGpsFrame(frame, frameLen);
         if (crsfSerialShouldForwardFrame(frame, frameLen)) {
           crsfRouter.processMessage(
@@ -5550,6 +5560,7 @@ void elrs_loop(void) {
   const bool shouldSendSerialRc = shouldOutputSerialRcFrames();
   const uint32_t rcOutputAge = now - lastRcOutput;
 
+#if SIW917_ELRS_CRSF_SERIAL_DIAG_LOGS
   static uint8_t serialRcGateDiagCount = 0;
   static uint32_t serialRcGateDiagLastMs = 0;
   if (connectionState == connected && serialRcGateDiagCount < 8U &&
@@ -5565,6 +5576,7 @@ void elrs_loop(void) {
           (unsigned long)rcOutputAge,
           (unsigned long)crsf_serial_get_tx_count());
   }
+#endif
 
   if (shouldSendSerialRc &&
       rcOutputAge >= serialRcOutputIntervalMs(serialProtocol)) {

@@ -27,7 +27,9 @@ static bool g_initialized = false;
 static uint32_t g_baud_rate = 0;
 static crsf_serial_format_t g_serial_format = CRSF_SERIAL_FORMAT_8N1;
 static uint32_t g_tx_count = 0;
+#if CRSF_SERIAL_DIAG_LOGS
 static uint32_t g_tx_diag_count = 0;
+#endif
 static uint32_t g_tx_stuck_recover_count = 0;
 static uint8_t g_tx_busy_skip_count = 0;
 static volatile bool g_tx_in_progress = false;
@@ -142,6 +144,14 @@ extern ARM_DRIVER_USART Driver_ULP_UART;
 
 #define CRSF_DBG(fmt, ...) DEBUGOUT("[CRSF] " fmt, ##__VA_ARGS__)
 
+#ifndef CRSF_SERIAL_DIAG_LOGS
+#define CRSF_SERIAL_DIAG_LOGS 0
+#endif
+
+#ifndef CRSF_SERIAL_RECOVERY_LOGS
+#define CRSF_SERIAL_RECOVERY_LOGS 0
+#endif
+
 #ifndef ARM_USART_EVENT_RX_TIMEOUT
 #define ARM_USART_EVENT_RX_TIMEOUT 0U
 #endif
@@ -149,6 +159,7 @@ extern ARM_DRIVER_USART Driver_ULP_UART;
 #define ARM_USART_EVENT_RX_OVERFLOW 0U
 #endif
 
+#if CRSF_SERIAL_DIAG_LOGS
 static const char *crsf_serial_pin_domain(uint32_t sdk_pin)
 {
     return (sdk_pin >= GPIO_MAX_PIN) ? "ULP_GPIO" : "GPIO";
@@ -210,6 +221,10 @@ static void crsf_serial_log_route(void)
              (unsigned long)CRSF_SERIAL_RX_PAD);
 #endif
 }
+#else
+#define crsf_serial_log_status(stage_) ((void)0)
+#define crsf_serial_log_route() ((void)0)
+#endif
 
 static void crsf_serial_configure_rx_idle_bias(void)
 {
@@ -217,8 +232,10 @@ static void crsf_serial_configure_rx_idle_bias(void)
         const uint8_t ulp_pin = (uint8_t)(CRSF_SERIAL_RX_PIN - GPIO_MAX_PIN);
         RSI_EGPIO_UlpPadDriverDisableState(ulp_pin, ulp_Pullup);
         RSI_EGPIO_UlpPadReceiverEnable(ulp_pin);
+#if CRSF_SERIAL_DIAG_LOGS
         CRSF_DBG("RX idle bias: ULP_GPIO_%u pull-up/receiver enabled\n",
                  (unsigned)ulp_pin);
+#endif
         return;
     }
 
@@ -227,9 +244,11 @@ static void crsf_serial_configure_rx_idle_bias(void)
     rx_pad |= CRSF_SERIAL_PAD_REN_ENABLE | CRSF_SERIAL_PAD_SMT_ENABLE |
               CRSF_SERIAL_PAD_PULLUP;
     CRSF_SERIAL_PAD_CONFIG_REG(CRSF_SERIAL_RX_PIN) = rx_pad;
+#if CRSF_SERIAL_DIAG_LOGS
     CRSF_DBG("RX idle bias: GPIO_%lu PAD_CONFIG_REG=0x%08lX\n",
              (unsigned long)CRSF_SERIAL_RX_PIN,
              (unsigned long)CRSF_SERIAL_PAD_CONFIG_REG(CRSF_SERIAL_RX_PIN));
+#endif
 }
 
 /*******************************************************************************
@@ -487,10 +506,12 @@ static int wait_for_tx_idle(void)
         g_tx_in_progress = false;
         g_tx_busy_skip_count = 0;
         g_tx_stuck_recover_count++;
+#if CRSF_SERIAL_RECOVERY_LOGS
         if (g_tx_stuck_recover_count <= 4U) {
             CRSF_DBG("TX busy recovery #%lu\n",
                      (unsigned long)g_tx_stuck_recover_count);
         }
+#endif
         return 0;
     }
 
@@ -521,6 +542,7 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
         return -3;
     }
 
+#if CRSF_SERIAL_DIAG_LOGS
     if (g_tx_diag_count < 8U) {
         const uint8_t addr = (frame_len > 0U) ? frame[0] : 0U;
         const uint8_t type = (frame_len > 2U) ? frame[2] : 0U;
@@ -531,6 +553,7 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
                  type);
         g_tx_diag_count++;
     }
+#endif
 
     return 0;
 }
@@ -676,7 +699,9 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
     
     g_initialized = true;
     g_tx_count = 0;
+#if CRSF_SERIAL_DIAG_LOGS
     g_tx_diag_count = 0;
+#endif
     return 0;
 }
 
