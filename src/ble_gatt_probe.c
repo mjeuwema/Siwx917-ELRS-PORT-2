@@ -74,6 +74,10 @@ extern bool device_initialized;
 #define BLE_EVENT_READ 3
 #define BLE_REMOTE_ID_DYNAMIC_UPDATE_SECONDS 1U
 #define BLE_REMOTE_ID_LOCATION_STALE_MS 3000U
+#define BLE_AE_ADV_HANDLE 0x00U
+#define BLE_AE_ADV_INTERVAL_1S 0x0640U
+#define BLE_AE_TEST_PAYLOAD_MAX 96U
+#define BLE_REMOTE_ID_AE_PAYLOAD_MAX 64U
 
 typedef enum {
   BLE_ADV_MODE_ELRS_CONFIG = 0,
@@ -98,6 +102,8 @@ static bool config_dirty;
 static volatile bool ble_task_started;
 static volatile bool ble_service_ready;
 static volatile bool ble_advertising;
+static volatile bool ble_ae_advertising;
+static volatile bool ble_ae_params_configured;
 static volatile bool ble_config_advertise_when_remote_id_off = true;
 static volatile bool ble_remote_id_requested_enabled;
 static volatile bool ble_remote_id_request_pending;
@@ -123,6 +129,12 @@ static uint32_t notify_count;
 static uint32_t notify_error_count;
 static uint16_t last_write_handle;
 static uint16_t last_read_handle;
+
+static bool ascii_equal_ignore_case(const char *a, const char *b);
+static char *trim_ascii(char *text);
+static void ble_publish_ephemeral_response(const char *response);
+static int32_t ble_ae_stop_advertising(void);
+static int32_t ble_apply_remote_id_ae_advertisement(ble_remote_id_adv_kind_t kind);
 
 static uint16_t ble_build_elrs_advertisement(uint8_t adv[31])
 {
@@ -224,6 +236,15 @@ static int32_t ble_apply_current_advertisement(void)
 
   if (ble_adv_mode == BLE_ADV_MODE_ELRS_CONFIG &&
       !ble_config_advertise_when_remote_id_off) {
+    if (ble_ae_advertising) {
+      status = ble_ae_stop_advertising();
+      if (status != RSI_SUCCESS) {
+        DEBUGOUT("[BLE] stop AE advertising failed status=0x%lX\n",
+                 (unsigned long)status);
+        return status;
+      }
+    }
+
     if (!ble_advertising) {
       return RSI_SUCCESS;
     }
@@ -244,17 +265,20 @@ static int32_t ble_apply_current_advertisement(void)
       kind = BLE_REMOTE_ID_ADV_BASIC_ID;
     }
 
-    adv_len = ble_remote_id_build_advertisement(adv, kind);
-    adv_name = ble_remote_id_adv_kind_name(kind);
-    /*
-     * Keep the advertised Remote ID payload stable. The NWP repeats this single
-     * non-connectable advertisement at 1 Hz by itself; do not stop/set/start
-     * advertising every second from the M4 while the ELRS RX loop is running.
-     */
-  } else {
-    adv_len = ble_build_elrs_advertisement(adv);
-    adv_name = "ELRS";
+    return ble_apply_remote_id_ae_advertisement(kind);
   }
+
+  if (ble_ae_advertising) {
+    status = ble_ae_stop_advertising();
+    if (status != RSI_SUCCESS) {
+      DEBUGOUT("[BLE] stop AE advertising failed status=0x%lX\n",
+               (unsigned long)status);
+      return status;
+    }
+  }
+
+  adv_len = ble_build_elrs_advertisement(adv);
+  adv_name = "ELRS";
 
   if (adv_len == 0U) {
     return -1;
@@ -294,6 +318,318 @@ static int32_t ble_apply_current_advertisement(void)
   }
 
   return status;
+}
+
+static uint8_t ble_build_remote_id_ae_payload(uint8_t *payload,
+                                              uint8_t max_len,
+                                              ble_remote_id_adv_kind_t kind)
+{
+  uint8_t len = 0U;
+  uint8_t legacy_adv[BLE_REMOTE_ID_ADV_MAX] = { 0 };
+  uint16_t legacy_len;
+  const char name[] = "ELRS-RID";
+  const uint8_t name_len = (uint8_t)(sizeof(name) - 1U);
+
+  if (payload == NULL || max_len == 0U) {
+    return 0U;
+  }
+
+  legacy_len = ble_remote_id_build_advertisement(legacy_adv, kind);
+  if (legacy_len == 0U) {
+    return 0U;
+  }
+
+  if ((uint16_t)(legacy_len + 2U + name_len) > max_len) {
+    return 0U;
+  }
+
+  /*
+   * Keep the ODID service-data element byte-for-byte identical to the legacy
+   * advertisement Drone Scanner already parsed correctly. The appended Complete
+   * Local Name only proves the payload is travelling through the AE path.
+   */
+  memcpy(&payload[len], legacy_adv, legacy_len);
+  len = (uint8_t)(len + legacy_len);
+
+  payload[len++] = (uint8_t)(1U + name_len);
+  payload[len++] = 0x09U;
+  memcpy(&payload[len], name, name_len);
+  len = (uint8_t)(len + name_len);
+
+  return len;
+}
+
+static int32_t ble_apply_remote_id_ae_advertisement(ble_remote_id_adv_kind_t kind)
+{
+  uint8_t payload[BLE_REMOTE_ID_AE_PAYLOAD_MAX] = { 0 };
+  uint8_t payload_len = ble_build_remote_id_ae_payload(payload, sizeof(payload), kind);
+  const char *adv_name = ble_remote_id_adv_kind_name(kind);
+  int32_t status = RSI_SUCCESS;
+
+  if (payload_len == 0U || payload_len > sizeof(((rsi_ble_ae_data_t *)0)->data)) {
+    return -1;
+  }
+
+  if (ble_advertising) {
+    status = rsi_ble_stop_advertising();
+    if (status != RSI_SUCCESS) {
+      DEBUGOUT("[BLE] stop legacy advertising failed before AE status=0x%lX\n",
+               (unsigned long)status);
+      return status;
+    }
+    ble_advertising = false;
+  }
+
+  if (ble_ae_advertising) {
+    status = ble_ae_stop_advertising();
+    if (status != RSI_SUCCESS) {
+      DEBUGOUT("[BLE] stop AE advertising failed status=0x%lX\n",
+               (unsigned long)status);
+      return status;
+    }
+  }
+
+  if (!ble_ae_params_configured) {
+    int8_t selected_tx_power = 0;
+    rsi_ble_ae_adv_params_t params = { 0 };
+    params.adv_handle = BLE_AE_ADV_HANDLE;
+    params.adv_event_prop = 0x0000U;
+    params.primary_adv_intterval_min = BLE_AE_ADV_INTERVAL_1S;
+    params.primary_adv_intterval_max = BLE_AE_ADV_INTERVAL_1S;
+    params.primary_adv_chnl_map = RSI_BLE_ADV_CHANNEL_MAP;
+    params.own_addr_type = LE_PUBLIC_ADDRESS;
+    params.peer_addr_type = LE_PUBLIC_ADDRESS;
+    params.adv_filter_policy = ALLOW_SCAN_REQ_ANY_CONN_REQ_ANY;
+    params.adv_tx_power = 0x7FU;
+    params.primary_adv_phy = 0x01U;
+    params.sec_adv_max_skip = 0x00U;
+    params.sec_adv_phy = 0x01U;
+    params.adv_sid = 0x00U;
+    params.scan_req_notify_enable = 0x00U;
+
+    status = rsi_ble_set_ae_params(&params, &selected_tx_power);
+    if (status != RSI_SUCCESS) {
+      DEBUGOUT("[BLE] set Remote ID AE params failed status=0x%lX\n",
+               (unsigned long)status);
+      return status;
+    }
+    ble_ae_params_configured = true;
+    BLE_LOG_DEBUGOUT("[BLE] Remote ID AE params ready selected_tx_power=%d\n",
+                     (int)selected_tx_power);
+  }
+
+  rsi_ble_ae_data_t data = { 0 };
+  data.type = AE_ADV_DATA;
+  data.adv_handle = BLE_AE_ADV_HANDLE;
+  data.operation = 0x03U;
+  data.frag_pref = 0x00U;
+  data.data_len = payload_len;
+  memcpy(data.data, payload, payload_len);
+
+  status = rsi_ble_set_ae_data(&data);
+  if (status != RSI_SUCCESS) {
+    DEBUGOUT("[BLE] set %s AE data failed len=%u status=0x%lX\n",
+             adv_name,
+             (unsigned int)payload_len,
+             (unsigned long)status);
+    return status;
+  }
+
+  if (!is_connected && ble_should_advertise_current_mode()) {
+    rsi_ble_ae_adv_enable_t enable = { 0 };
+    enable.enable = RSI_BLE_START_ADV;
+    enable.no_of_sets = 1U;
+    enable.adv_handle = BLE_AE_ADV_HANDLE;
+    enable.duration = 0U;
+    enable.max_ae_events = 0U;
+
+    status = rsi_ble_start_ae_advertising(&enable);
+    if (status == RSI_SUCCESS) {
+      ble_ae_advertising = true;
+      BLE_LOG_DEBUGOUT("[BLE] start %s AE advertising len=%u status=0x%lX\n",
+                       adv_name,
+                       (unsigned int)payload_len,
+                       (unsigned long)status);
+    } else {
+      DEBUGOUT("[BLE] start %s AE advertising failed status=0x%lX\n",
+               adv_name,
+               (unsigned long)status);
+    }
+  }
+
+  return status;
+}
+
+static uint8_t ble_build_ae_test_payload(uint8_t *payload, uint8_t max_len)
+{
+  uint8_t len = 0U;
+  const char name[] = "ELRS-AE-TEST";
+
+  if (payload == NULL || max_len < 48U) {
+    return 0U;
+  }
+
+  payload[len++] = 0x02U;
+  payload[len++] = 0x01U;
+  payload[len++] = 0x06U;
+
+  payload[len++] = (uint8_t)(1U + sizeof(name) - 1U);
+  payload[len++] = 0x08U;
+  memcpy(&payload[len], name, sizeof(name) - 1U);
+  len = (uint8_t)(len + sizeof(name) - 1U);
+
+  /*
+   * OpenDroneID service UUID with dummy bytes. This deliberately exceeds the
+   * 31-byte legacy advertising limit without pretending to be valid RID data.
+   */
+  const uint8_t service_data_len = 44U;
+  payload[len++] = (uint8_t)(1U + 2U + service_data_len);
+  payload[len++] = 0x16U;
+  payload[len++] = 0xFAU;
+  payload[len++] = 0xFFU;
+  for (uint8_t i = 0; i < service_data_len && len < max_len; i++) {
+    payload[len++] = (uint8_t)(0xA0U + i);
+  }
+
+  return len;
+}
+
+static int32_t ble_ae_stop_advertising(void)
+{
+  rsi_ble_ae_adv_enable_t enable = { 0 };
+  enable.enable = RSI_BLE_STOP_ADV;
+  enable.no_of_sets = 1U;
+  enable.adv_handle = BLE_AE_ADV_HANDLE;
+  enable.duration = 0U;
+  enable.max_ae_events = 0U;
+
+  int32_t status = rsi_ble_start_ae_advertising(&enable);
+  if (status == RSI_SUCCESS) {
+    ble_ae_advertising = false;
+  }
+  return status;
+}
+
+static void ble_handle_ae_command(char *args)
+{
+  char response[128];
+  args = trim_ascii(args);
+
+  if (*args == '\0' || ascii_equal_ignore_case(args, "help")) {
+    ble_publish_ephemeral_response("ae: caps,test,stop,status");
+    return;
+  }
+
+  if (ascii_equal_ignore_case(args, "status")) {
+    snprintf(response,
+             sizeof(response),
+             "ae advertising=%u handle=%u",
+             ble_ae_advertising ? 1U : 0U,
+             (unsigned int)BLE_AE_ADV_HANDLE);
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(args, "caps")) {
+    uint8_t max_len = 0U;
+    uint8_t max_sets = 0U;
+    int32_t len_status = rsi_ble_get_max_adv_data_len(&max_len);
+    int32_t sets_status = rsi_ble_get_max_no_of_supp_adv_sets(&max_sets);
+    snprintf(response,
+             sizeof(response),
+             "ae caps len_st=0x%lX max_len=%u sets_st=0x%lX max_sets=%u",
+             (unsigned long)len_status,
+             (unsigned int)max_len,
+             (unsigned long)sets_status,
+             (unsigned int)max_sets);
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(args, "stop")) {
+    int32_t status = ble_ae_stop_advertising();
+    snprintf(response, sizeof(response), "ae stop status=0x%lX", (unsigned long)status);
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  if (ascii_equal_ignore_case(args, "test")) {
+    uint8_t payload[BLE_AE_TEST_PAYLOAD_MAX] = { 0 };
+    uint8_t payload_len = ble_build_ae_test_payload(payload, sizeof(payload));
+    int8_t selected_tx_power = 0;
+    int32_t status;
+
+    if (payload_len == 0U || payload_len > sizeof(((rsi_ble_ae_data_t *)0)->data)) {
+      ble_publish_ephemeral_response("ae test payload build failed");
+      return;
+    }
+
+    if (ble_ae_advertising) {
+      (void)ble_ae_stop_advertising();
+    }
+
+    rsi_ble_ae_adv_params_t params = { 0 };
+    params.adv_handle = BLE_AE_ADV_HANDLE;
+    params.adv_event_prop = 0x0000U;
+    params.primary_adv_intterval_min = BLE_AE_ADV_INTERVAL_1S;
+    params.primary_adv_intterval_max = BLE_AE_ADV_INTERVAL_1S;
+    params.primary_adv_chnl_map = RSI_BLE_ADV_CHANNEL_MAP;
+    params.own_addr_type = LE_PUBLIC_ADDRESS;
+    params.peer_addr_type = LE_PUBLIC_ADDRESS;
+    params.adv_filter_policy = ALLOW_SCAN_REQ_ANY_CONN_REQ_ANY;
+    params.adv_tx_power = 0x7FU;
+    params.primary_adv_phy = 0x01U;
+    params.sec_adv_max_skip = 0x00U;
+    params.sec_adv_phy = 0x01U;
+    params.adv_sid = 0x00U;
+    params.scan_req_notify_enable = 0x00U;
+
+    status = rsi_ble_set_ae_params(&params, &selected_tx_power);
+    if (status != RSI_SUCCESS) {
+      snprintf(response, sizeof(response), "ae params failed status=0x%lX", (unsigned long)status);
+      ble_publish_ephemeral_response(response);
+      return;
+    }
+
+    rsi_ble_ae_data_t data = { 0 };
+    data.type = AE_ADV_DATA;
+    data.adv_handle = BLE_AE_ADV_HANDLE;
+    data.operation = 0x03U;
+    data.frag_pref = 0x00U;
+    data.data_len = payload_len;
+    memcpy(data.data, payload, payload_len);
+
+    status = rsi_ble_set_ae_data(&data);
+    if (status != RSI_SUCCESS) {
+      snprintf(response, sizeof(response), "ae data failed len=%u status=0x%lX",
+               (unsigned int)payload_len,
+               (unsigned long)status);
+      ble_publish_ephemeral_response(response);
+      return;
+    }
+
+    rsi_ble_ae_adv_enable_t enable = { 0 };
+    enable.enable = RSI_BLE_START_ADV;
+    enable.no_of_sets = 1U;
+    enable.adv_handle = BLE_AE_ADV_HANDLE;
+    enable.duration = 0U;
+    enable.max_ae_events = 0U;
+
+    status = rsi_ble_start_ae_advertising(&enable);
+    if (status == RSI_SUCCESS) {
+      ble_ae_advertising = true;
+    }
+    snprintf(response,
+             sizeof(response),
+             "ae test len=%u start=0x%lX tx=%d",
+             (unsigned int)payload_len,
+             (unsigned long)status,
+             (int)selected_tx_power);
+    ble_publish_ephemeral_response(response);
+    return;
+  }
+
+  ble_publish_ephemeral_response("err ae command; write ae help");
 }
 
 static void ble_restore_elrs_advertisement_if_due(void)
@@ -336,10 +672,7 @@ static void ble_update_remote_id_dynamic_advertisement_if_due(void)
     return;
   }
 
-  ble_remote_id_next_adv_kind =
-      (ble_remote_id_next_adv_kind == BLE_REMOTE_ID_ADV_LOCATION)
-          ? BLE_REMOTE_ID_ADV_BASIC_ID
-          : BLE_REMOTE_ID_ADV_LOCATION;
+  ble_remote_id_next_adv_kind = BLE_REMOTE_ID_ADV_LOCATION;
   (void)ble_apply_current_advertisement();
 }
 
@@ -502,6 +835,12 @@ static const sl_wifi_device_configuration_t ble_wifi_config = {
 #endif
 #if BLE_SIMPLE_GATT
              | SL_SI91X_BLE_GATT_INIT
+#endif
+#if RSI_BLE_ENABLE_ADV_EXTN
+             | SL_SI91X_BLE_ENABLE_ADV_EXTN
+#endif
+#if RSI_BLE_AE_MAX_ADV_SETS
+             | SL_SI91X_BLE_AE_MAX_ADV_SETS(RSI_BLE_AE_MAX_ADV_SETS)
 #endif
              ),
         .config_feature_bit_map = SL_SI91X_FEAT_SLEEP_GPIO_SEL_BITMAP,
@@ -1035,7 +1374,7 @@ static void ble_format_ranges_response(void)
 
 static void ble_format_caps_response(void)
 {
-  ble_publish_response("{\"api\":\"elrs-ble-v1\",\"svc\":\"E7E0\",\"rsp\":\"E7E1\",\"cmd\":\"E7E2\",\"chunk\":20,\"max\":320,\"cmds\":[\"help\",\"status\",\"jstatus\",\"jget\",\"meta\",\"diag\",\"get\",\"keys\",\"setkeys\",\"ranges\",\"set\",\"save\",\"reload\",\"len\",\"chunk\",\"page\"]}");
+  ble_publish_response("{\"api\":\"elrs-ble-v1\",\"svc\":\"E7E0\",\"rsp\":\"E7E1\",\"cmd\":\"E7E2\",\"chunk\":20,\"max\":320,\"cmds\":[\"help\",\"status\",\"jstatus\",\"jget\",\"meta\",\"diag\",\"get\",\"keys\",\"setkeys\",\"ranges\",\"set\",\"save\",\"reload\",\"len\",\"chunk\",\"page\",\"rid\",\"ae\"]}");
 }
 
 static void ble_format_meta_response(void)
@@ -1921,7 +2260,7 @@ static void ble_handle_command(const uint8_t *data, uint16_t len)
   if (*trimmed == '\0') {
     ble_publish_ephemeral_response("err empty command");
   } else if (ascii_equal_ignore_case(trimmed, "help")) {
-    ble_publish_ephemeral_response("cmds: ping,status,jstatus,jget,meta,diag,get,set,save,reload,len,page,rid");
+    ble_publish_ephemeral_response("cmds: ping,status,jstatus,jget,meta,diag,get,set,save,reload,len,page,rid,ae");
   } else if (ascii_equal_ignore_case(trimmed, "api")) {
     ble_publish_ephemeral_response("api=elrs-ble-v1");
   } else if (ascii_equal_ignore_case(trimmed, "caps")) {
@@ -1945,6 +2284,10 @@ static void ble_handle_command(const uint8_t *data, uint16_t len)
     ble_handle_remote_id_command("");
   } else if (ascii_starts_with_ignore_case(trimmed, "rid ")) {
     ble_handle_remote_id_command(trimmed + 4);
+  } else if (ascii_equal_ignore_case(trimmed, "ae")) {
+    ble_handle_ae_command("");
+  } else if (ascii_starts_with_ignore_case(trimmed, "ae ")) {
+    ble_handle_ae_command(trimmed + 3);
   } else if (ascii_equal_ignore_case(trimmed, "jstatus")) {
     ble_format_json_status_response();
   } else if (ascii_equal_ignore_case(trimmed, "jget") ||
@@ -2290,10 +2633,10 @@ static void ble_task(void *argument)
   }
 
   if (ble_adv_mode == BLE_ADV_MODE_REMOTE_ID_BASIC) {
-    DEBUGOUT("[BLE] Advertising Remote ID (fixed 0 dBm setting, id=%s)\n",
+    DEBUGOUT("[BLE] Advertising Remote ID over BLE AE (fixed 0 dBm setting, id=%s)\n",
              ble_remote_id_get_uas_id());
-    BLE_LOG_DEBUGOUT("[BLE] Remote ID uses BLE legacy service data UUID 0xFFFA\n");
-    BLE_LOG_DEBUGOUT("[BLE] Note: the 31-byte Remote ID payload leaves no room for the ELRS local name\n");
+    BLE_LOG_DEBUGOUT("[BLE] Remote ID AE payload includes ODID service data UUID 0xFFFA\n");
+    BLE_LOG_DEBUGOUT("[BLE] AE test payload includes flags/name plus the ODID service data element\n");
     BLE_LOG_DEBUGOUT("[BLE] Use 'rid elrs' to restore normal %s advertising for config-app discovery\n",
                      BLE_PROBE_NAME);
   } else {
@@ -2306,7 +2649,7 @@ static void ble_task(void *argument)
   BLE_LOG_DEBUGOUT("[BLE] Read 0x%04X for response, write commands to 0x%04X\n",
                    BLE_UUID_ELRS_STATUS,
                    BLE_UUID_ELRS_COMMAND);
-  BLE_LOG_DEBUGOUT("[BLE] Commands: help, api, caps, meta, diag, keys, setkeys, ranges, ping, status, jstatus, get [key], set key=value, save, reload, len, chunk n, rid\n");
+  BLE_LOG_DEBUGOUT("[BLE] Commands: help, api, caps, meta, diag, keys, setkeys, ranges, ping, status, jstatus, get [key], set key=value, save, reload, len, chunk n, rid, ae\n");
 
   while (1) {
     ble_apply_remote_id_request_if_pending();
