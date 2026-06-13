@@ -409,6 +409,7 @@ static inline bool radio2_available(void) { return LR1121_HAS_RADIO2 != 0; }
 static void delay_ms(uint32_t ms);
 static void delay_us(uint32_t us);
 
+#if LR1121_HAS_RADIO2
 static uint32_t mcu_hp_pad_selection_bit_for_gpio(uint8_t pin) {
   if (pin >= 46U && pin <= 57U) {
     return 1UL << (pin - 36U);
@@ -419,7 +420,6 @@ static uint32_t mcu_hp_pad_selection_bit_for_gpio(uint8_t pin) {
   return 0U;
 }
 
-#if LR1121_HAS_RADIO2
 static void configure_radio2_pad_ownership(void) {
   const uint32_t mask =
       mcu_hp_pad_selection_bit_for_gpio(LR1121_PIN_NSS_2) |

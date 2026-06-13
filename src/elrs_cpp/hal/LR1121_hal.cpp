@@ -164,6 +164,7 @@ static inline bool siw917IsValidLr1121Version(
   return version.hardware == 0x22 && version.type != 0x00;
 }
 
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
 static bool siw917SetSelectedRadioStandbyXosc() {
   const uint8_t standbyXosc = ELRS_STANDBY_XOSC;
   if (!lr1121_wait_busy_timeout(100)) {
@@ -174,6 +175,7 @@ static bool siw917SetSelectedRadioStandbyXosc() {
   }
   return lr1121_wait_busy_timeout(200);
 }
+#endif
 
 extern "C" bool lr1121_hal_prepare_radio2_image_calibration(bool highBand) {
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO

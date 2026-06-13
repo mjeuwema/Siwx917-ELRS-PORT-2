@@ -4945,6 +4945,13 @@ bool elrs_init(void) {
   // Initialize FHSS
   FHSSrandomiseFHSSsequence(uidMacSeedGet());
   DBGLN("FHSS initialized with %d channels", FHSSgetChannelCount());
+#if defined(RADIO_LR1121) && SIW917_ELRS_SCAN_ALL_LR1121_RATES
+#if SIW917_ELRS_ENABLE_CROSSBAND_RATES
+  DBGLN("LR1121 all-band scan enabled (sub-GHz + 2.4GHz + crossband)");
+#else
+  DBGLN("LR1121 single-radio scan enabled (sub-GHz + 2.4GHz)");
+#endif
+#endif
 
   // Initialize radio with frequency range from FHSS config
   bool radioOk = Radio.Begin(FHSSgetMinimumFreq(), FHSSgetMaximumFreq());

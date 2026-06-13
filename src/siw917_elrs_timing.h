@@ -14,6 +14,11 @@
 /*
  * Dual-LR1121 bring-up switches.
  *
+ * SINGLE_LR1121_RX is the hardware profile for running with only the mikroBUS
+ * LR1121 populated. Keep this enabled when the second LR1121 is physically
+ * removed; otherwise radio2 version probing correctly reads 0x00 and the RX
+ * enters radio-failed status.
+ *
  * PROBE initializes and version-checks a second LR1121 on the shared GSPI bus,
  * but keeps upstream ELRS in single-radio mode. Use this first to validate
  * wiring and chip-select/BUSY/reset timing without risking the working RX link.
@@ -23,12 +28,16 @@
  * passes cleanly with both radios wired; the first Radio2 IRQ implementation is
  * intentionally deferred/safe rather than timing-optimized.
  */
+#ifndef SIW917_ELRS_SINGLE_LR1121_RX
+#define SIW917_ELRS_SINGLE_LR1121_RX 1
+#endif
+
 #ifndef SIW917_ELRS_DUAL_RADIO_PROBE
-#define SIW917_ELRS_DUAL_RADIO_PROBE 1
+#define SIW917_ELRS_DUAL_RADIO_PROBE (!SIW917_ELRS_SINGLE_LR1121_RX)
 #endif
 
 #ifndef SIW917_ELRS_UPSTREAM_DUAL_RADIO
-#define SIW917_ELRS_UPSTREAM_DUAL_RADIO 1
+#define SIW917_ELRS_UPSTREAM_DUAL_RADIO (!SIW917_ELRS_SINGLE_LR1121_RX)
 #endif
 
 #ifndef SIW917_ELRS_RADIO2_IRQ_READY
@@ -41,7 +50,7 @@
  * radio1 on the primary sub-GHz FHSS domain and radio2 on the 2.4 GHz domain.
  */
 #ifndef SIW917_ELRS_ENABLE_CROSSBAND_RATES
-#define SIW917_ELRS_ENABLE_CROSSBAND_RATES 1
+#define SIW917_ELRS_ENABLE_CROSSBAND_RATES (!SIW917_ELRS_SINGLE_LR1121_RX)
 #endif
 
 #ifndef SIW917_ELRS_CROSSBAND_TEST_LOG
