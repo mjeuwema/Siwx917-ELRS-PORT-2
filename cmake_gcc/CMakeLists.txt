@@ -50,16 +50,20 @@ target_include_directories(slc BEFORE PUBLIC
 # ELRS C++ Platform Abstraction Layer for SiW917
 #=============================================================================
 
+set(ELRS_CPP_DIR "../src/elrs_cpp" CACHE STRING
+    "ELRS C++ source folder, relative to cmake_gcc")
+message(STATUS "ELRS C++ source folder: ${ELRS_CPP_DIR}")
+
 # SiW917 platform abstraction files (Arduino compatibility layer)
-# Now using elrs_cpp folder (the clean C++ implementation)
+# Default uses elrs_cpp; alternate presets can select another copied tree.
 set(ELRS_PLATFORM_SOURCES
-    "../src/elrs_cpp/hal/Arduino.cpp"
-    "../src/elrs_cpp/hal/SPIEx.cpp"
-    "../src/elrs_cpp/hal/hwTimer.cpp"
-    "../src/elrs_cpp/hal/LR1121_hal.cpp"
-    "../src/elrs_cpp/hal/elrs_task_wakeup.cpp"
-    "../src/elrs_cpp/elrs_main.cpp"
-    "../src/elrs_cpp/common.cpp"
+    "${ELRS_CPP_DIR}/hal/Arduino.cpp"
+    "${ELRS_CPP_DIR}/hal/SPIEx.cpp"
+    "${ELRS_CPP_DIR}/hal/hwTimer.cpp"
+    "${ELRS_CPP_DIR}/hal/LR1121_hal.cpp"
+    "${ELRS_CPP_DIR}/hal/elrs_task_wakeup.cpp"
+    "${ELRS_CPP_DIR}/elrs_main.cpp"
+    "${ELRS_CPP_DIR}/common.cpp"
     # CT-based hardware timer (C implementation wrapped by hwTimer.cpp)
     "../src/hw_timer.c"
     # Hardware timer test suite
@@ -68,7 +72,7 @@ set(ELRS_PLATFORM_SOURCES
 
 # ELRS C++ library sources from our elrs_cpp folder
 # These are SiW917-adapted versions of the upstream ELRS code
-set(ELRS_CPP_LIB_DIR "../src/elrs_cpp/lib")
+set(ELRS_CPP_LIB_DIR "${ELRS_CPP_DIR}/lib")
 
 set(ELRS_CPP_SOURCES
     # CRC
@@ -86,7 +90,7 @@ set(ELRS_CPP_SOURCES
     "${ELRS_CPP_LIB_DIR}/FEC/FEC.cpp"
     "${ELRS_CPP_LIB_DIR}/FEC/hamming.cpp"
     # Device stubs
-    "../src/elrs_cpp/hal/device.cpp"
+    "${ELRS_CPP_DIR}/hal/device.cpp"
     # StubbornSender (for telemetry TX)
     "${ELRS_CPP_LIB_DIR}/StubbornSender/stubborn_sender.cpp"
     # StubbornReceiver (for telemetry RX / downlink data)
@@ -129,23 +133,23 @@ set(ELRS_UPSTREAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ExpressLRS/src")
 target_include_directories(wifi_gspi_merged PUBLIC
     # Our SiW917 platform headers (must come FIRST to override upstream)
     "../src"
-    "../src/elrs_cpp/hal"
-    "../src/elrs_cpp/include"
-    "../src/elrs_cpp/lib/CRC"
-    "../src/elrs_cpp/lib/FHSS"
-    "../src/elrs_cpp/lib/OTA"
-    "../src/elrs_cpp/lib/LR1121Driver"
-    "../src/elrs_cpp/lib/SX12xxDriverCommon"
-    "../src/elrs_cpp/lib/CrsfProtocol"
-    "../src/elrs_cpp/lib/rx-crsf"
-    "../src/elrs_cpp/lib/TelemetryProtocol"
-    "../src/elrs_cpp/lib/LQCALC"
-    "../src/elrs_cpp/lib/PFD"
-    "../src/elrs_cpp/lib/FIFO"
-    "../src/elrs_cpp/lib/LowPassFilter"
-    "../src/elrs_cpp/lib/OPTIONS"
-    "../src/elrs_cpp/lib/FEC"
-    "../src/elrs_cpp/lib/StubbornSender"
+    "${ELRS_CPP_DIR}/hal"
+    "${ELRS_CPP_DIR}/include"
+    "${ELRS_CPP_DIR}/lib/CRC"
+    "${ELRS_CPP_DIR}/lib/FHSS"
+    "${ELRS_CPP_DIR}/lib/OTA"
+    "${ELRS_CPP_DIR}/lib/LR1121Driver"
+    "${ELRS_CPP_DIR}/lib/SX12xxDriverCommon"
+    "${ELRS_CPP_DIR}/lib/CrsfProtocol"
+    "${ELRS_CPP_DIR}/lib/rx-crsf"
+    "${ELRS_CPP_DIR}/lib/TelemetryProtocol"
+    "${ELRS_CPP_DIR}/lib/LQCALC"
+    "${ELRS_CPP_DIR}/lib/PFD"
+    "${ELRS_CPP_DIR}/lib/FIFO"
+    "${ELRS_CPP_DIR}/lib/LowPassFilter"
+    "${ELRS_CPP_DIR}/lib/OPTIONS"
+    "${ELRS_CPP_DIR}/lib/FEC"
+    "${ELRS_CPP_DIR}/lib/StubbornSender"
     
     # Upstream ELRS include directories (for missing headers)
     "${ELRS_UPSTREAM_DIR}/include"
@@ -179,6 +183,26 @@ target_include_directories(wifi_gspi_merged PUBLIC
 # Compile definitions
 #=============================================================================
 
+set(ELRS_ENABLE_DISCONNECTED_SCAN_DIAG OFF CACHE BOOL
+    "Enable ELRS disconnected scan IRQ/link diagnostic logging")
+set(ELRS_ENABLE_RADIO_INIT_VERBOSE OFF CACHE BOOL
+    "Enable verbose radio/DIO initialization logging")
+
+set(ELRS_DIAG_COMPILE_DEFINITIONS)
+if(ELRS_ENABLE_DISCONNECTED_SCAN_DIAG)
+    list(APPEND ELRS_DIAG_COMPILE_DEFINITIONS
+        SIW917_ELRS_DISCONNECTED_SCAN_DIAG=1
+        SIW917_ELRS_RF_RATE_DIAG=1
+        SIW917_ELRS_PACKET_STATS_DIAG=1
+        SIW917_ELRS_ISR_STATS_DIAG=1
+    )
+endif()
+if(ELRS_ENABLE_RADIO_INIT_VERBOSE)
+    list(APPEND ELRS_DIAG_COMPILE_DEFINITIONS
+        SIW917_ELRS_RADIO_INIT_VERBOSE=1
+    )
+endif()
+
 target_compile_definitions(wifi_gspi_merged PUBLIC
     # Platform identification - don't redefine if already set
     # PLATFORM_SIW917=1  # Set in targets.h with guards
@@ -192,6 +216,8 @@ target_compile_definitions(wifi_gspi_merged PUBLIC
     
     # Debug logging
     # DEBUG_LOG=1        # Set in hardware.h with guards
+
+    ${ELRS_DIAG_COMPILE_DEFINITIONS}
 )
 
 #=============================================================================

@@ -416,6 +416,20 @@
 #endif
 
 /*
+ * Always-available health snapshot for BLE/Web/raw diagnostics. This keeps
+ * high-water counters only and prints nothing by itself. It intentionally
+ * measures the ELRS task loop, not LR1121 IRQ internals, so it is useful for
+ * feature-regression checks without adding serial spam.
+ */
+#ifndef SIW917_ELRS_HEALTH_DIAG
+#define SIW917_ELRS_HEALTH_DIAG 1
+#endif
+
+#ifndef SIW917_ELRS_HEALTH_LOOP_SLOW_US
+#define SIW917_ELRS_HEALTH_LOOP_SLOW_US 1000U
+#endif
+
+/*
  * Use ARM DWT->CYCCNT as the fast monotonic microsecond source. This avoids the
  * RTOS SysTick sampling jitter in packet-edge/PFD timestamps while preserving a
  * software-extended micros() counter instead of exposing raw 32-bit cycles.

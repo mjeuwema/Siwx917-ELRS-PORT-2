@@ -15,6 +15,30 @@
         "cacheVariables": {
           "CMAKE_CONFIGURATION_TYPES": "base"
         }
+      },
+      {
+        "name": "project_lr2021",
+        "displayName": "Configure wifi_gspi_merged LR2021",
+        "generator": "Ninja Multi-Config",
+        "binaryDir": "${sourceDir}/build_lr2021",
+        "toolchainFile": "${sourceDir}/toolchain.cmake",
+        "cacheVariables": {
+          "CMAKE_CONFIGURATION_TYPES": "base",
+          "ELRS_CPP_DIR": "../src/elrs_cpp_lr2021"
+        }
+      },
+      {
+        "name": "project_lr2021_diag",
+        "displayName": "Configure wifi_gspi_merged LR2021 diagnostics",
+        "generator": "Ninja Multi-Config",
+        "binaryDir": "${sourceDir}/build_lr2021_diag",
+        "toolchainFile": "${sourceDir}/toolchain.cmake",
+        "cacheVariables": {
+          "CMAKE_CONFIGURATION_TYPES": "base",
+          "ELRS_CPP_DIR": "../src/elrs_cpp_lr2021",
+          "ELRS_ENABLE_DISCONNECTED_SCAN_DIAG": "ON",
+          "ELRS_ENABLE_RADIO_INIT_VERBOSE": "ON"
+        }
       }
     ],
     "buildPresets": [
@@ -22,6 +46,20 @@
         "name": "default_config",
         "displayName": "Build wifi_gspi_merged",
         "configurePreset": "project",
+        "configuration": "base",
+        "targets": ["wifi_gspi_merged"]
+      },
+      {
+        "name": "default_config_lr2021",
+        "displayName": "Build wifi_gspi_merged LR2021",
+        "configurePreset": "project_lr2021",
+        "configuration": "base",
+        "targets": ["wifi_gspi_merged"]
+      },
+      {
+        "name": "default_config_lr2021_diag",
+        "displayName": "Build wifi_gspi_merged LR2021 diagnostics",
+        "configurePreset": "project_lr2021_diag",
         "configuration": "base",
         "targets": ["wifi_gspi_merged"]
       }
@@ -32,6 +70,20 @@
         "steps": [
           {"type": "configure", "name": "project"},
           {"type": "build", "name": "default_config"}
+        ]
+      },
+      {
+        "name": "project_lr2021",
+        "steps": [
+          {"type": "configure", "name": "project_lr2021"},
+          {"type": "build", "name": "default_config_lr2021"}
+        ]
+      },
+      {
+        "name": "project_lr2021_diag",
+        "steps": [
+          {"type": "configure", "name": "project_lr2021_diag"},
+          {"type": "build", "name": "default_config_lr2021_diag"}
         ]
       }
     ]
