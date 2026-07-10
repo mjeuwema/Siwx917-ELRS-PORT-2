@@ -52,6 +52,8 @@ static volatile uint32_t tx_fifo_retry_count = 0;
 static volatile uint32_t tx_fifo_retry_fail_count = 0;
 static volatile uint32_t set_tx_retry_count = 0;
 static volatile uint32_t set_tx_retry_fail_count = 0;
+static volatile uint32_t set_frequency_retry_count = 0;
+static volatile uint32_t set_frequency_retry_fail_count = 0;
 #if SIW917_ELRS_FUSED_RX_RETUNE
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
@@ -532,6 +534,8 @@ LR1121Hal::WriteCommandFastRetry(uint16_t opcode, const uint8_t *buffer,
       set_tx_retry_count++;
     } else if (opcode == LR20XX_RADIO_SET_RX) {
       post_tx_set_rx_retry_count++;
+    } else if (opcode == LR20XX_RADIO_SET_RF_FREQUENCY) {
+      set_frequency_retry_count++;
     }
     commandOk = lr1121_send_command_fast(opcode, buffer, size);
     if (!commandOk) {
@@ -541,6 +545,8 @@ LR1121Hal::WriteCommandFastRetry(uint16_t opcode, const uint8_t *buffer,
         set_tx_retry_fail_count++;
       } else if (opcode == LR20XX_RADIO_SET_RX) {
         post_tx_set_rx_retry_fail_count++;
+      } else if (opcode == LR20XX_RADIO_SET_RF_FREQUENCY) {
+        set_frequency_retry_fail_count++;
       }
     }
   }
@@ -576,6 +582,14 @@ extern "C" uint32_t lr1121_hal_get_set_tx_retry_count(void) {
 
 extern "C" uint32_t lr1121_hal_get_set_tx_retry_fail_count(void) {
   return set_tx_retry_fail_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_set_frequency_retry_count(void) {
+  return set_frequency_retry_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_set_frequency_retry_fail_count(void) {
+  return set_frequency_retry_fail_count;
 }
 
 //-----------------------------------------------------------------------------

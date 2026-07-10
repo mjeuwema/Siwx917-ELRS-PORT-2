@@ -84,6 +84,8 @@ uint32_t lr1121_hal_get_tx_fifo_retry_count(void);
 uint32_t lr1121_hal_get_tx_fifo_retry_fail_count(void);
 uint32_t lr1121_hal_get_set_tx_retry_count(void);
 uint32_t lr1121_hal_get_set_tx_retry_fail_count(void);
+uint32_t lr1121_hal_get_set_frequency_retry_count(void);
+uint32_t lr1121_hal_get_set_frequency_retry_fail_count(void);
 bool lr1121_hal_prepare_radio2_image_calibration(bool highBand);
 void lr1121_tlm_miss_irq_trace_arm(void);
 void lr1121_tlm_miss_irq_trace_complete(void);
@@ -337,6 +339,7 @@ static volatile uint32_t telemetryDispatchFailCount = 0;
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
 static volatile uint8_t lr2021TelemetryTxPending = 0;
 static volatile uint32_t lr2021TelemetryTxStartUs = 0;
+static uint32_t lr2021TelemetryTxWatchdogUs = 19750U;
 static volatile uint32_t lr2021TelemetryTxWatchdogCount = 0;
 static volatile uint32_t lr2021TelemetryTxWatchdogLastAgeUs = 0;
 static volatile uint32_t lr2021TelemetryTxWatchdogIrqCount = 0;
@@ -2310,6 +2313,9 @@ extern "C" void dump_capture_buffer() {
 // Forward declarations
 void SetMode(connectionState_e NewMode);
 static void SetRFLinkRate(uint8_t index, bool bindMode);
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+static uint32_t ICACHE_RAM_ATTR Lr2021TxDoneWatchdogUs();
+#endif
 
 // DMA debug test removed
 extern bool SerialrxUpdatePacketComplete; // This seems to be a new declaration
@@ -4721,6 +4727,9 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   ExpressLRS_currAirRate_Modparams = ModParams;
   ExpressLRS_currAirRate_RFperfParams = RFperf;
   ExpressLRS_nextAirRateIndex = index;
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+  lr2021TelemetryTxWatchdogUs = Lr2021TxDoneWatchdogUs();
+#endif
   telemBurstValid = false;
   InvalidatePrebuiltTelemetry();
   armTelemetry150Snapshot(ModParams, bindMode);
@@ -5176,7 +5185,7 @@ static void ICACHE_RAM_ATTR ServiceLr2021TxDoneWatchdog() {
 
   const uint32_t nowUs = micros();
   const uint32_t ageUs = nowUs - lr2021TelemetryTxStartUs;
-  if (ageUs < Lr2021TxDoneWatchdogUs()) {
+  if (ageUs < lr2021TelemetryTxWatchdogUs) {
     return;
   }
 
@@ -5313,8 +5322,20 @@ static void maybeReportTelemetryGap(uint32_t now) {
 #endif
 
   if (eventDue || periodicDue) {
+    uint8_t eventStat1 = 0;
+    uint8_t eventStat2 = 0;
+    uint8_t eventIrq = 0;
+    uint16_t eventErrors = 0;
+    bool eventStatusOk = false;
+    uint8_t eventDio = 0;
+    uint8_t eventBusy = 0;
     if (eventDue) {
       lastEventMs = now;
+      eventStatusOk =
+          lr1121_get_status(&eventStat1, &eventStat2, &eventIrq);
+      eventErrors = Radio.GetErrors(SX12XX_Radio_1);
+      eventDio = lr1121_hal_has_pending_dio1() ? 1U : 0U;
+      eventBusy = digitalRead(GPIO_PIN_BUSY) != LOW ? 1U : 0U;
     }
 #if SIW917_ELRS_TLM_GAP_PERIOD_MS > 0
     if (periodicDue) {
@@ -5326,7 +5347,8 @@ static void maybeReportTelemetryGap(uint32_t now) {
            "tx:%lu ls:%lu data:%lu fail:%lu supp:%lu rc:%lu/%lu ack:%u "
            "act:%u st:%u pkg:%u off:%u wait:%u/%u q:%u ul:%lu/%lu "
            "wd:%lu/%lu/%u txo:%lu/%lu txc:%lu/%lu/%lu/%lu "
-           "spi:%lu/%lu rxr:%lu/%lu rssi:%d snr:%d "
+           "spi:%lu/%lu rxr:%lu/%lu fr:%lu/%lu "
+           "snap:%u/%02X/%02X/%02X/%04X/%u/%u rssi:%d snr:%d "
            "turn:%lu/%lu/%lu max:%lu/%lu/%lu cnt:%lu/%lu/%lu pre:%lu "
            "skip:%lu aw:%u awage:%lu miss:%lu/%lu irq:%lu/%lu rej:%lu "
            "crc:%lu sync:%lu to:%lu err:%lu last:%08lX dio:%u busy:%u "
@@ -5366,6 +5388,11 @@ static void maybeReportTelemetryGap(uint32_t now) {
            (unsigned long)lr1121_get_raw_gspi_fail_count(),
            (unsigned long)lr1121_hal_get_post_tx_set_rx_retry_count(),
            (unsigned long)lr1121_hal_get_post_tx_set_rx_retry_fail_count(),
+           (unsigned long)lr1121_hal_get_set_frequency_retry_count(),
+           (unsigned long)lr1121_hal_get_set_frequency_retry_fail_count(),
+           eventStatusOk ? 1U : 0U, (unsigned)eventStat1,
+           (unsigned)eventStat2, (unsigned)eventIrq, (unsigned)eventErrors,
+           (unsigned)eventDio, (unsigned)eventBusy,
            (int)Radio.LastPacketRSSI, (int)Radio.LastPacketSNRRaw,
 #if SIW917_ELRS_TLM_TURNAROUND_TRACE
            (unsigned long)tlmTurnTxToDoneLastUs,

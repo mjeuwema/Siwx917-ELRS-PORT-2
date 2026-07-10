@@ -482,7 +482,7 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
       return false;
   }
 
-  printf("LR2021 port build marker: rx-stage-v182-single-rxfifo\n");
+  printf("LR2021 port build marker: rx-stage-v186-fe-cal-floor\n");
 
   hal.IsrCallback_1 = &LR1121Driver::IsrCallback_1;
   hal.IsrCallback_2 = &LR1121Driver::IsrCallback_2;
@@ -638,6 +638,9 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
   }
 
   SetRxPath(isSubGHz, radioNumber);
+  // CalibFE is rejected in RX/TX. Enter FS before updating the three on-chip
+  // calibration slots; the command returns to this mode when complete.
+  SetMode(LR1121_MODE_FS, radioNumber);
   if (isSubGHz) {
     CalibrateFrontEndDefaultSet(radioNumber);
   } else {
@@ -1045,7 +1048,10 @@ void LR1121Driver::CalibrateAll(SX12XX_Radio_Number_t radioNumber) {
 }
 
 uint16_t LR1121Driver::FrontEndCalWordForFrequency(uint32_t freqHz) {
-  uint16_t calFreq = (uint16_t)((freqHz + 3999999UL) / 4000000UL);
+  // LR20xx section 6.4.2 specifies 4 MHz units truncated to the lower
+  // multiple. Rounding upward can leave the lowest FHSS channel below every
+  // stored calibration and trigger RXFREQ_NO_FE_CAL_ERR.
+  uint16_t calFreq = (uint16_t)(freqHz / 4000000UL);
   if (freqHz > LR20XX_LF_HF_CUTOFF_HZ) {
     calFreq |= LR20XX_CALIB_FE_HF_PATH;
   } else {
@@ -1587,10 +1593,11 @@ LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
   CalibrateFrontEndForFrequency(radioFreq, radioNumber);
 #endif
   if (doRx) {
-    hal.WriteCommand(LR20XX_RADIO_SET_RF_FREQUENCY, buf, 4,
-                     radioNumber);
-    hal.WriteCommand(LR20XX_RADIO_SET_RX, buf + 4, 3,
-                     radioNumber);
+    const bool frequencySet = hal.WriteCommandFastRetry(
+        LR20XX_RADIO_SET_RF_FREQUENCY, buf, 4, radioNumber);
+    const bool rxSet = frequencySet && hal.WriteCommandFastRetry(
+                                           LR20XX_RADIO_SET_RX, buf + 4, 3,
+                                           radioNumber);
 #if defined(SIW917_ELRS_LR2021_RX_FE_CAL_RETRY) &&                             \
     SIW917_ELRS_LR2021_RX_FE_CAL_RETRY
     const uint16_t rxErrors = GetErrors(radioNumber);
@@ -1619,9 +1626,10 @@ LR1121Driver::SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
       }
     }
 #endif
-    rxContinuousActive = true;
+    rxContinuousActive = rxSet;
   } else {
-    hal.WriteCommand(LR20XX_RADIO_SET_RF_FREQUENCY, buf, 4, radioNumber);
+    hal.WriteCommandFastRetry(LR20XX_RADIO_SET_RF_FREQUENCY, buf, 4,
+                              radioNumber);
   }
 
   currFreq = radioFreq;

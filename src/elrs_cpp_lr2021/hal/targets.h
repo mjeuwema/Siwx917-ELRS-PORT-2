@@ -120,7 +120,9 @@
 #define SIW917_ELRS_LR2021_GFSK_RELAX_TENTATIVE_LQ 1
 #endif
 #ifndef SIW917_ELRS_LR2021_RUNTIME_CALIB_FE
-#define SIW917_ELRS_LR2021_RUNTIME_CALIB_FE 1
+// CalibFE is invalid in RX/TX. Band configuration seeds all three on-chip
+// calibration slots from FS, so FHSS retunes must remain calibration-free.
+#define SIW917_ELRS_LR2021_RUNTIME_CALIB_FE 0
 #endif
 #ifndef SIW917_ELRS_LR2021_RX_FE_CAL_RETRY
 // Quiet hot path: FE calibration is seeded for the FHSS range during Begin().
