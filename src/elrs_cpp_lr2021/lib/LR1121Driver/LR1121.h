@@ -52,7 +52,10 @@ public:
 
   void TXnb(uint8_t *data, bool sendGeminiBuffer, uint8_t *dataGemini,
             SX12XX_Radio_Number_t radioNumber);
+  bool LastTxStartSuccessful() const { return lastTxStartSuccessful; }
   void RXnb();
+  void RXnbFromTxDone();
+  bool TakeAutoRxAfterTxArmed();
 
   uint32_t GetIrqStatus(SX12XX_Radio_Number_t radioNumber);
   uint32_t PeekIrqStatus(SX12XX_Radio_Number_t radioNumber);
@@ -98,6 +101,8 @@ private:
   bool useFSK;
   bool rxContinuousActive;
   volatile bool txInProgress;
+  volatile bool lastTxStartSuccessful;
+  volatile bool autoRxAfterTxArmed;
   bool modeSupportsFei;
   uint8_t pwrCurrentLF;
   uint8_t pwrPendingLF;

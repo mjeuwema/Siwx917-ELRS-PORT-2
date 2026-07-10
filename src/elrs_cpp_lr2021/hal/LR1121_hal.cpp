@@ -32,6 +32,9 @@
 extern "C" {
 #include "hw_timer.h"
 #include "lr1121_driver.h"
+extern volatile uint8_t lr1121_tlm_miss_irq_trace_active;
+void lr1121_tlm_miss_irq_trace_record_fifo_busy_wait(bool busyAtEntry,
+                                                     bool ready);
 }
 
 #define ELRS_DIAG_GET_PACKET_SOFT_SPI 0
@@ -43,6 +46,12 @@ volatile bool isr_1_pending = false;
 volatile bool isr_2_pending = false;
 volatile uint32_t busy_timeout_count = 0;
 static volatile uint16_t last_command_opcode = 0;
+static volatile uint32_t post_tx_set_rx_retry_count = 0;
+static volatile uint32_t post_tx_set_rx_retry_fail_count = 0;
+static volatile uint32_t tx_fifo_retry_count = 0;
+static volatile uint32_t tx_fifo_retry_fail_count = 0;
+static volatile uint32_t set_tx_retry_count = 0;
+static volatile uint32_t set_tx_retry_fail_count = 0;
 #if SIW917_ELRS_FUSED_RX_RETUNE
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
@@ -499,6 +508,76 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
 #endif
 }
 
+bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Hal::WriteCommandFastRetry(uint16_t opcode, const uint8_t *buffer,
+                                 uint8_t size,
+                                 SX12XX_Radio_Number_t radioNumber) {
+  if (siw917FanoutAllRadios(radioNumber)) {
+    const bool radio1Ok = WriteCommandFastRetry(
+        opcode, buffer, size, SX12XX_Radio_1);
+    const bool radio2Ok = WriteCommandFastRetry(
+        opcode, buffer, size, SX12XX_Radio_2);
+    lr1121_select_radio(LR1121_RADIO_1);
+    return radio1Ok && radio2Ok;
+  }
+
+  siw917SelectRadio(radioNumber);
+  last_command_opcode = opcode;
+
+  bool commandOk = lr1121_send_command_fast(opcode, buffer, size);
+  if (!commandOk) {
+    if (opcode == LR20XX_CMD_WRITE_RADIO_TX_FIFO) {
+      tx_fifo_retry_count++;
+    } else if (opcode == LR20XX_RADIO_SET_TX) {
+      set_tx_retry_count++;
+    } else if (opcode == LR20XX_RADIO_SET_RX) {
+      post_tx_set_rx_retry_count++;
+    }
+    commandOk = lr1121_send_command_fast(opcode, buffer, size);
+    if (!commandOk) {
+      if (opcode == LR20XX_CMD_WRITE_RADIO_TX_FIFO) {
+        tx_fifo_retry_fail_count++;
+      } else if (opcode == LR20XX_RADIO_SET_TX) {
+        set_tx_retry_fail_count++;
+      } else if (opcode == LR20XX_RADIO_SET_RX) {
+        post_tx_set_rx_retry_fail_count++;
+      }
+    }
+  }
+
+#if SIW917_ELRS_FUSED_RX_RETUNE
+  if (opcode == LR20XX_RADIO_SET_RX && commandOk) {
+    rx_continuous_active = true;
+    pending_rx_retune = false;
+  }
+#endif
+  return commandOk;
+}
+
+extern "C" uint32_t lr1121_hal_get_post_tx_set_rx_retry_count(void) {
+  return post_tx_set_rx_retry_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_post_tx_set_rx_retry_fail_count(void) {
+  return post_tx_set_rx_retry_fail_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_tx_fifo_retry_count(void) {
+  return tx_fifo_retry_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_tx_fifo_retry_fail_count(void) {
+  return tx_fifo_retry_fail_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_set_tx_retry_count(void) {
+  return set_tx_retry_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_set_tx_retry_fail_count(void) {
+  return set_tx_retry_fail_count;
+}
+
 //-----------------------------------------------------------------------------
 // SPI Commands - ReadCommand
 // ELRS SINGLE-PHASE FULL-DUPLEX (matching upstream ESP32 behavior)
@@ -516,28 +595,39 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
     const uint16_t inline_opcode =
         ((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1];
     if (inline_opcode == LR20XX_CMD_READ_RADIO_RX_FIFO) {
-      uint8_t dummy[32] = {0};
-      if (size > sizeof(dummy)) {
+      constexpr uint8_t commandSize = 2U;
+      constexpr uint8_t maxResponseSize = 32U;
+      uint8_t tx[commandSize + maxResponseSize] = {};
+      uint8_t rx[commandSize + maxResponseSize];
+      if (size > maxResponseSize) {
         DBGLN("ReadRadioRxFifo inline too large (size=%u)", size);
         memset(buffer, 0, size);
         last_command_opcode = 0;
         return;
       }
-      const uint8_t command[2] = {buffer[0], buffer[1]};
-      uint8_t status[2] = {0};
-      if (!WaitOnBusy(radioNumber) &&
+      tx[0] = buffer[0];
+      tx[1] = buffer[1];
+      const bool traceActive = lr1121_tlm_miss_irq_trace_active != 0U;
+      const bool busyAtEntry =
+          traceActive && digitalRead(GPIO_PIN_BUSY) != LOW;
+      const bool busyReady = WaitOnBusy(radioNumber);
+      if (traceActive) {
+        lr1121_tlm_miss_irq_trace_record_fifo_busy_wait(busyAtEntry,
+                                                         busyReady);
+      }
+      if (!busyReady &&
           !handleBusyTimeout("ReadRadioRxFifo inline", inline_opcode, size)) {
         memset(buffer, 0, size);
         last_command_opcode = 0;
         return;
       }
       lr1121_cs_assert();
-      bool ok = lr1121_spi_transfer_raw(command, status, sizeof(command));
-      if (ok && size > 0) {
-        ok = lr1121_spi_transfer_raw(dummy, buffer, size);
-      }
+      const bool ok = lr1121_spi_transfer_raw(
+          tx, rx, (uint16_t)(commandSize + size));
       lr1121_cs_deassert();
-      if (!ok) {
+      if (ok) {
+        memcpy(buffer, rx + commandSize, size);
+      } else {
         DBGLN("ReadRadioRxFifo inline transfer failed size=%u", size);
         memset(buffer, 0, size);
       }

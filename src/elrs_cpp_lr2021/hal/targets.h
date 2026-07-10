@@ -33,7 +33,13 @@
 #define SIW917_ELRS_DISABLE_DOWNLINK_TLM 0
 #endif
 #ifndef SIW917_ELRS_FHSS_SET_FREQ_RX
-#define SIW917_ELRS_FHSS_SET_FREQ_RX 1
+#define SIW917_ELRS_FHSS_SET_FREQ_RX 0
+#endif
+#ifndef SIW917_ELRS_LR2021_GFSK_HOP_SET_RX
+// LR20xx does not have LR1121's combined SetRfFrequency_SetRx command. Its
+// SetRfFrequency command leaves a GFSK receiver out of continuous RX, so
+// explicitly re-arm after each GFSK FHSS retune.
+#define SIW917_ELRS_LR2021_GFSK_HOP_SET_RX 1
 #endif
 #ifndef SIW917_ELRS_LR2021_MIN_TLM_DENOM
 #define SIW917_ELRS_LR2021_MIN_TLM_DENOM 2
@@ -48,13 +54,55 @@
 #define SIW917_ELRS_LR2021_TXDONE_WATCHDOG 1
 #endif
 #ifndef SIW917_ELRS_LR2021_TXDONE_WATCHDOG_PEEK_IRQ
-#define SIW917_ELRS_LR2021_TXDONE_WATCHDOG_PEEK_IRQ 0
+#define SIW917_ELRS_LR2021_TXDONE_WATCHDOG_PEEK_IRQ 1
+#endif
+#ifndef SIW917_ELRS_LR2021_TXDONE_WATCHDOG_EVENT_LOG
+#define SIW917_ELRS_LR2021_TXDONE_WATCHDOG_EVENT_LOG 1
+#endif
+#ifndef SIW917_ELRS_LR2021_TXDONE_LORA_GUARD_US
+#define SIW917_ELRS_LR2021_TXDONE_LORA_GUARD_US 350U
+#endif
+#ifndef SIW917_ELRS_TLM_GAP_DIAG
+#define SIW917_ELRS_TLM_GAP_DIAG 1
+#endif
+#ifndef SIW917_ELRS_TLM_TURNAROUND_TRACE
+// Keep the healthy telemetry turnaround free of timestamp reads and volatile
+// bookkeeping. Re-enable only for a focused telemetry-loss investigation.
+#define SIW917_ELRS_TLM_TURNAROUND_TRACE 0
+#endif
+#ifndef SIW917_ELRS_TLM_MISS_IRQ_TRACE
+// This trace keeps per-slot state even when it never prints. Keep it out of
+// normal RF runs; it can be re-enabled for a focused loss investigation.
+#define SIW917_ELRS_TLM_MISS_IRQ_TRACE 0
+#endif
+#ifndef SIW917_ELRS_TLM_GAP_PERIOD_MS
+// Keep RF timing quiet by default. TLMGAP still prints on actual local
+// telemetry stalls; periodic TLMSTAT lines are too expensive at high rates.
+#define SIW917_ELRS_TLM_GAP_PERIOD_MS 0
+#endif
+#ifndef SIW917_ELRS_PREBUILD_TLM_PACKET
+#define SIW917_ELRS_PREBUILD_TLM_PACKET 0
 #endif
 #ifndef SIW917_ELRS_LR2021_FORCE_RF_TLM
 #define SIW917_ELRS_LR2021_FORCE_RF_TLM 1
 #endif
 #ifndef SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
+// SetAutoRxTx does not produce any RX IRQs on the Core2021-XF in the ELRS
+// continuous-RX/FHSS flow. Keep the proven explicit TX_DONE -> SetRx path
+// active while the hardware-auto sequence remains isolated for investigation.
 #define SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX 0
+#endif
+#ifndef SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX_LOCKED_ONLY
+// Keep acquisition on the established manual TX -> RX path. Once the ELRS
+// timer is locked, use the LR20xx hardware handoff for the tight downlink
+// turnaround.
+#define SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX_LOCKED_ONLY 1
+#endif
+#ifndef SIW917_ELRS_LR2021_RX_TX_FALLBACK_FS
+// Preserve upstream ELRS's TX-to-RX turnaround contract. FS leaves the
+// synthesizer running after a telemetry TX, so the following SetRx does not
+// have to restart from RC standby inside the next uplink window.
+#define SIW917_ELRS_LR2021_RX_TX_FALLBACK_FS 1
 #endif
 #ifndef SIW917_ELRS_LR2021_TLM_AFTER_TIMER_LOCK
 // Match upstream RX behavior: telemetry slots are valid once the receiver is
@@ -169,7 +217,7 @@
 #define SIW917_ELRS_LR2021_GFSK_RESYNC_SKIP_PFD 1
 #endif
 #ifndef SIW917_ELRS_LR2021_PERIOD_NORMALIZE_PFD
-#define SIW917_ELRS_LR2021_PERIOD_NORMALIZE_PFD 1
+#define SIW917_ELRS_LR2021_PERIOD_NORMALIZE_PFD 0
 #endif
 #ifndef SIW917_ELRS_LR2021_LORA_FAIL_DUMP
 #define SIW917_ELRS_LR2021_LORA_FAIL_DUMP 0
@@ -178,11 +226,10 @@
 #define SIW917_ELRS_LR2021_GFSK_FAIL_DUMP 0
 #endif
 #ifndef SIW917_ELRS_DIO_EDGE_TIMESTAMPS
-// Quiet timing: do not sample micros() on every DIO edge during RF runs.
+// Keep the locked RF path quiet; PFD uses the upstream processing timestamp.
 #define SIW917_ELRS_DIO_EDGE_TIMESTAMPS 0
 #endif
 #ifndef SIW917_ELRS_DIO_PFD_TIMESTAMP
-// Keep PFD aligned with packet processing, not raw GPIO edge.
 #define SIW917_ELRS_DIO_PFD_TIMESTAMP 0
 #endif
 #ifndef SIW917_ELRS_DIO_STATS_DIAG

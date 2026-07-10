@@ -20,6 +20,7 @@
 #include "LR1121.h"
 #include "LR1121Driver.h"
 #include "LR1121_hal.h"
+#include "hardware.h"
 #include "LowPassFilter.h"
 #include "MeanAccumulator.h"
 #include "OTA.h"
@@ -69,6 +70,7 @@ uint32_t lr1121_hal_get_direct_reentrant_count(void);
 uint32_t lr1121_hal_get_level_requeue_count(void);
 uint32_t lr1121_hal_get_stage_max_us(void);
 uint32_t lr1121_hal_get_deferred_max_us(void);
+bool lr1121_hal_has_pending_dio1(void);
 uint32_t lr1121_get_last_rxnbisr_entry_us(void);
 uint32_t lr1121_get_last_packet_ready_us(void);
 uint32_t lr1121_get_busy_fast_max_iterations(void);
@@ -76,7 +78,22 @@ uint32_t lr1121_get_busy_fast_fail_count(void);
 uint32_t lr1121_get_raw_gspi_max_us(void);
 uint32_t lr1121_get_raw_gspi_count(void);
 uint32_t lr1121_get_raw_gspi_fail_count(void);
+uint32_t lr1121_hal_get_post_tx_set_rx_retry_count(void);
+uint32_t lr1121_hal_get_post_tx_set_rx_retry_fail_count(void);
+uint32_t lr1121_hal_get_tx_fifo_retry_count(void);
+uint32_t lr1121_hal_get_tx_fifo_retry_fail_count(void);
+uint32_t lr1121_hal_get_set_tx_retry_count(void);
+uint32_t lr1121_hal_get_set_tx_retry_fail_count(void);
 bool lr1121_hal_prepare_radio2_image_calibration(bool highBand);
+void lr1121_tlm_miss_irq_trace_arm(void);
+void lr1121_tlm_miss_irq_trace_complete(void);
+void lr1121_tlm_miss_irq_trace_latch(
+    uint32_t *event_count, uint32_t *rx_done_count,
+    uint32_t *packet_reject_count, uint32_t *crc_count,
+    uint32_t *sync_count, uint32_t *timeout_count,
+    uint32_t *error_count, uint32_t *last_irq,
+    uint32_t *fifo_read_count, uint32_t *fifo_busy_entry_count,
+    uint32_t *fifo_busy_timeout_count);
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
@@ -99,7 +116,9 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_DISABLE_DOWNLINK_TLM SIW917_ELRS_DISABLE_DOWNLINK_TLM
 #define ELRS_DIAG_DISABLE_CRSF_SERIAL SIW917_ELRS_DISABLE_CRSF_SERIAL
 #define ELRS_DIAG_USE_DIO_PFD_TIMESTAMP SIW917_ELRS_DIO_PFD_TIMESTAMP
-#define ELRS_DIAG_CRC_NONCE_WINDOW 64
+// Keep the generic nonce search out of timing-lean RF callbacks, matching the
+// working port. GFSK uses its own small, explicitly requested resync window.
+#define ELRS_DIAG_CRC_NONCE_WINDOW (!SIW917_ELRS_TIMING_TEST_BUILD ? 64 : 0)
 #define ELRS_DIAG_PACKET_CAPTURE (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_TX_TURNAROUND (!SIW917_ELRS_TIMING_TEST_BUILD)
 #define ELRS_DIAG_TLM_RATE_LOG SIW917_ELRS_TLM_RATE_DIAG
@@ -308,8 +327,13 @@ static volatile uint32_t telemetryTxCount = 0;
 static volatile uint32_t telemetrySuppressedCount = 0;
 static volatile uint32_t telemetryRcConfirmCount = 0;
 static volatile bool telemetryLastRcConfirm = false;
+static volatile uint32_t telemetryRcConfirmSeenCount = 0;
+static volatile uint32_t telemetryRcConfirmToggleCount = 0;
 static volatile uint32_t telemetryDataUlAckCount = 0;
 static volatile bool telemetryLastDataUlAck = false;
+static volatile uint32_t telemetryLinkStatsDlCount = 0;
+static volatile uint32_t telemetryDataDlCount = 0;
+static volatile uint32_t telemetryDispatchFailCount = 0;
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
 static volatile uint8_t lr2021TelemetryTxPending = 0;
 static volatile uint32_t lr2021TelemetryTxStartUs = 0;
@@ -318,6 +342,8 @@ static volatile uint32_t lr2021TelemetryTxWatchdogLastAgeUs = 0;
 static volatile uint32_t lr2021TelemetryTxWatchdogIrqCount = 0;
 static volatile uint32_t lr2021TelemetryTxRfCount = 0;
 static volatile uint32_t lr2021TelemetryTxNoneCount = 0;
+static volatile uint32_t lr2021TelemetryTxOverlapCount = 0;
+static volatile uint32_t lr2021TelemetryTxStartFailCount = 0;
 #endif
 static volatile uint32_t dataUlChunkCount = 0;
 static volatile uint32_t dataUlCompleteCount = 0;
@@ -387,6 +413,51 @@ static inline void telemetryExitCritical(uint32_t primask) {
   __asm volatile("msr primask, %0" ::"r"(primask) : "memory");
 }
 #endif
+
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+// Keep this independent from the broad timing diagnostics. It records the
+// final telemetry handoff only and reports from TLMGAP after a real failure.
+static volatile uint32_t tlmTurnTxStartUs = 0;
+static volatile uint32_t tlmTurnRxArmUs = 0;
+static volatile uint32_t tlmTurnTxDoneCount = 0;
+static volatile uint32_t tlmTurnRxArmCount = 0;
+static volatile uint32_t tlmTurnRxOkCount = 0;
+static volatile uint32_t tlmTurnNextTxBeforeRxCount = 0;
+static volatile uint32_t tlmTurnLqSetSkipCount = 0;
+static volatile uint32_t tlmTurnTxToDoneLastUs = 0;
+static volatile uint32_t tlmTurnDoneToRxLastUs = 0;
+static volatile uint32_t tlmTurnRxToOkLastUs = 0;
+static volatile uint32_t tlmTurnTxToDoneMaxUs = 0;
+static volatile uint32_t tlmTurnDoneToRxMaxUs = 0;
+static volatile uint32_t tlmTurnRxToOkMaxUs = 0;
+static volatile uint8_t tlmTurnAwaitingRx = 0;
+
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+static volatile uint32_t tlmTurnMissCount = 0;
+static volatile uint32_t tlmTurnMissNoIrqCount = 0;
+static volatile uint32_t tlmTurnMissLastIrqCount = 0;
+static volatile uint32_t tlmTurnMissLastRxDoneCount = 0;
+static volatile uint32_t tlmTurnMissLastPacketRejectCount = 0;
+static volatile uint32_t tlmTurnMissLastCrcCount = 0;
+static volatile uint32_t tlmTurnMissLastSyncCount = 0;
+static volatile uint32_t tlmTurnMissLastTimeoutCount = 0;
+static volatile uint32_t tlmTurnMissLastErrorCount = 0;
+static volatile uint32_t tlmTurnMissLastIrqStatus = 0;
+static volatile uint32_t tlmTurnMissLastFifoReadCount = 0;
+static volatile uint32_t tlmTurnMissLastFifoBusyEntryCount = 0;
+static volatile uint32_t tlmTurnMissLastFifoBusyTimeoutCount = 0;
+static volatile uint8_t tlmTurnMissLastDioPending = 0;
+static volatile uint8_t tlmTurnMissLastBusyHigh = 0;
+#endif
+
+static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+tlmTurnUpdateMax(volatile uint32_t &maximum, uint32_t value) {
+  if (value > maximum) {
+    maximum = value;
+  }
+}
+#endif
+
 #if ELRS_DIAG_TX_TURNAROUND
 static volatile uint32_t telemetryTxStartUs = 0;
 static volatile uint32_t telemetryTxDoneUs = 0;
@@ -2765,6 +2836,18 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
     return;
   }
 
+  // LR1121 combines frequency change and RX re-arm in one command. LR2021
+  // requires two commands; re-arm only the GFSK modes so proven LoRa hopping
+  // retains its existing timing profile.
+  const bool isGfskHopRate =
+      ExpressLRS_currAirRate_Modparams->radio_type ==
+          RADIO_TYPE_LR1121_GFSK_900 ||
+      ExpressLRS_currAirRate_Modparams->radio_type ==
+          RADIO_TYPE_LR1121_GFSK_2G4;
+  const bool rearmRxAfterHop =
+      SIW917_ELRS_FHSS_SET_FREQ_RX ||
+      (SIW917_ELRS_LR2021_GFSK_HOP_SET_RX && isGfskHopRate);
+
   uint8_t modresultFHSS =
       OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
 
@@ -2777,28 +2860,28 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
   if (isDualRadio() && geminiMode) {
     if (FHSSuseDualBand) {
       Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_1,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
       Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_2,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
     } else if (((OtaNonce /
                  ExpressLRS_currAirRate_Modparams->FHSShopInterval) %
                 2U) == 0U) {
       Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_1,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
       Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_2,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
     } else {
       // Match upstream Gemini: alternate which physical radio tracks the
       // offset frequency so both antennas see both hop positions over time.
       const uint32_t freqRadio2 = FHSSgetNextFreq();
       Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_1,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
       Radio.SetFrequencyReg(freqRadio2, SX12XX_Radio_2,
-                            SIW917_ELRS_FHSS_SET_FREQ_RX);
+                            rearmRxAfterHop);
     }
   } else {
     Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
-                          SIW917_ELRS_FHSS_SET_FREQ_RX);
+                          rearmRxAfterHop);
   }
 }
 
@@ -3268,8 +3351,13 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
   }
 
   bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
+  const bool previousTelemetryConfirmValue = telemetryLastRcConfirm;
   noteDecodedUplinkTxPower();
   TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
+  telemetryRcConfirmSeenCount++;
+  if (telemetryConfirmValue != previousTelemetryConfirmValue) {
+    telemetryRcConfirmToggleCount++;
+  }
   telemetryLastRcConfirm = telemetryConfirmValue;
   if (telemetryConfirmValue) {
     telemetryRcConfirmCount++;
@@ -3794,23 +3882,24 @@ applyFhssCorrectionForNonceResync(uint8_t const oldNonce,
 
 static void ICACHE_RAM_ATTR
 diagnoseCrcFailureNonce(OTA_Packet_s const *const otaPktPtr,
-                        uint8_t const type) {
-#if ELRS_DIAG_CRC_NONCE_WINDOW > 0
-  if (type == PACKET_TYPE_SYNC) {
-    return;
-  }
-
+                        uint8_t const type, uint8_t const nonceWindow) {
   const uint8_t expectedNonce = OtaNonce;
   lastCrcNonceType = type;
   lastCrcNonceExpected = expectedNonce;
+  lastCrcNonceDelta = 127;
+  lastCrcNonceMatched = 0xFF;
 
-  for (int8_t delta = -ELRS_DIAG_CRC_NONCE_WINDOW;
-       delta <= ELRS_DIAG_CRC_NONCE_WINDOW; delta++) {
+  if (type == PACKET_TYPE_SYNC || nonceWindow == 0U) {
+    return;
+  }
+
+  for (int16_t delta = -(int16_t)nonceWindow;
+       delta <= (int16_t)nonceWindow; delta++) {
     OTA_Packet_s packetCopy;
     memcpy(&packetCopy, otaPktPtr, sizeof(packetCopy));
     const uint8_t candidateNonce = (uint8_t)(expectedNonce + delta);
     if (OtaValidatePacketCrcForNonce(&packetCopy, candidateNonce)) {
-      lastCrcNonceDelta = delta;
+      lastCrcNonceDelta = (int8_t)delta;
       lastCrcNonceMatched = candidateNonce;
       crcNonceDiagHitCount++;
       return;
@@ -3820,10 +3909,6 @@ diagnoseCrcFailureNonce(OTA_Packet_s const *const otaPktPtr,
   lastCrcNonceDelta = 127;
   lastCrcNonceMatched = 0xFF;
   crcNonceDiagMissCount++;
-#else
-  (void)otaPktPtr;
-  (void)type;
-#endif
 }
 
 static bool ICACHE_RAM_ATTR
@@ -3835,22 +3920,24 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   uint32_t const beginProcessing = micros();
   uint32_t packetTimeUs = beginProcessing;
   uint8_t pfdSourceForPacket = 0;
-#if SIW917_ELRS_HOTPATH_TIMING_DIAG || ELRS_DIAG_USE_DIO_PFD_TIMESTAMP
+#if ELRS_DIAG_USE_DIO_PFD_TIMESTAMP
+  {
+    const uint32_t dio1EdgeUs = lr1121_hal_get_last_dio1_edge_us();
+    if (dio1EdgeUs != 0U && (beginProcessing - dio1EdgeUs) < 10000U) {
+      packetTimeUs = dio1EdgeUs;
+      pfdSourceForPacket = 1;
+    }
+  }
+#endif
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   uint32_t const dio1EdgeUs = lr1121_hal_get_last_dio1_edge_us();
   uint32_t const deferredUs = lr1121_hal_get_last_deferred_us();
   uint32_t const rxIsrEntryUs = lr1121_get_last_rxnbisr_entry_us();
   uint32_t const packetReadyUs = lr1121_get_last_packet_ready_us();
-  const bool timerRunningForPfd = hwTimer::isRunning();
   if (dio1EdgeUs != 0U) {
     const uint32_t irqLatencyUs = beginProcessing - dio1EdgeUs;
     if (irqLatencyUs < 10000U) {
       lastRxDoneLatencyUs = irqLatencyUs;
-#if ELRS_DIAG_USE_DIO_PFD_TIMESTAMP
-      packetTimeUs = dio1EdgeUs;
-      if (timerRunningForPfd) {
-        pfdSourceForPacket = 1;
-      }
-#endif
     }
     const uint32_t dioToDeferred = deferredUs - dio1EdgeUs;
     if (deferredUs != 0U && dioToDeferred < 10000U) {
@@ -3876,6 +3963,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     }
   }
 #endif
+#if ELRS_DIAG_CRC_NONCE_WINDOW > 0
   uint32_t crcDiagEdgeAgeUs = 0;
   uint8_t crcDiagEdgeSlots = 0;
   uint8_t crcDiagPacketNonce = OtaNonce;
@@ -3893,10 +3981,24 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     }
   }
 #endif
+#endif
   OTA_Packet_s *const otaPktPtr = (OTA_Packet_s *const)Radio.RXdataBuffer;
   uint8_t const type = Radio.RXdataBuffer[0] & 0x03;
+  const bool gfskRate =
+      ExpressLRS_currAirRate_Modparams != nullptr &&
+      (ExpressLRS_currAirRate_Modparams->radio_type ==
+           RADIO_TYPE_LR1121_GFSK_2G4 ||
+       ExpressLRS_currAirRate_Modparams->radio_type ==
+           RADIO_TYPE_LR1121_GFSK_900);
+#if ELRS_DIAG_CRC_NONCE_WINDOW == 0 && !ELRS_DIAG_SCAN_TRACE
+  const bool leanConnectedLoRa = connectionState == connected && !gfskRate;
+#else
+  constexpr bool leanConnectedLoRa = false;
+#endif
   OTA_Packet_s rawOtaPacket;
-  memcpy(&rawOtaPacket, otaPktPtr, sizeof(rawOtaPacket));
+  if (!leanConnectedLoRa) {
+    memcpy(&rawOtaPacket, otaPktPtr, sizeof(rawOtaPacket));
+  }
 
 #if ELRS_DIAG_SCAN_TRACE
   uint8_t scanRawLen = 0;
@@ -3915,45 +4017,47 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   }
 #endif
 
-  OTA_Packet_s validatedPacket;
-  memcpy(&validatedPacket, &rawOtaPacket, sizeof(validatedPacket));
-  bool crcValid = OtaValidatePacketCrc(&validatedPacket);
+  bool crcValid = OtaValidatePacketCrc(otaPktPtr);
   bool gfskRecoveredNonce = false;
-  memcpy(otaPktPtr, &validatedPacket, sizeof(*otaPktPtr));
-
-#if ELRS_DIAG_CRC_NONCE_WINDOW > 0 ||                                          \
-    SIW917_ELRS_LR2021_GFSK_TENTATIVE_NONCE_RESYNC
-  const bool gfskRate =
-      ExpressLRS_currAirRate_Modparams != nullptr &&
-      (ExpressLRS_currAirRate_Modparams->radio_type ==
-           RADIO_TYPE_LR1121_GFSK_2G4 ||
-       ExpressLRS_currAirRate_Modparams->radio_type ==
-           RADIO_TYPE_LR1121_GFSK_900);
+  if (leanConnectedLoRa && !crcValid) {
+    ELRS_PACKET_STAT_INC(crcFailCount);
+    ELRS_PACKET_STAT_INC(crcFailTypeCount[type]);
+    return false;
+  }
+#if SIW917_ELRS_LR2021_GFSK_TENTATIVE_NONCE_RESYNC
+  const bool allowTentativeNonceResync =
+      connectionState == tentative && RXtimerState != tim_locked;
+#if SIW917_ELRS_LR2021_GFSK_CONNECTED_NONCE_RESYNC
+  const bool allowConnectedNonceResync =
+      connectionState == connected && RXtimerState != tim_locked;
+#else
+  const bool allowConnectedNonceResync = false;
+#endif
+  const uint8_t maxNonceResyncDelta =
+      allowConnectedNonceResync
+          ? SIW917_ELRS_LR2021_GFSK_CONNECTED_NONCE_RESYNC_MAX_DELTA
+          : SIW917_ELRS_LR2021_GFSK_NONCE_RESYNC_MAX_DELTA;
+  const bool gfskNonceResyncAllowed =
+      gfskRate && type != PACKET_TYPE_SYNC &&
+      (allowTentativeNonceResync || allowConnectedNonceResync);
+#endif
+  uint8_t crcNonceWindow = ELRS_DIAG_CRC_NONCE_WINDOW;
+#if SIW917_ELRS_LR2021_GFSK_TENTATIVE_NONCE_RESYNC
+  // Preserve the GFSK resync feature, but search only the range it can accept.
+  if (gfskNonceResyncAllowed && maxNonceResyncDelta > crcNonceWindow) {
+    crcNonceWindow = maxNonceResyncDelta;
+  }
 #endif
 
   if (!crcValid) {
-    diagnoseCrcFailureNonce(&rawOtaPacket, type);
+    diagnoseCrcFailureNonce(&rawOtaPacket, type, crcNonceWindow);
 
 #if SIW917_ELRS_LR2021_GFSK_TENTATIVE_NONCE_RESYNC
     const int8_t nonceDelta =
         lastCrcNonceMatched == 0xFF
             ? 127
             : (int8_t)(lastCrcNonceMatched - lastCrcNonceExpected);
-    const bool allowTentativeNonceResync =
-        connectionState == tentative && RXtimerState != tim_locked;
-#if SIW917_ELRS_LR2021_GFSK_CONNECTED_NONCE_RESYNC
-    const bool allowConnectedNonceResync =
-        connectionState == connected && RXtimerState != tim_locked;
-#else
-    const bool allowConnectedNonceResync = false;
-#endif
-    const uint8_t maxNonceResyncDelta =
-        allowConnectedNonceResync
-            ? SIW917_ELRS_LR2021_GFSK_CONNECTED_NONCE_RESYNC_MAX_DELTA
-            : SIW917_ELRS_LR2021_GFSK_NONCE_RESYNC_MAX_DELTA;
-    if (gfskRate &&
-        (allowTentativeNonceResync || allowConnectedNonceResync) &&
-        type != PACKET_TYPE_SYNC && lastCrcNonceMatched != 0xFF &&
+    if (gfskNonceResyncAllowed && lastCrcNonceMatched != 0xFF &&
         absI32((int32_t)nonceDelta) <= maxNonceResyncDelta) {
       OTA_Packet_s recoveredPacket;
       memcpy(&recoveredPacket, &rawOtaPacket, sizeof(recoveredPacket));
@@ -4040,6 +4144,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   ELRS_PACKET_STAT_SET(lastValidFreq, Radio.currFreq);
   ELRS_PACKET_STAT_SET(lastPfdUsedEdgeTimestamp,
                        pfdSourceForPacket | (gfskRecoveredNonce ? 2U : 0U));
+  (void)pfdSourceForPacket;
   uint32_t const now = millis();
 
   if (ExpressLRS_currAirRate_Modparams != nullptr &&
@@ -4099,7 +4204,9 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 
   // Match downstream RX core ordering: packet contents are handled before the
   // current LQ period is marked as consumed.
+#if !SIW917_ELRS_LR2021_SKIP_PACKET_STATUS
   Radio.GetLastPacketStats();
+#endif
   getRFlinkInfo();
   LQCalc.add();
   RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
@@ -4114,6 +4221,11 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   if (LQCalc.currentIsSet() && connectionState == connected) {
     ELRS_PACKET_STAT_INC(rxLqCurrentSetSkipCount);
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+    if (tlmTurnAwaitingRx) {
+      tlmTurnLqSetSkipCount++;
+    }
+#endif
 #if ELRS_DIAG_TX_TURNAROUND
     if (telemetryAwaitingRx) {
       telemetryLqSetWhileAwaitingCount++;
@@ -4123,6 +4235,18 @@ RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
   }
 
   if (ProcessRFPacket(rxStatus)) {
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+    lr1121_tlm_miss_irq_trace_complete();
+#endif
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+    if (tlmTurnAwaitingRx) {
+      const uint32_t rxToOkUs = micros() - tlmTurnRxArmUs;
+      tlmTurnRxToOkLastUs = rxToOkUs;
+      tlmTurnUpdateMax(tlmTurnRxToOkMaxUs, rxToOkUs);
+      tlmTurnRxOkCount++;
+      tlmTurnAwaitingRx = 0;
+    }
+#endif
 #if ELRS_DIAG_TX_TURNAROUND
     if (telemetryAwaitingRx) {
       const uint32_t now = micros();
@@ -4159,6 +4283,13 @@ TXdoneISRCommon(bool forceManualRx) {
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
   lr2021TelemetryTxPending = 0;
 #endif
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+  const uint32_t txDoneUs = micros();
+  const uint32_t txToDoneUs = txDoneUs - tlmTurnTxStartUs;
+  tlmTurnTxToDoneLastUs = txToDoneUs;
+  tlmTurnUpdateMax(tlmTurnTxToDoneMaxUs, txToDoneUs);
+  tlmTurnTxDoneCount++;
+#endif
 #if ELRS_DIAG_TX_TURNAROUND
   const uint32_t txDoneUs = micros();
   telemetryTxDoneUs = txDoneUs;
@@ -4166,18 +4297,31 @@ TXdoneISRCommon(bool forceManualRx) {
 #endif
 #if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
     SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
-  if (forceManualRx) {
-    Radio.RXnb();
+  const bool autoRxAfterTxArmed = Radio.TakeAutoRxAfterTxArmed();
+  if (forceManualRx || !autoRxAfterTxArmed) {
+    Radio.RXnbFromTxDone();
   }
 #else
   (void)forceManualRx;
-  Radio.RXnb();
+  Radio.RXnbFromTxDone();
+#endif
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+  const uint32_t rxArmUs = micros();
+  const uint32_t doneToRxUs = rxArmUs - txDoneUs;
+  tlmTurnDoneToRxLastUs = doneToRxUs;
+  tlmTurnUpdateMax(tlmTurnDoneToRxMaxUs, doneToRxUs);
+  tlmTurnRxArmUs = rxArmUs;
+  tlmTurnRxArmCount++;
+  tlmTurnAwaitingRx = 1;
+#endif
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+  lr1121_tlm_miss_irq_trace_arm();
 #endif
 #if ELRS_DIAG_TX_TURNAROUND
   const uint32_t rxnbDoneUs =
 #if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
     SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
-      forceManualRx ? micros() : txDoneUs;
+      (forceManualRx || !autoRxAfterTxArmed) ? micros() : txDoneUs;
 #else
       micros();
 #endif
@@ -4793,12 +4937,55 @@ BuildTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
   return true;
 }
 
-static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
-                    bool sendGeminiBuffer, uint8_t diagNonce = OtaNonce,
+                     bool sendGeminiBuffer, uint8_t diagNonce = OtaNonce,
                     uint8_t diagFhss = FHSSgetCurrIndex()) {
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t sendStartUs = micros();
+#endif
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+  if (tlmTurnAwaitingRx) {
+    tlmTurnNextTxBeforeRxCount++;
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+    uint32_t irqEvents = 0;
+    uint32_t rxDoneEvents = 0;
+    uint32_t packetRejects = 0;
+    uint32_t crcEvents = 0;
+    uint32_t syncEvents = 0;
+    uint32_t timeoutEvents = 0;
+    uint32_t errorEvents = 0;
+    uint32_t lastIrq = 0;
+    uint32_t fifoReads = 0;
+    uint32_t fifoBusyAtEntry = 0;
+    uint32_t fifoBusyTimeouts = 0;
+
+    tlmTurnMissCount++;
+    tlmTurnMissLastDioPending = lr1121_hal_has_pending_dio1() ? 1U : 0U;
+    tlmTurnMissLastBusyHigh =
+        digitalRead(GPIO_PIN_BUSY) != LOW ? 1U : 0U;
+    lr1121_tlm_miss_irq_trace_latch(
+        &irqEvents, &rxDoneEvents, &packetRejects, &crcEvents, &syncEvents,
+        &timeoutEvents, &errorEvents, &lastIrq, &fifoReads,
+        &fifoBusyAtEntry, &fifoBusyTimeouts);
+    tlmTurnMissLastIrqCount = irqEvents;
+    tlmTurnMissLastRxDoneCount = rxDoneEvents;
+    tlmTurnMissLastPacketRejectCount = packetRejects;
+    tlmTurnMissLastCrcCount = crcEvents;
+    tlmTurnMissLastSyncCount = syncEvents;
+    tlmTurnMissLastTimeoutCount = timeoutEvents;
+    tlmTurnMissLastErrorCount = errorEvents;
+    tlmTurnMissLastIrqStatus = lastIrq;
+    tlmTurnMissLastFifoReadCount = fifoReads;
+    tlmTurnMissLastFifoBusyEntryCount = fifoBusyAtEntry;
+    tlmTurnMissLastFifoBusyTimeoutCount = fifoBusyTimeouts;
+    if (irqEvents == 0U) {
+      tlmTurnMissNoIrqCount++;
+    }
+#endif
+  }
+  tlmTurnTxStartUs = micros();
+  tlmTurnAwaitingRx = 0;
 #endif
 #if ELRS_DIAG_TX_TURNAROUND
   if (telemetryAwaitingRx) {
@@ -4851,6 +5038,16 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
 #endif
     TXdoneISRForceManualRx();
   } else {
+    if (!Radio.LastTxStartSuccessful()) {
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+      lr2021TelemetryTxStartFailCount++;
+#endif
+      TXdoneISRForceManualRx();
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      updateHotpathMax(telemetrySendMaxUs, micros() - sendStartUs);
+#endif
+      return false;
+    }
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
     lr2021TelemetryTxRfCount++;
     lr2021TelemetryTxStartUs = micros();
@@ -4860,6 +5057,7 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   updateHotpathMax(telemetrySendMaxUs, micros() - sendStartUs);
 #endif
+  return true;
 }
 
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
@@ -4940,19 +5138,25 @@ static uint32_t ICACHE_RAM_ATTR Lr2021EstimateTxAirtimeUs() {
 }
 
 static uint32_t ICACHE_RAM_ATTR Lr2021TxDoneWatchdogUs() {
+  const expresslrs_mod_settings_s *const params =
+      ExpressLRS_currAirRate_Modparams;
   const uint32_t interval =
-      ExpressLRS_currAirRate_Modparams
-          ? (uint32_t)ExpressLRS_currAirRate_Modparams->interval
-          : 20000U;
+      params ? (uint32_t)params->interval : 20000U;
   const uint32_t estimatedAirtime = Lr2021EstimateTxAirtimeUs();
-  uint32_t deadline =
-      estimatedAirtime ? (estimatedAirtime + 350U) : (interval - 250U);
   const bool isGfsk =
-      ExpressLRS_currAirRate_Modparams &&
-      (ExpressLRS_currAirRate_Modparams->radio_type ==
-           RADIO_TYPE_LR1121_GFSK_900 ||
-       ExpressLRS_currAirRate_Modparams->radio_type ==
-           RADIO_TYPE_LR1121_GFSK_2G4);
+      params && (params->radio_type == RADIO_TYPE_LR1121_GFSK_900 ||
+                 params->radio_type == RADIO_TYPE_LR1121_GFSK_2G4);
+  uint32_t deadline = estimatedAirtime
+                          ? (estimatedAirtime +
+                             SIW917_ELRS_LR2021_TXDONE_LORA_GUARD_US)
+                          : (interval - 250U);
+  if (!isGfsk) {
+    if (deadline < 500U) {
+      deadline = 500U;
+    }
+    return deadline;
+  }
+
   const uint32_t guardUs = isGfsk ? 150U : 250U;
   const uint32_t latestDeadline =
       (interval > guardUs) ? (interval - guardUs) : interval;
@@ -4982,22 +5186,252 @@ static void ICACHE_RAM_ATTR ServiceLr2021TxDoneWatchdog() {
     const uint32_t irqStatus = Radio.GetIrqStatus(SX12XX_Radio_1);
     lr2021TelemetryTxWatchdogIrqCount++;
     LR1121Driver::IsrCallbackWithStatus(SX12XX_Radio_1, irqStatus);
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG_EVENT_LOG
+    printf("[TXWD] irq age=%lu irq=0x%08lX dio=%u tx=%lu wd=%lu/%lu\n",
+           (unsigned long)ageUs, (unsigned long)irqStatus,
+           lr1121_hal_has_pending_dio1() ? 1U : 0U,
+           (unsigned long)telemetryTxCount,
+           (unsigned long)lr2021TelemetryTxWatchdogCount,
+           (unsigned long)lr2021TelemetryTxWatchdogIrqCount);
+#endif
     return;
   }
+#else
+  const uint32_t peekIrqStatus = 0;
 #endif
 
   lr2021TelemetryTxWatchdogCount++;
   lr2021TelemetryTxWatchdogLastAgeUs = ageUs;
   TXdoneISRForceManualRx();
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG_EVENT_LOG
+  printf("[TXWD] force age=%lu peek=0x%08lX dio=%u tx=%lu wd=%lu/%lu\n",
+         (unsigned long)ageUs, (unsigned long)peekIrqStatus,
+         lr1121_hal_has_pending_dio1() ? 1U : 0U,
+         (unsigned long)telemetryTxCount,
+         (unsigned long)lr2021TelemetryTxWatchdogCount,
+         (unsigned long)lr2021TelemetryTxWatchdogIrqCount);
+#endif
 }
 #else
 static void ICACHE_RAM_ATTR ServiceLr2021TxDoneWatchdog() {}
 #endif
 
+static void maybeReportTelemetryGap(uint32_t now) {
+#if SIW917_ELRS_TLM_GAP_DIAG
+  const expresslrs_mod_settings_s *const params =
+      ExpressLRS_currAirRate_Modparams;
+
+  static bool initialized = false;
+  static uint32_t lastTxProgressMs = 0;
+  static uint32_t lastRcProgressMs = 0;
+  static uint32_t lastAckToggleMs = 0;
+#if SIW917_ELRS_TLM_GAP_PERIOD_MS > 0
+  static uint32_t lastReportMs = 0;
+#endif
+  static uint32_t lastEventMs = 0;
+  static uint32_t previousTelemetryTxCount = 0;
+  static uint32_t previousTelemetryRcConfirmSeenCount = 0;
+  static uint32_t previousTelemetryRcConfirmToggleCount = 0;
+  static uint32_t previousTelemetryDispatchFailCount = 0;
+
+  if (connectionState != connected || params == nullptr ||
+      ExpressLRS_currTlmDenom <= 1U) {
+    initialized = false;
+    return;
+  }
+
+  const uint32_t telemetryTxSnapshot = telemetryTxCount;
+  const uint32_t rcSeenSnapshot = telemetryRcConfirmSeenCount;
+  const uint32_t rcToggleSnapshot = telemetryRcConfirmToggleCount;
+  const uint32_t dispatchFailSnapshot = telemetryDispatchFailCount;
+
+  if (!initialized) {
+    initialized = true;
+    lastTxProgressMs = now;
+    lastRcProgressMs = now;
+    lastAckToggleMs = now;
+#if SIW917_ELRS_TLM_GAP_PERIOD_MS > 0
+    lastReportMs = now;
+#endif
+    lastEventMs = 0;
+    previousTelemetryTxCount = telemetryTxSnapshot;
+    previousTelemetryRcConfirmSeenCount = rcSeenSnapshot;
+    previousTelemetryRcConfirmToggleCount = rcToggleSnapshot;
+    previousTelemetryDispatchFailCount = dispatchFailSnapshot;
+    return;
+  }
+
+  if (telemetryTxSnapshot != previousTelemetryTxCount) {
+    lastTxProgressMs = now;
+  }
+  if (rcSeenSnapshot != previousTelemetryRcConfirmSeenCount) {
+    lastRcProgressMs = now;
+  }
+  if (rcToggleSnapshot != previousTelemetryRcConfirmToggleCount) {
+    lastAckToggleMs = now;
+  }
+
+  const uint32_t txAgeMs = now - lastTxProgressMs;
+  const uint32_t rcAgeMs = now - lastRcProgressMs;
+  const uint32_t ackAgeMs = now - lastAckToggleMs;
+  uint32_t staleMs =
+      (((uint32_t)params->interval * (uint32_t)ExpressLRS_currTlmDenom) +
+       999U) /
+      1000U;
+  staleMs *= 6U;
+  if (staleMs < 2000U) {
+    staleMs = 2000U;
+  }
+
+  const uint16_t waitCount = TelemetrySender.GetWaitCount();
+  const uint16_t maxWaitCount = TelemetrySender.GetMaxPacketsBeforeResync();
+  uint16_t waitThreshold = maxWaitCount / 4U;
+  if (waitThreshold < 4U) {
+    waitThreshold = 4U;
+  }
+  if (waitThreshold > maxWaitCount) {
+    waitThreshold = maxWaitCount;
+  }
+
+  const bool noTelemetryTxProgress = txAgeMs > staleMs;
+  const bool noRcConfirmProgress = rcAgeMs > staleMs;
+  const bool activeAckStall =
+      TelemetrySender.IsActive() && waitCount >= waitThreshold &&
+      ackAgeMs > staleMs;
+  const bool dispatchFailed =
+      dispatchFailSnapshot != previousTelemetryDispatchFailCount;
+  const bool event =
+      noTelemetryTxProgress || noRcConfirmProgress || activeAckStall ||
+      dispatchFailed;
+  const bool eventDue = event && (lastEventMs == 0U ||
+                                  (uint32_t)(now - lastEventMs) >= 5000U);
+  const bool periodicDue =
+#if SIW917_ELRS_TLM_GAP_PERIOD_MS > 0
+      (uint32_t)(now - lastReportMs) >= SIW917_ELRS_TLM_GAP_PERIOD_MS;
+#else
+      false;
+#endif
+
+  if (eventDue || periodicDue) {
+    if (eventDue) {
+      lastEventMs = now;
+    }
+#if SIW917_ELRS_TLM_GAP_PERIOD_MS > 0
+    if (periodicDue) {
+      lastReportMs = now;
+    }
+#endif
+
+    printf("[%s] age:%lu/%lu/%lu stale:%lu rate:%u den:%u lq:%u/%u "
+           "tx:%lu ls:%lu data:%lu fail:%lu supp:%lu rc:%lu/%lu ack:%u "
+           "act:%u st:%u pkg:%u off:%u wait:%u/%u q:%u ul:%lu/%lu "
+           "wd:%lu/%lu/%u txo:%lu/%lu txc:%lu/%lu/%lu/%lu "
+           "spi:%lu/%lu rxr:%lu/%lu rssi:%d snr:%d "
+           "turn:%lu/%lu/%lu max:%lu/%lu/%lu cnt:%lu/%lu/%lu pre:%lu "
+           "skip:%lu aw:%u awage:%lu miss:%lu/%lu irq:%lu/%lu rej:%lu "
+           "crc:%lu sync:%lu to:%lu err:%lu last:%08lX dio:%u busy:%u "
+           "fifo:%lu/%lu/%lu\n",
+           event ? "TLMGAP" : "TLMSTAT", (unsigned long)txAgeMs,
+           (unsigned long)rcAgeMs, (unsigned long)ackAgeMs,
+           (unsigned long)staleMs, (unsigned)params->index,
+           (unsigned)ExpressLRS_currTlmDenom, (unsigned)LQCalc.getLQRaw(),
+           (unsigned)LQCalc.getCount(), (unsigned long)telemetryTxSnapshot,
+           (unsigned long)telemetryLinkStatsDlCount,
+           (unsigned long)telemetryDataDlCount,
+           (unsigned long)dispatchFailSnapshot,
+           (unsigned long)telemetrySuppressedCount,
+           (unsigned long)rcSeenSnapshot, (unsigned long)rcToggleSnapshot,
+           telemetryLastRcConfirm ? 1U : 0U,
+           TelemetrySender.IsActive() ? 1U : 0U,
+           (unsigned)TelemetrySender.GetState(),
+           (unsigned)TelemetrySender.GetCurrentPackage(),
+           (unsigned)TelemetrySender.GetCurrentOffset(),
+           (unsigned)waitCount, (unsigned)maxWaitCount,
+           (unsigned)rxLuaQueueCount, (unsigned long)dataUlChunkCount,
+           (unsigned long)dataUlCompleteCount,
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+           (unsigned long)lr2021TelemetryTxWatchdogCount,
+           (unsigned long)lr2021TelemetryTxWatchdogIrqCount,
+           (unsigned)lr2021TelemetryTxPending,
+           (unsigned long)lr2021TelemetryTxOverlapCount,
+           (unsigned long)lr2021TelemetryTxStartFailCount,
+#else
+           0UL, 0UL, 0U, 0UL, 0UL,
+#endif
+           (unsigned long)lr1121_hal_get_tx_fifo_retry_count(),
+           (unsigned long)lr1121_hal_get_tx_fifo_retry_fail_count(),
+           (unsigned long)lr1121_hal_get_set_tx_retry_count(),
+           (unsigned long)lr1121_hal_get_set_tx_retry_fail_count(),
+           (unsigned long)lr1121_get_raw_gspi_max_us(),
+           (unsigned long)lr1121_get_raw_gspi_fail_count(),
+           (unsigned long)lr1121_hal_get_post_tx_set_rx_retry_count(),
+           (unsigned long)lr1121_hal_get_post_tx_set_rx_retry_fail_count(),
+           (int)Radio.LastPacketRSSI, (int)Radio.LastPacketSNRRaw,
+#if SIW917_ELRS_TLM_TURNAROUND_TRACE
+           (unsigned long)tlmTurnTxToDoneLastUs,
+           (unsigned long)tlmTurnDoneToRxLastUs,
+           (unsigned long)tlmTurnRxToOkLastUs,
+           (unsigned long)tlmTurnTxToDoneMaxUs,
+           (unsigned long)tlmTurnDoneToRxMaxUs,
+           (unsigned long)tlmTurnRxToOkMaxUs,
+           (unsigned long)tlmTurnTxDoneCount,
+           (unsigned long)tlmTurnRxArmCount,
+           (unsigned long)tlmTurnRxOkCount,
+           (unsigned long)tlmTurnNextTxBeforeRxCount,
+           (unsigned long)tlmTurnLqSetSkipCount, (unsigned)tlmTurnAwaitingRx,
+           (unsigned long)(tlmTurnAwaitingRx
+                               ? (micros() - tlmTurnRxArmUs)
+                               : 0U)
+#else
+           0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0U, 0UL
+#endif
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+           , (unsigned long)tlmTurnMissCount,
+           (unsigned long)tlmTurnMissNoIrqCount,
+           (unsigned long)tlmTurnMissLastIrqCount,
+           (unsigned long)tlmTurnMissLastRxDoneCount,
+           (unsigned long)tlmTurnMissLastPacketRejectCount,
+           (unsigned long)tlmTurnMissLastCrcCount,
+           (unsigned long)tlmTurnMissLastSyncCount,
+           (unsigned long)tlmTurnMissLastTimeoutCount,
+           (unsigned long)tlmTurnMissLastErrorCount,
+           (unsigned long)tlmTurnMissLastIrqStatus,
+           (unsigned)tlmTurnMissLastDioPending,
+           (unsigned)tlmTurnMissLastBusyHigh,
+           (unsigned long)tlmTurnMissLastFifoReadCount,
+           (unsigned long)tlmTurnMissLastFifoBusyEntryCount,
+           (unsigned long)tlmTurnMissLastFifoBusyTimeoutCount
+#else
+           , 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0U, 0U,
+           0UL, 0UL, 0UL
+#endif
+    );
+  }
+
+  previousTelemetryTxCount = telemetryTxSnapshot;
+  previousTelemetryRcConfirmSeenCount = rcSeenSnapshot;
+  previousTelemetryRcConfirmToggleCount = rcToggleSnapshot;
+  previousTelemetryDispatchFailCount = dispatchFailSnapshot;
+#else
+  (void)now;
+#endif
+}
+
 #if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
 static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() {
   const uint32_t primask = telemetryEnterCritical();
-  const bool hasRoom = !deferredTelemetryPending;
+  const bool txPending =
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+      lr2021TelemetryTxPending != 0U;
+#else
+      false;
+#endif
+  const bool hasRoom = !deferredTelemetryPending && !txPending;
+  if (txPending) {
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+    lr2021TelemetryTxOverlapCount++;
+#endif
+  }
   telemetryExitCritical(primask);
   return hasRoom;
 }
@@ -5054,10 +5488,15 @@ static void ServiceDeferredTelemetryTx() {
   deferredTelemetryPending = false;
   telemetryExitCritical(primask);
 
-  SendTelemetryPacket(&packet, sendGeminiBuffer ? &geminiPacket : nullptr,
-                      sendGeminiBuffer, diagNonce, diagFhss);
-  telemetryDeferredSendCount++;
-  telemetryTxCount++;
+  if (SendTelemetryPacket(&packet,
+                          sendGeminiBuffer ? &geminiPacket : nullptr,
+                          sendGeminiBuffer, diagNonce, diagFhss)) {
+    telemetryDeferredSendCount++;
+    telemetryTxCount++;
+  } else {
+    telemetryDispatchFailCount++;
+    telemetrySuppressedCount++;
+  }
 }
 
 static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(
@@ -5066,13 +5505,20 @@ static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(
   return QueueTelemetryPacketForTask(otaPkt, otaPktGemini, sendGeminiBuffer);
 }
 #else
-static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() { return true; }
+static bool ICACHE_RAM_ATTR TelemetryTxQueueHasRoom() {
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+  if (lr2021TelemetryTxPending != 0U) {
+    lr2021TelemetryTxOverlapCount++;
+    return false;
+  }
+#endif
+  return true;
+}
 static void ServiceDeferredTelemetryTx() {}
 static bool ICACHE_RAM_ATTR DispatchTelemetryPacket(
     OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
     bool sendGeminiBuffer) {
-  SendTelemetryPacket(otaPkt, otaPktGemini, sendGeminiBuffer);
-  return true;
+  return SendTelemetryPacket(otaPkt, otaPktGemini, sendGeminiBuffer);
 }
 #endif
 
@@ -5169,8 +5615,15 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
               prebuiltTelemetrySendGemini ? &prebuiltTelemetryGeminiPacket
                                           : nullptr,
               prebuiltTelemetrySendGemini)) {
+        if ((prebuiltTelemetryPacket.std.type & 0x03U) ==
+            PACKET_TYPE_LINKSTATS) {
+          telemetryLinkStatsDlCount++;
+        } else {
+          telemetryDataDlCount++;
+        }
         return true;
       }
+      telemetryDispatchFailCount++;
       telemetrySuppressedCount++;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
       updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
@@ -5209,13 +5662,20 @@ static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HandleSendDataDl() {
   alreadyTLMresp = true;
   NextTelemetryType = nextTelemetryType;
   telemetryBurstCount = nextTelemetryBurstCount;
+  const uint8_t telemetryPacketType = otaPkt.std.type & 0x03U;
   if (!DispatchTelemetryPacket(&otaPkt, sendGeminiBuffer ? &otaPktGemini : nullptr,
                                sendGeminiBuffer)) {
+    telemetryDispatchFailCount++;
     telemetrySuppressedCount++;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
 #endif
     return false;
+  }
+  if (telemetryPacketType == PACKET_TYPE_LINKSTATS) {
+    telemetryLinkStatsDlCount++;
+  } else {
+    telemetryDataDlCount++;
   }
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   updateHotpathMax(telemetryHandleMaxUs, micros() - handleStartUs);
@@ -5740,6 +6200,7 @@ void elrs_loop(void) {
 #endif
 
   ServiceLr2021TxDoneWatchdog();
+  maybeReportTelemetryGap(now);
 
   if (do_packet_dump) {
     do_packet_dump = false;
@@ -6539,7 +7000,7 @@ int elrs_format_health_json(char *out, size_t out_len) {
       out, out_len,
       "{\"ok\":1,\"s\":[%u,%u,%u,%u],\"age\":[%lu,%lu],"
       "\"rf\":[%u,%u,%d,%d],\"tlm\":[%lu,%lu,%lu],"
-      "\"spi\":[%lu,%lu],\"q\":%u,\"d\":%u}",
+      "\"txwd\":[%lu,%lu,%lu,%u],\"spi\":[%lu,%lu],\"q\":%u,\"d\":%u}",
       (unsigned)connectionState, (unsigned)RXtimerState, (unsigned)rateIndex,
       (unsigned)ExpressLRS_currTlmDenom, (unsigned long)(now - LastValidPacket),
       (unsigned long)(now - LastSyncPacket), (unsigned)LQCalc.getLQRaw(),
@@ -6547,6 +7008,14 @@ int elrs_format_health_json(char *out, size_t out_len) {
       (int)Radio.LastPacketSNRRaw, (unsigned long)telemetryTxCount,
       (unsigned long)telemetrySuppressedCount,
       (unsigned long)telemetryDataUlAckCount,
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+      (unsigned long)lr2021TelemetryTxWatchdogCount,
+      (unsigned long)lr2021TelemetryTxWatchdogIrqCount,
+      (unsigned long)lr2021TelemetryTxWatchdogLastAgeUs,
+      (unsigned)lr2021TelemetryTxPending,
+#else
+      0UL, 0UL, 0UL, 0U,
+#endif
       (unsigned long)lr1121_get_raw_gspi_max_us(),
       (unsigned long)lr1121_get_raw_gspi_fail_count(), (unsigned)rxLuaQueueCount,
       (unsigned)lastDisconnectReason);

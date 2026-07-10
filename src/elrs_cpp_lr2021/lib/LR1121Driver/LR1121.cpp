@@ -19,6 +19,140 @@ extern "C" {
 
 LR1121Hal hal;
 LR1121Driver *LR1121Driver::instance = NULL;
+extern RXtimerState_e RXtimerState;
+
+extern "C" {
+volatile uint8_t lr1121_tlm_miss_irq_trace_active = 0;
+}
+
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+// This trace observes only IRQs already delivered by the normal DIO mask. It
+// never reads the radio or changes the DIO configuration on the RF hot path.
+static volatile uint32_t tlmMissIrqTraceEventCount = 0;
+static volatile uint32_t tlmMissIrqTraceRxDoneCount = 0;
+static volatile uint32_t tlmMissIrqTracePacketRejectCount = 0;
+static volatile uint32_t tlmMissIrqTraceCrcCount = 0;
+static volatile uint32_t tlmMissIrqTraceSyncCount = 0;
+static volatile uint32_t tlmMissIrqTraceTimeoutCount = 0;
+static volatile uint32_t tlmMissIrqTraceErrorCount = 0;
+static volatile uint32_t tlmMissIrqTraceLastStatus = 0;
+static volatile uint32_t tlmMissIrqTraceFifoReadCount = 0;
+static volatile uint32_t tlmMissIrqTraceFifoBusyEntryCount = 0;
+static volatile uint32_t tlmMissIrqTraceFifoBusyTimeoutCount = 0;
+
+static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+lr1121TlmMissIrqTraceRecord(uint32_t irqStatus) {
+  if (lr1121_tlm_miss_irq_trace_active == 0U) {
+    return;
+  }
+
+  tlmMissIrqTraceEventCount++;
+  tlmMissIrqTraceLastStatus = irqStatus;
+  if ((irqStatus & (LR1121_IRQ_RX_DONE | LR20XX_IRQ_RX_FIFO)) != 0U) {
+    tlmMissIrqTraceRxDoneCount++;
+  }
+  // These flags are recorded only if co-latched with an IRQ already routed to
+  // DIO; enabling their DIO sources would change the timing being measured.
+  if ((irqStatus &
+       (LR20XX_IRQ_CRC_ERROR | LR20XX_IRQ_LORA_HEADER_CRC_ERROR)) != 0U) {
+    tlmMissIrqTraceCrcCount++;
+  }
+  if ((irqStatus & LR20XX_IRQ_SYNC_FAIL) != 0U) {
+    tlmMissIrqTraceSyncCount++;
+  }
+  if ((irqStatus & LR1121_IRQ_TIMEOUT) != 0U) {
+    tlmMissIrqTraceTimeoutCount++;
+  }
+  if ((irqStatus &
+       (LR20XX_IRQ_ERROR | LR20XX_IRQ_LEN_ERROR | LR20XX_IRQ_ADDR_ERROR)) !=
+      0U) {
+    tlmMissIrqTraceErrorCount++;
+  }
+}
+
+extern "C" void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+lr1121_tlm_miss_irq_trace_arm(void) {
+  tlmMissIrqTraceEventCount = 0;
+  tlmMissIrqTraceRxDoneCount = 0;
+  tlmMissIrqTracePacketRejectCount = 0;
+  tlmMissIrqTraceCrcCount = 0;
+  tlmMissIrqTraceSyncCount = 0;
+  tlmMissIrqTraceTimeoutCount = 0;
+  tlmMissIrqTraceErrorCount = 0;
+  tlmMissIrqTraceLastStatus = 0;
+  tlmMissIrqTraceFifoReadCount = 0;
+  tlmMissIrqTraceFifoBusyEntryCount = 0;
+  tlmMissIrqTraceFifoBusyTimeoutCount = 0;
+  lr1121_tlm_miss_irq_trace_active = 1;
+}
+
+extern "C" void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+lr1121_tlm_miss_irq_trace_complete(void) {
+  lr1121_tlm_miss_irq_trace_active = 0;
+}
+
+extern "C" void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+lr1121_tlm_miss_irq_trace_record_fifo_busy_wait(bool busyAtEntry,
+                                                bool ready) {
+  if (lr1121_tlm_miss_irq_trace_active == 0U) {
+    return;
+  }
+  tlmMissIrqTraceFifoReadCount++;
+  if (busyAtEntry) {
+    tlmMissIrqTraceFifoBusyEntryCount++;
+  }
+  if (!ready) {
+    tlmMissIrqTraceFifoBusyTimeoutCount++;
+  }
+}
+
+extern "C" void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+lr1121_tlm_miss_irq_trace_latch(
+    uint32_t *eventCount, uint32_t *rxDoneCount, uint32_t *packetRejectCount,
+    uint32_t *crcCount, uint32_t *syncCount, uint32_t *timeoutCount,
+    uint32_t *errorCount, uint32_t *lastIrq, uint32_t *fifoReadCount,
+    uint32_t *fifoBusyEntryCount, uint32_t *fifoBusyTimeoutCount) {
+  if (eventCount) *eventCount = tlmMissIrqTraceEventCount;
+  if (rxDoneCount) *rxDoneCount = tlmMissIrqTraceRxDoneCount;
+  if (packetRejectCount) *packetRejectCount = tlmMissIrqTracePacketRejectCount;
+  if (crcCount) *crcCount = tlmMissIrqTraceCrcCount;
+  if (syncCount) *syncCount = tlmMissIrqTraceSyncCount;
+  if (timeoutCount) *timeoutCount = tlmMissIrqTraceTimeoutCount;
+  if (errorCount) *errorCount = tlmMissIrqTraceErrorCount;
+  if (lastIrq) *lastIrq = tlmMissIrqTraceLastStatus;
+  if (fifoReadCount) *fifoReadCount = tlmMissIrqTraceFifoReadCount;
+  if (fifoBusyEntryCount) {
+    *fifoBusyEntryCount = tlmMissIrqTraceFifoBusyEntryCount;
+  }
+  if (fifoBusyTimeoutCount) {
+    *fifoBusyTimeoutCount = tlmMissIrqTraceFifoBusyTimeoutCount;
+  }
+  lr1121_tlm_miss_irq_trace_active = 0;
+}
+#else
+static void lr1121TlmMissIrqTraceRecord(uint32_t) {}
+extern "C" void lr1121_tlm_miss_irq_trace_arm(void) {}
+extern "C" void lr1121_tlm_miss_irq_trace_complete(void) {}
+extern "C" void lr1121_tlm_miss_irq_trace_record_fifo_busy_wait(bool, bool) {}
+extern "C" void lr1121_tlm_miss_irq_trace_latch(
+    uint32_t *eventCount, uint32_t *rxDoneCount, uint32_t *packetRejectCount,
+    uint32_t *crcCount, uint32_t *syncCount, uint32_t *timeoutCount,
+    uint32_t *errorCount, uint32_t *lastIrq, uint32_t *fifoReadCount,
+    uint32_t *fifoBusyEntryCount, uint32_t *fifoBusyTimeoutCount) {
+  if (eventCount) *eventCount = 0;
+  if (rxDoneCount) *rxDoneCount = 0;
+  if (packetRejectCount) *packetRejectCount = 0;
+  if (crcCount) *crcCount = 0;
+  if (syncCount) *syncCount = 0;
+  if (timeoutCount) *timeoutCount = 0;
+  if (errorCount) *errorCount = 0;
+  if (lastIrq) *lastIrq = 0;
+  if (fifoReadCount) *fifoReadCount = 0;
+  if (fifoBusyEntryCount) *fifoBusyEntryCount = 0;
+  if (fifoBusyTimeoutCount) *fifoBusyTimeoutCount = 0;
+}
+#endif
+
 static volatile uint8_t siw917_last_payload_length = 8;
 static volatile uint32_t siw917_rxnbisr_entry_us = 0;
 static volatile uint32_t siw917_packet_ready_us = 0;
@@ -299,6 +433,8 @@ LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
   rxContinuousActive = false;
   txInProgress = false;
+  lastTxStartSuccessful = false;
+  autoRxAfterTxArmed = false;
   pwrCurrentLF = 0;
   pwrPendingLF = PWRPENDING_NONE;
   pwrCurrentHF = 0;
@@ -346,7 +482,7 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
       return false;
   }
 
-  DBGLN("LR2021 port build marker: rx-stage-v154-quiet-txdone-watchdog");
+  printf("LR2021 port build marker: rx-stage-v182-single-rxfifo\n");
 
   hal.IsrCallback_1 = &LR1121Driver::IsrCallback_1;
   hal.IsrCallback_2 = &LR1121Driver::IsrCallback_2;
@@ -356,15 +492,21 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
                    SX12XX_Radio_All); // Remove later?  Might not be required???
   ResetFrontEndCalCache();
 
-  // LR2021 RadioLib config uses standby RC fallback after Rx/Tx. Keep this
-  // copied port aligned with the LR20xx reference flow rather than the LR1121
-  // AUTOFS-oriented fallback inherited from the original driver.
+  // ExpressLRS transitions from telemetry TX straight into the next uplink
+  // window. Match upstream's FS fallback so SetRx can reuse the running
+  // frequency synthesizer instead of restarting from RC standby.
+#if SIW917_ELRS_LR2021_RX_TX_FALLBACK_FS
+  uint8_t FBbuf[1] = {LR20XX_FALLBACK_FS};
+  fallBackMode = LR1121_MODE_FS;
+#else
   uint8_t FBbuf[1] = {LR20XX_FALLBACK_STDBY_RC};
   fallBackMode = LR1121_MODE_STDBY_RC;
+#endif
   hal.WriteCommand(LR20XX_RADIO_SET_RX_TX_FALLBACK_MODE, FBbuf,
                    sizeof(FBbuf), SX12XX_Radio_All);
 #if SIW917_ELRS_RADIO_INIT_VERBOSE
-  DBGLN("SetRxTxFallbackMode: STDBY_RC");
+  DBGLN("SetRxTxFallbackMode: %s",
+        SIW917_ELRS_LR2021_RX_TX_FALLBACK_FS ? "FS" : "STDBY_RC");
 #endif
 
   SetRxPath(true, SX12XX_Radio_All);
@@ -1603,6 +1745,12 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnbISR() {
   DBGLN("TOA: %d", endTX - beginTX);
 #endif
   txInProgress = false;
+#if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
+    SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
+  if (autoRxAfterTxArmed) {
+    rxContinuousActive = true;
+  }
+#endif
 #if !defined(PLATFORM_SIW917)
   CommitOutputPower();
 #else
@@ -1616,6 +1764,11 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
     uint8_t *data, const bool sendGeminiBuffer, uint8_t *dataGemini,
     const SX12XX_Radio_Number_t radioNumber) {
   transmittingRadio = radioNumber;
+  lastTxStartSuccessful = false;
+#if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
+    SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
+  autoRxAfterTxArmed = false;
+#endif
 
   // //catch TX timeout
   // if (currOpmode == SX1280_MODE_TX)
@@ -1631,9 +1784,6 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
     SetMode(fallBackMode, SX12XX_Radio_All);
     return;
   }
-
-  txInProgress = true;
-  rxContinuousActive = false;
 
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
   if (radioNumber == SX12XX_Radio_All || radioNumber == SX12XX_Radio_1) {
@@ -1657,17 +1807,33 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
 
 #if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
     SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
-  // Let LR2021 return to continuous RX at the exact TX_DONE boundary. The MCU
-  // TX_DONE callback still runs to clear ELRS state, but RX is no longer gated
-  // by the SiW917 task/IRQ latency.
-  const uint8_t autoRxAfterTx[8] = {
-      0x01, // condition: always run the automatic operation after manual TX
-      0xFF, 0xFF, 0xFF, // automatic RX timeout: continuous
-      0x00, 0x00, 0x00, 0x00, // delay_in_tick: immediate
-  };
-  hal.WriteCommand(LR20XX_RADIO_SET_AUTO_RX_TX,
-                   const_cast<uint8_t *>(autoRxAfterTx),
-                   sizeof(autoRxAfterTx), radioNumber);
+  const bool enableAutoRxAfterTx =
+#if SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX_LOCKED_ONLY
+      connectionState == connected && RXtimerState == tim_locked;
+#else
+      true;
+#endif
+  if (enableAutoRxAfterTx) {
+    // SetAutoRxTx runs the automatic operation from the configured fallback
+    // mode. Leave continuous RX before arming it so the following manual TX
+    // starts the documented FS -> TX -> FS -> auto-RX sequence.
+    if (rxContinuousActive) {
+      SetMode(fallBackMode, radioNumber);
+    }
+
+    // Let LR2021 return to continuous RX at the exact TX_DONE boundary. The
+    // callback still runs to clear ELRS state, but RX is no longer gated by
+    // SiW917 task/IRQ latency once the receiver has acquired timing lock.
+    const uint8_t autoRxAfterTx[8] = {
+        0x01, // condition: always run the automatic operation after manual TX
+        0xFF, 0xFF, 0xFF, // automatic RX timeout: continuous
+        0x00, 0x00, 0x00, 0x00, // delay_in_tick: immediate
+    };
+    hal.WriteCommand(LR20XX_RADIO_SET_AUTO_RX_TX,
+                     const_cast<uint8_t *>(autoRxAfterTx),
+                     sizeof(autoRxAfterTx), radioNumber);
+    autoRxAfterTxArmed = true;
+  }
 #endif
 
   WORD_ALIGNED_ATTR uint8_t outBuffer[32];
@@ -1675,6 +1841,14 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
   outBuffer[PayloadLength] = 0;
   outBuffer[PayloadLength + 1] = 0;
   outBuffer[PayloadLength + 2] = 0;
+
+  // Do not let an RX_DONE from the preceding continuous-RX state be treated
+  // as TX_DONE while the auto-RX sequence is being prepared.
+  txInProgress = true;
+  rxContinuousActive = false;
+
+  bool txCommandsOk = false;
+
   if (sendGeminiBuffer) {
     WORD_ALIGNED_ATTR uint8_t outBufferGemini[32];
     codec->encode(outBufferGemini, dataGemini, PayloadLength);
@@ -1684,20 +1858,34 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
 
     // Keep the two TX start command groups adjacent; encoding between them
     // widens Gemini skew inside the already-tight telemetry slot.
-    hal.WriteCommand(LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength,
-                     SX12XX_Radio_1);
-    hal.WriteCommand(LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
-                     SX12XX_Radio_1);
-    hal.WriteCommand(LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBufferGemini,
-                     PayloadLength,
-                     SX12XX_Radio_2);
-    hal.WriteCommand(LR20XX_RADIO_SET_TX, outBufferGemini + PayloadLength, 3,
-                     SX12XX_Radio_2);
+    const bool radio1FifoOk = hal.WriteCommandFastRetry(
+        LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength,
+        SX12XX_Radio_1);
+    const bool radio1TxOk =
+        radio1FifoOk && hal.WriteCommandFastRetry(
+                            LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
+                            SX12XX_Radio_1);
+    const bool radio2FifoOk = hal.WriteCommandFastRetry(
+        LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBufferGemini, PayloadLength,
+        SX12XX_Radio_2);
+    const bool radio2TxOk =
+        radio2FifoOk && hal.WriteCommandFastRetry(
+                            LR20XX_RADIO_SET_TX,
+                            outBufferGemini + PayloadLength, 3,
+                            SX12XX_Radio_2);
+    txCommandsOk = radio1TxOk && radio2TxOk;
   } else {
-    hal.WriteCommand(LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength,
-                     radioNumber);
-    hal.WriteCommand(LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
-                     radioNumber);
+    const bool fifoOk = hal.WriteCommandFastRetry(
+        LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength, radioNumber);
+    txCommandsOk =
+        fifoOk && hal.WriteCommandFastRetry(
+                      LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
+                      radioNumber);
+  }
+
+  lastTxStartSuccessful = txCommandsOk;
+  if (!txCommandsOk) {
+    txInProgress = false;
   }
 #ifdef DEBUG_LLCC68_OTA_TIMING
   beginTX = micros();
@@ -1786,7 +1974,6 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   }
   bool packetAccepted = false;
 
-  memset(rx_buf, 0, rxReadLength);
   rx_buf[0] = (uint8_t)(LR20XX_CMD_READ_RADIO_RX_FIFO >> 8);
   rx_buf[1] = (uint8_t)(LR20XX_CMD_READ_RADIO_RX_FIFO & 0xFF);
   hal.ReadCommand(rx_buf, rxReadLength, radioNumber);
@@ -1823,6 +2010,11 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   codec->decode(RXdataBuffer, rx_buf + fifoPayloadOffset,
                 effectivePayloadLength);
   packetAccepted = RXdoneCallback(SX12XX_RX_OK);
+#if SIW917_ELRS_TLM_MISS_IRQ_TRACE
+  if (!packetAccepted && lr1121_tlm_miss_irq_trace_active != 0U) {
+    tlmMissIrqTracePacketRejectCount++;
+  }
+#endif
   if (!packetAccepted) {
 #if defined(DEBUG_RCVR_SIGNAL_STATS)
     rxSignalStats[radioNumber == SX12XX_Radio_1 ? 0 : 1].fail_count++;
@@ -1954,6 +2146,23 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
 void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::RXnb() {
   // Match upstream ELRS: TX_DONE returns via fallback mode, then SetRx only.
   SetMode(LR1121_MODE_RX_CONT, SX12XX_Radio_All);
+}
+
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Driver::RXnbFromTxDone() {
+  // This is exactly the RX_CONT branch of SetMode(), kept separate so the
+  // telemetry ISR does not pay for the generic mode dispatcher.
+  const uint8_t timeout[3] = {0xFF, 0xFF, 0xFF};
+  rxContinuousActive = hal.WriteCommandFastRetry(
+      LR20XX_RADIO_SET_RX, timeout, sizeof(timeout), SX12XX_Radio_All);
+  txInProgress = false;
+}
+
+bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Driver::TakeAutoRxAfterTxArmed() {
+  const bool armed = autoRxAfterTxArmed;
+  autoRxAfterTxArmed = false;
+  return armed;
 }
 
 bool ICACHE_RAM_ATTR
@@ -2135,6 +2344,7 @@ void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
       radioNumber == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
 
   LR1121_ISR_STAT_SET(lastIrqStatus, irqStatus);
+  lr1121TlmMissIrqTraceRecord(irqStatus);
 
   // HOT PATH - No debug output here! Printf kills timing.
 

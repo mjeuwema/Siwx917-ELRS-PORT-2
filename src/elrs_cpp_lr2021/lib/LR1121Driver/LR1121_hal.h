@@ -16,6 +16,9 @@ public:
   void WriteCommand(uint16_t opcode, SX12XX_Radio_Number_t radioNumber);
   void WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
                     SX12XX_Radio_Number_t radioNumber);
+  bool WriteCommandFastRetry(uint16_t opcode, const uint8_t *buffer,
+                             uint8_t size,
+                             SX12XX_Radio_Number_t radioNumber);
 
   void ReadCommand(uint8_t *buffer, uint8_t size,
                    SX12XX_Radio_Number_t radioNumber);
