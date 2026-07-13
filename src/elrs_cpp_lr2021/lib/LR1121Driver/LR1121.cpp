@@ -9,6 +9,20 @@
 // C functions from lr1121_driver.c
 extern "C" {
 #include "lr1121_driver.h"
+uint32_t lr1121_hal_get_dio1_edge_sequence(void);
+uint32_t lr1121_hal_get_dio2_edge_sequence(void);
+}
+
+static inline uint32_t SIW917_ELRS_RAMFUNC_ATTR
+siw917Lr2021DioEdgeSequence(SX12XX_Radio_Number_t radioNumber) {
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  if (radioNumber == SX12XX_Radio_2) {
+    return lr1121_hal_get_dio2_edge_sequence();
+  }
+#else
+  (void)radioNumber;
+#endif
+  return lr1121_hal_get_dio1_edge_sequence();
 }
 
 // LittleFS is ESP32-specific, not needed for SiW917
@@ -433,6 +447,7 @@ LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
   rxContinuousActive = false;
   txInProgress = false;
+  txArmDioSequence = 0;
   lastTxStartSuccessful = false;
   autoRxAfterTxArmed = false;
   pwrCurrentLF = 0;
@@ -482,7 +497,7 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
       return false;
   }
 
-  printf("LR2021 port build marker: rx-stage-v186-fe-cal-floor\n");
+  printf("LR2021 port build marker: rx-stage-v216-locked-tlm-slots\n");
 
   hal.IsrCallback_1 = &LR1121Driver::IsrCallback_1;
   hal.IsrCallback_2 = &LR1121Driver::IsrCallback_2;
@@ -541,6 +556,7 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
                           uint8_t _PayloadLength, bool setFSKModulation,
                           uint8_t fskSyncWord1, uint8_t fskSyncWord2,
                           SX12XX_Radio_Number_t radioNumber) {
+  preparedTxValid = false;
 #if SIW917_ELRS_RF_RATE_DIAG
   DBGLN("Config: freq=%u, bw=%d, sf=%d, cr=%d, FSK=%d, Pre=%d, InvIQ=%d, "
         "Payload=%d",
@@ -1815,7 +1831,10 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
 
 #if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
     SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
-  const bool enableAutoRxAfterTx =
+  const bool isK1000 =
+      useFSK && ExpressLRS_currAirRate_Modparams != nullptr &&
+      ExpressLRS_currAirRate_Modparams->enum_rate == RATE_FSK_2G4_1000HZ;
+  const bool enableAutoRxAfterTx = isK1000 &&
 #if SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX_LOCKED_ONLY
       connectionState == connected && RXtimerState == tim_locked;
 #else
@@ -1844,15 +1863,27 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
   }
 #endif
 
-  WORD_ALIGNED_ATTR uint8_t outBuffer[32];
-  codec->encode(outBuffer, data, PayloadLength);
+  WORD_ALIGNED_ATTR uint8_t outBuffer[32] = {};
+  const uint8_t rawPayloadLength =
+      ExpressLRS_currAirRate_Modparams != nullptr
+          ? ExpressLRS_currAirRate_Modparams->PayloadLength
+          : PayloadLength;
+  const bool usePreparedTx =
+      preparedTxValid && preparedTxSourceLength == rawPayloadLength &&
+      memcmp(preparedTxSource, data, rawPayloadLength) == 0;
+  if (usePreparedTx) {
+    memcpy(outBuffer, preparedTxEncoded, PayloadLength);
+  } else {
+    codec->encode(outBuffer, data, PayloadLength);
+  }
+  preparedTxValid = false;
   outBuffer[PayloadLength] = 0;
   outBuffer[PayloadLength + 1] = 0;
   outBuffer[PayloadLength + 2] = 0;
 
-  // Do not let an RX_DONE from the preceding continuous-RX state be treated
-  // as TX_DONE while the auto-RX sequence is being prepared.
-  txInProgress = true;
+  // Keep the telemetry launch path to FIFO + SetTx. The transmitter has
+  // already opened a short receive window for this slot.
+  txInProgress = false;
   rxContinuousActive = false;
 
   bool txCommandsOk = false;
@@ -1869,10 +1900,21 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
     const bool radio1FifoOk = hal.WriteCommandFastRetry(
         LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength,
         SX12XX_Radio_1);
+    if (radio1FifoOk) {
+      // TX_DONE can preempt this function as soon as SetTx is accepted. Arm
+      // before the command so TXnbISR() can clear the state without TXnb()
+      // restoring a stale true value when the command call resumes.
+      txArmDioSequence =
+          siw917Lr2021DioEdgeSequence(SX12XX_Radio_1);
+      txInProgress = true;
+    }
     const bool radio1TxOk =
         radio1FifoOk && hal.WriteCommandFastRetry(
                             LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
                             SX12XX_Radio_1);
+    if (!radio1TxOk) {
+      txInProgress = false;
+    }
     const bool radio2FifoOk = hal.WriteCommandFastRetry(
         LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBufferGemini, PayloadLength,
         SX12XX_Radio_2);
@@ -1885,6 +1927,10 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
   } else {
     const bool fifoOk = hal.WriteCommandFastRetry(
         LR20XX_CMD_WRITE_RADIO_TX_FIFO, outBuffer, PayloadLength, radioNumber);
+    if (fifoOk) {
+      txArmDioSequence = siw917Lr2021DioEdgeSequence(radioNumber);
+      txInProgress = true;
+    }
     txCommandsOk =
         fifoOk && hal.WriteCommandFastRetry(
                       LR20XX_RADIO_SET_TX, outBuffer + PayloadLength, 3,
@@ -2156,6 +2202,26 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::RXnb() {
   SetMode(LR1121_MODE_RX_CONT, SX12XX_Radio_All);
 }
 
+void LR1121Driver::PrepareTxPayload(const uint8_t *data, uint8_t dataLength) {
+#if defined(SIW917_ELRS_LR2021_PREENCODE_TLM) &&                              \
+    SIW917_ELRS_LR2021_PREENCODE_TLM
+  preparedTxValid = false;
+  if (!useFSK || data == nullptr || dataLength == 0U ||
+      dataLength > sizeof(preparedTxSource)) {
+    return;
+  }
+
+  memcpy(preparedTxSource, data, dataLength);
+  preparedTxSourceLength = dataLength;
+  memset(preparedTxEncoded, 0, sizeof(preparedTxEncoded));
+  codec->encode(preparedTxEncoded, preparedTxSource, PayloadLength);
+  preparedTxValid = true;
+#else
+  (void)data;
+  (void)dataLength;
+#endif
+}
+
 void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 LR1121Driver::RXnbFromTxDone() {
   // This is exactly the RX_CONT branch of SetMode(), kept separate so the
@@ -2316,6 +2382,27 @@ bool lr1121_spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
 
 void SIW917_ELRS_RAMFUNC_ATTR
 LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
+#if defined(SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH) &&                     \
+    SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH
+  const uint32_t dioEdgeSequence =
+      siw917Lr2021DioEdgeSequence(radioNumber);
+  const bool freshTxEdge = dioEdgeSequence != instance->txArmDioSequence;
+  const bool useGfskFastTxDone =
+      instance->txInProgress && instance->useFSK && freshTxEdge;
+  if (useGfskFastTxDone) {
+    LR1121_ISR_STAT_INC(isrCallCount);
+    LR1121_ISR_STAT_INC(txDoneCount);
+    LR1121_ISR_STAT_SET(lastIrqStatus, LR1121_IRQ_TX_DONE);
+    instance->processingPacketRadio = radioNumber;
+
+    // Keep the fast path upstream-shaped: deassert the level-held DIO source
+    // before SetRx. This uses the same two commands as the old ordering while
+    // ensuring the next RX_DONE can create a fresh rising edge.
+    instance->ClearIrqStatusMask(LR1121_IRQ_TX_DONE, radioNumber);
+    instance->TXnbISR();
+    return;
+  }
+#endif
 #if SIW917_ELRS_RX_FIRST_TXDONE
   if (instance->txInProgress) {
     LR1121_ISR_STAT_INC(isrCallCount);

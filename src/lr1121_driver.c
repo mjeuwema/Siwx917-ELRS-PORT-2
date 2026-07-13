@@ -408,6 +408,11 @@ static uint8_t selected_radio = LR1121_RADIO_1;
 static inline bool radio2_available(void) { return LR1121_HAS_RADIO2 != 0; }
 static void delay_ms(uint32_t ms);
 static void delay_us(uint32_t us);
+static bool lr1121_send_command_raw_gspi(uint16_t opcode,
+                                         const uint8_t *params,
+                                         uint16_t param_len);
+static bool lr1121_read_response_raw_gspi(uint8_t *response,
+                                          uint16_t response_len);
 
 #if LR1121_HAS_RADIO2
 static uint32_t mcu_hp_pad_selection_bit_for_gpio(uint8_t pin) {
@@ -1170,10 +1175,61 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
-  uint8_t rx[6] = {0};
+  enum {
+    LR20XX_CMD_CLEAR_IRQ = 0x0116U,
+    LR20XX_CMD_GET_AND_CLEAR_IRQ_STATUS = 0x0117U,
+  };
+  if (irq_status != NULL) {
+    uint8_t response[6] = {0};
+    *irq_status = 0U;
+
+    if (!lr1121_wait_busy_fast_timeout(SIW917_ELRS_BUSY_FAST_US) &&
+        !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
+      LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
+      return false;
+    }
+
+    if (!lr1121_send_command_raw_gspi(LR20XX_CMD_GET_AND_CLEAR_IRQ_STATUS,
+                                      NULL, 0)) {
+      LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
+      return false;
+    }
+
+    if (!lr1121_wait_busy_fast_timeout(SIW917_ELRS_BUSY_FAST_US) &&
+        !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
+      LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
+      return false;
+    }
+
+    if (!lr1121_read_response_raw_gspi(response, sizeof(response))) {
+      LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+      lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
+      return false;
+    }
+
+    *irq_status = ((uint32_t)response[2] << 24) |
+                  ((uint32_t)response[3] << 16) |
+                  ((uint32_t)response[4] << 8) | (uint32_t)response[5];
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
+    lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
+#endif
+    return true;
+  }
+
   const uint8_t tx[6] = {
-      0x01U,
-      0x14U,
+      (uint8_t)(LR20XX_CMD_CLEAR_IRQ >> 8),
+      (uint8_t)LR20XX_CMD_CLEAR_IRQ,
       (uint8_t)(clear_mask >> 24),
       (uint8_t)(clear_mask >> 16),
       (uint8_t)(clear_mask >> 8),
@@ -1262,7 +1318,7 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
       break;
     }
 
-    rx[i] = gspi_fifo_read8();
+    (void)gspi_fifo_read8();
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
@@ -1304,10 +1360,6 @@ bool lr1121_clear_irq_status_fast(uint32_t clear_mask, uint32_t *irq_status) {
     return false;
   }
 
-  if (irq_status != NULL) {
-    *irq_status = ((uint32_t)rx[2] << 24) | ((uint32_t)rx[3] << 16) |
-                  ((uint32_t)rx[4] << 8) | (uint32_t)rx[5];
-  }
   return true;
 #endif
 }

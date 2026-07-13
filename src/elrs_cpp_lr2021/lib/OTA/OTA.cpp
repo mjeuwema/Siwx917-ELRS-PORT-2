@@ -522,14 +522,27 @@ bool ICACHE_RAM_ATTR OtaValidatePacketCrcForNonce(OTA_Packet_s * const otaPktPtr
 
 void ICACHE_RAM_ATTR GeneratePacketCrcFull(OTA_Packet_s * const otaPktPtr)
 {
-    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
-    otaPktPtr->full.crc = ota_crc.calc((uint8_t*)otaPktPtr, OTA8_CRC_CALC_LEN, OtaCrcInitializer ^ nonceValidator);
+    OtaGeneratePacketCrcForNonce(otaPktPtr, OtaNonce);
 }
 
 void ICACHE_RAM_ATTR GeneratePacketCrcStd(OTA_Packet_s * const otaPktPtr)
 {
-    uint16_t nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : OtaNonce;
-    uint16_t crc = ota_crc.calc((uint8_t*)otaPktPtr, OTA4_CRC_CALC_LEN, OtaCrcInitializer ^ nonceValidator);
+    OtaGeneratePacketCrcForNonce(otaPktPtr, OtaNonce);
+}
+
+void ICACHE_RAM_ATTR OtaGeneratePacketCrcForNonce(OTA_Packet_s * const otaPktPtr, uint8_t nonce)
+{
+    uint16_t const nonceValidator = (otaPktPtr->std.type == PACKET_TYPE_SYNC) ? 0 : nonce;
+    if (OtaIsFullRes)
+    {
+        otaPktPtr->full.crc = ota_crc.calc((uint8_t*)otaPktPtr, OTA8_CRC_CALC_LEN,
+                                           OtaCrcInitializer ^ nonceValidator);
+        return;
+    }
+
+    otaPktPtr->std.crcHigh = 0;
+    uint16_t const crc = ota_crc.calc((uint8_t*)otaPktPtr, OTA4_CRC_CALC_LEN,
+                                      OtaCrcInitializer ^ nonceValidator);
     otaPktPtr->std.crcHigh = (crc >> 8);
     otaPktPtr->std.crcLow  = crc;
 }

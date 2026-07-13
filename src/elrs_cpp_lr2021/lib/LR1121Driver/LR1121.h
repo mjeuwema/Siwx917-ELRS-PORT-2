@@ -52,6 +52,7 @@ public:
 
   void TXnb(uint8_t *data, bool sendGeminiBuffer, uint8_t *dataGemini,
             SX12XX_Radio_Number_t radioNumber);
+  void PrepareTxPayload(const uint8_t *data, uint8_t dataLength);
   bool LastTxStartSuccessful() const { return lastTxStartSuccessful; }
   void RXnb();
   void RXnbFromTxDone();
@@ -101,6 +102,7 @@ private:
   bool useFSK;
   bool rxContinuousActive;
   volatile bool txInProgress;
+  volatile uint32_t txArmDioSequence;
   volatile bool lastTxStartSuccessful;
   volatile bool autoRxAfterTxArmed;
   bool modeSupportsFei;
@@ -120,6 +122,11 @@ private:
   uint8_t feCalWordCountRadio2;
   lr11xx_RadioOperatingModes_t fallBackMode;
   BufferCodec *codec;
+
+  volatile bool preparedTxValid = false;
+  uint8_t preparedTxSourceLength = 0;
+  WORD_ALIGNED_ATTR uint8_t preparedTxSource[16] = {};
+  WORD_ALIGNED_ATTR uint8_t preparedTxEncoded[32] = {};
 
   WORD_ALIGNED_ATTR uint8_t rx_buf[32] = {};
   WORD_ALIGNED_ATTR uint8_t rx2_buf[32] = {};

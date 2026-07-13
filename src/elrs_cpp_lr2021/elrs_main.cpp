@@ -221,6 +221,7 @@ PFD PFDloop;
 
 // LQ calculation
 LQCALC<100> LQCalc;
+LQCALC<100> LQCalcDVDA;
 uint8_t uplinkLQ = 0;
 
 // Low pass filters
@@ -325,6 +326,13 @@ static uint8_t telemetryBurstCount = 0;
 static uint8_t telemetryBurstMax = 1;
 static bool telemBurstValid = false;
 static bool alreadyTLMresp = false;
+#if SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE
+static volatile bool dvdaTelemetryHopDeferred = false;
+#endif
+#if SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+static volatile bool dvdaTelemetryPrehopped = false;
+static volatile uint8_t dvdaTelemetryPrehopNonce = 0;
+#endif
 static volatile uint32_t telemetryTxCount = 0;
 static volatile uint32_t telemetrySuppressedCount = 0;
 static volatile uint32_t telemetryRcConfirmCount = 0;
@@ -393,6 +401,10 @@ static uint8_t prebuiltTelemetryBurstCount = 0;
 static volatile uint32_t telemetryPrebuildCount = 0;
 static volatile uint32_t telemetryPrebuildHitCount = 0;
 static volatile uint32_t telemetryPrebuildMissCount = 0;
+#else
+static constexpr uint32_t telemetryPrebuildCount = 0;
+static constexpr uint32_t telemetryPrebuildHitCount = 0;
+static constexpr uint32_t telemetryPrebuildMissCount = 0;
 #endif
 #if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
 static WORD_ALIGNED_ATTR OTA_Packet_s deferredTelemetryPacket = {};
@@ -416,6 +428,17 @@ static inline void telemetryExitCritical(uint32_t primask) {
   __asm volatile("msr primask, %0" ::"r"(primask) : "memory");
 }
 #endif
+
+static inline uint32_t lqEnterCritical() {
+  uint32_t primask;
+  __asm volatile("mrs %0, primask" : "=r"(primask));
+  __asm volatile("cpsid i" ::: "memory");
+  return primask;
+}
+
+static inline void lqExitCritical(uint32_t primask) {
+  __asm volatile("msr primask, %0" : : "r"(primask) : "memory");
+}
 
 #if SIW917_ELRS_TLM_TURNAROUND_TRACE
 // Keep this independent from the broad timing diagnostics. It records the
@@ -2327,6 +2350,7 @@ static void ICACHE_RAM_ATTR getRFlinkInfo();
 static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HWtimerCallbackTick();
 static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HWtimerCallbackTock();
 static void ICACHE_RAM_ATTR HandleFHSS();
+static bool ICACHE_RAM_ATTR isTelemetrySlotForNonce(uint8_t nonce);
 static void ICACHE_RAM_ATTR updatePhaseLock();
 static void waitForRecentTockBeforeTimerStop();
 static void armTelemetry150Snapshot(const expresslrs_mod_settings_s *params,
@@ -2850,9 +2874,16 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
           RADIO_TYPE_LR1121_GFSK_900 ||
       ExpressLRS_currAirRate_Modparams->radio_type ==
           RADIO_TYPE_LR1121_GFSK_2G4;
+  // Match upstream's hop behavior for a downlink slot: move to the next
+  // frequency, but do not enter RX immediately before HandleSendDataDl()
+  // changes the radio to TX. LR2021 needs separate SetFrequency and SetRx
+  // commands, so avoiding that redundant SetRx also removes a BUSY
+  // turnaround from the telemetry hot path.
+  const bool telemetrySlot = isTelemetrySlotForNonce(OtaNonce);
   const bool rearmRxAfterHop =
-      SIW917_ELRS_FHSS_SET_FREQ_RX ||
-      (SIW917_ELRS_LR2021_GFSK_HOP_SET_RX && isGfskHopRate);
+      !telemetrySlot &&
+      (SIW917_ELRS_FHSS_SET_FREQ_RX ||
+       (SIW917_ELRS_LR2021_GFSK_HOP_SET_RX && isGfskHopRate));
 
   uint8_t modresultFHSS =
       OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
@@ -2862,6 +2893,13 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
       (connectionState == disconnected)) {
     return;
   }
+
+#if SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+  if (dvdaTelemetryPrehopped && dvdaTelemetryPrehopNonce == OtaNonce) {
+    dvdaTelemetryPrehopped = false;
+    return;
+  }
+#endif
 
   if (isDualRadio() && geminiMode) {
     if (FHSSuseDualBand) {
@@ -2886,6 +2924,13 @@ static void ICACHE_RAM_ATTR HandleFHSS() {
                             rearmRxAfterHop);
     }
   } else {
+#if SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE
+    if (telemetrySlot && isGfskHopRate &&
+        ExpressLRS_currAirRate_Modparams->numOfSends > 1U) {
+      dvdaTelemetryHopDeferred = true;
+      return;
+    }
+#endif
     Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All,
                           rearmRxAfterHop);
   }
@@ -2898,16 +2943,67 @@ static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HWtimerCallbackTick() {
   }
 #endif
 
-  uplinkLQ = LQCalc.getLQ();
+  const uint32_t lqPrimask = lqEnterCritical();
+  const uint8_t numOfSends =
+      ExpressLRS_currAirRate_Modparams != nullptr
+          ? ExpressLRS_currAirRate_Modparams->numOfSends
+          : 1U;
+  if (numOfSends == 1U) {
+    uplinkLQ = LQCalc.getLQ();
+  } else if (!((uint8_t)(OtaNonce - 1U) % numOfSends)) {
+    uplinkLQ = LQCalcDVDA.getLQ();
+    LQCalcDVDA.inc();
+  }
   linkStats.uplink_Link_quality = uplinkLQ;
   if (!alreadyTLMresp) {
     LQCalc.inc();
   }
   alreadyTLMresp = false;
+  lqExitCritical(lqPrimask);
 }
+
+#if SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+static void ICACHE_RAM_ATTR MaybePrehopDvdaTelemetry() {
+  const expresslrs_mod_settings_s *const params =
+      ExpressLRS_currAirRate_Modparams;
+  if (params == nullptr || params->numOfSends <= 1U || !isGfskRate(params) ||
+      params->FHSShopInterval == 0U || ExpressLRS_currTlmDenom == 1U ||
+      connectionState != connected || RXtimerState != tim_locked ||
+      !teamraceHasModelMatch || isDualRadio() || dvdaTelemetryPrehopped) {
+    return;
+  }
+
+  const uint8_t targetNonce = (uint8_t)(OtaNonce + 1U);
+  if ((targetNonce % ExpressLRS_currTlmDenom) != 0U ||
+      (targetNonce % params->FHSShopInterval) != 0U) {
+    return;
+  }
+
+  Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
+  dvdaTelemetryPrehopNonce = targetNonce;
+  dvdaTelemetryPrehopped = true;
+}
+#else
+static void ICACHE_RAM_ATTR MaybePrehopDvdaTelemetry() {}
+#endif
 
 static void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR HWtimerCallbackTock() {
   PFDloop.intEvent(hwTimer::eventMicros());
+
+  const uint8_t numOfSends =
+      ExpressLRS_currAirRate_Modparams != nullptr
+          ? ExpressLRS_currAirRate_Modparams->numOfSends
+          : 1U;
+  if (numOfSends > 1U && (OtaNonce % numOfSends) == 0U) {
+    const uint32_t lqPrimask = lqEnterCritical();
+    const bool dvdaFrameAvailable = LQCalcDVDA.currentIsSet();
+    lqExitCritical(lqPrimask);
+    if (dvdaFrameAvailable && connectionHasModelMatch &&
+        teamraceHasModelMatch && channelCallback) {
+      channelCallback(ChannelData, CRSF_NUM_CHANNELS);
+    }
+  }
+
   OtaNonce++;
   HandleFHSS();
   if (HandleSendDataDl()) {
@@ -2935,6 +3031,9 @@ static void waitForRecentTockBeforeTimerStop() {
 
 static void ICACHE_RAM_ATTR TentativeConnection(unsigned long now) {
   PFDloop.reset();
+#if SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+  dvdaTelemetryPrehopped = false;
+#endif
   setConnectionState(tentative);
   connectionHasModelMatch = false;
   resetTeamraceModelMatch();
@@ -2972,6 +3071,12 @@ static void ResetDownlinkTelemetryStateAfterLoss() {
   telemetryBurstCount = 0;
   telemBurstValid = false;
   alreadyTLMresp = false;
+#if SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE
+  dvdaTelemetryHopDeferred = false;
+#endif
+#if SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+  dvdaTelemetryPrehopped = false;
+#endif
   telemetryLastRcConfirm = false;
   telemetryLastDataUlAck = false;
 #if SIW917_ELRS_DEFER_TLM_TX_FROM_TIMER
@@ -3061,6 +3166,7 @@ static void LostConnection(bool resumeRx) {
   connectionHasModelMatch = false;
   resetTeamraceModelMatch();
   LQCalc.reset();
+  LQCalcDVDA.reset();
   LPF_Offset.init(0);
   LPF_OffsetDx.init(0);
   alreadyTLMresp = false;
@@ -3359,6 +3465,9 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
   bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData);
   const bool previousTelemetryConfirmValue = telemetryLastRcConfirm;
   noteDecodedUplinkTxPower();
+  const uint8_t senderStateBefore = TelemetrySender.GetState();
+  const uint8_t senderPackageBefore = TelemetrySender.GetCurrentPackage();
+  const uint8_t senderOffsetBefore = TelemetrySender.GetCurrentOffset();
   TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
   telemetryRcConfirmSeenCount++;
   if (telemetryConfirmValue != previousTelemetryConfirmValue) {
@@ -3368,10 +3477,29 @@ ProcessRfPacket_RC(OTA_Packet_s const *const otaPktPtr) {
   if (telemetryConfirmValue) {
     telemetryRcConfirmCount++;
   }
-  InvalidatePrebuiltTelemetry();
+  // A repeated RC packet usually leaves the stubborn sender on the same
+  // payload. Keep the nonce-specific prebuilt downlink in that case; throwing
+  // it away on every repetition moves packet construction back into DK500's
+  // 1 ms telemetry slot. An accepted ACK changes this fingerprint and must
+  // invalidate the cached payload.
+  if (senderStateBefore != TelemetrySender.GetState() ||
+      senderPackageBefore != TelemetrySender.GetCurrentPackage() ||
+      senderOffsetBefore != TelemetrySender.GetCurrentOffset()) {
+    InvalidatePrebuiltTelemetry();
+  }
 
   const bool shouldForwardChannels = updateTeamraceModelMatch();
-  if (connectionHasModelMatch && shouldForwardChannels && channelCallback) {
+  const bool isDvda = ExpressLRS_currAirRate_Modparams != nullptr &&
+                      ExpressLRS_currAirRate_Modparams->numOfSends > 1U;
+  if (isDvda) {
+    const uint32_t lqPrimask = lqEnterCritical();
+    if (!LQCalcDVDA.currentIsSet()) {
+      LQCalcDVDA.add();
+    }
+    lqExitCritical(lqPrimask);
+  }
+  if (!isDvda && connectionHasModelMatch && shouldForwardChannels &&
+      channelCallback) {
     channelCallback(ChannelData, CRSF_NUM_CHANNELS);
   }
 }
@@ -4214,7 +4342,9 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   Radio.GetLastPacketStats();
 #endif
   getRFlinkInfo();
+  const uint32_t lqPrimask = lqEnterCritical();
   LQCalc.add();
+  lqExitCritical(lqPrimask);
   RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow;
 
   return true;
@@ -4225,7 +4355,10 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
 //=============================================================================
 static bool SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
 RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
-  if (LQCalc.currentIsSet() && connectionState == connected) {
+  const uint32_t lqPrimask = lqEnterCritical();
+  const bool lqCurrentIsSet = LQCalc.currentIsSet();
+  lqExitCritical(lqPrimask);
+  if (lqCurrentIsSet && connectionState == connected) {
     ELRS_PACKET_STAT_INC(rxLqCurrentSetSkipCount);
 #if SIW917_ELRS_TLM_TURNAROUND_TRACE
     if (tlmTurnAwaitingRx) {
@@ -4264,6 +4397,7 @@ RXdoneISR(SX12xxDriverCommon::rx_status rxStatus) {
       telemetryStaleRxReported = 0;
     }
 #endif
+    MaybePrehopDvdaTelemetry();
     if (doStartTimer) {
       doStartTimer = false;
       bool deliverImmediateTock = true;
@@ -4300,6 +4434,12 @@ TXdoneISRCommon(bool forceManualRx) {
   const uint32_t txDoneUs = micros();
   telemetryTxDoneUs = txDoneUs;
   telemetryTxToDoneUs = txDoneUs - telemetryTxStartUs;
+#endif
+#if SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE
+  if (dvdaTelemetryHopDeferred) {
+    dvdaTelemetryHopDeferred = false;
+    Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_All, false);
+  }
 #endif
 #if defined(SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX) &&                            \
     SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
@@ -4772,17 +4912,17 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
 }
 
 static bool ICACHE_RAM_ATTR isTelemetrySlotForNonce(uint8_t nonce) {
-  return (connectionState != disconnected) && (ExpressLRS_currTlmDenom != 1) &&
-         !alreadyTLMresp && teamraceHasModelMatch &&
+  // Keep acquisition receive-only until the ELRS timer is genuinely locked.
+  // This also keeps FHSS re-arm and telemetry launch on the same slot decision.
+  return (connectionState == connected) && (RXtimerState == tim_locked) &&
+         (ExpressLRS_currTlmDenom != 1) && !alreadyTLMresp &&
+         teamraceHasModelMatch &&
          ((nonce % ExpressLRS_currTlmDenom) == 0);
 }
 
 static void ICACHE_RAM_ATTR GenerateTelemetryPacketCrcForNonce(OTA_Packet_s *pkt,
                                                                uint8_t nonce) {
-  const uint8_t savedNonce = OtaNonce;
-  OtaNonce = nonce;
-  OtaGeneratePacketCrc(pkt);
-  OtaNonce = savedNonce;
+  OtaGeneratePacketCrcForNonce(pkt, nonce);
 }
 
 static bool ICACHE_RAM_ATTR shouldSendGeminiTelemetry() {
@@ -4937,6 +5077,18 @@ BuildTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
     }
   }
 
+#if SIW917_ELRS_LR2021_DVDA_NONCE_FREE_TLM_PROBE
+  const expresslrs_mod_settings_s *const probeParams =
+      ExpressLRS_currAirRate_Modparams;
+  if (probeParams != nullptr && probeParams->numOfSends > 1U &&
+      isGfskRate(probeParams)) {
+    otaPkt->std.type = PACKET_TYPE_SYNC;
+    if (useGemini) {
+      otaPktGemini->std.type = PACKET_TYPE_SYNC;
+    }
+  }
+#endif
+
   GenerateTelemetryPacketCrcForNonce(otaPkt, nonce);
   if (useGemini) {
     GenerateTelemetryPacketCrcForNonce(otaPktGemini, nonce);
@@ -5023,6 +5175,16 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
   const SX12XX_Radio_Number_t transmittingRadio =
       isRxTelemetryForcedOff() ? SX12XX_Radio_NONE : SX12XX_Radio_All;
 
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+  // TX_DONE may preempt Radio.TXnb() before it returns. Arm first so the ISR
+  // clears the live transaction; arming after the call can resurrect a stale
+  // pending flag after the radio has already returned to RX.
+  if (transmittingRadio != SX12XX_Radio_NONE) {
+    lr2021TelemetryTxStartUs = micros();
+    lr2021TelemetryTxPending = 1;
+  }
+#endif
+
   if (sendGeminiBuffer && otaPktGemini) {
     const bool swapGemini =
         ExpressLRS_currAirRate_Modparams &&
@@ -5059,8 +5221,6 @@ SendTelemetryPacket(OTA_Packet_s *otaPkt, OTA_Packet_s *otaPktGemini,
     }
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
     lr2021TelemetryTxRfCount++;
-    lr2021TelemetryTxStartUs = micros();
-    lr2021TelemetryTxPending = 1;
 #endif
   }
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
@@ -5555,6 +5715,15 @@ static void ICACHE_RAM_ATTR InvalidatePrebuiltTelemetry() {
 }
 
 static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {
+  const expresslrs_mod_settings_s *const params =
+      ExpressLRS_currAirRate_Modparams;
+  // LR2021 needs the launch headroom on repeated GFSK modes. Keep the proven
+  // K1000 and LoRa paths unchanged until DVDA downlink timing is established.
+  if (params == nullptr || params->numOfSends <= 1U || !isGfskRate(params)) {
+    prebuiltTelemetryValid = false;
+    return;
+  }
+
   const uint8_t targetNonce = (uint8_t)(OtaNonce + 1U);
 
   if (!isTelemetrySlotForNonce(targetNonce)) {
@@ -5572,6 +5741,11 @@ static void ICACHE_RAM_ATTR PrepareTelemetryForNextTock() {
                            &prebuiltTelemetryPayload, targetNonce,
                            &prebuiltNextTelemetryType,
                            &prebuiltTelemetryBurstCount)) {
+#if SIW917_ELRS_LR2021_PREENCODE_TLM
+    Radio.PrepareTxPayload(
+        reinterpret_cast<const uint8_t *>(&prebuiltTelemetryPacket),
+        params->PayloadLength);
+#endif
     prebuiltTelemetryNonce = targetNonce;
     prebuiltTelemetryValid = true;
     telemetryPrebuildCount++;
@@ -5875,6 +6049,7 @@ static void cycleRfMode() {
 #endif
     SetRFLinkRate(currentScanIndex, false);
     LQCalc.reset100();
+    LQCalcDVDA.reset100();
 
     do {
       scanIndex = (scanIndex + 1) % RATE_MAX;
@@ -6228,6 +6403,59 @@ void elrs_loop(void) {
 
   ServiceLr2021TxDoneWatchdog();
   maybeReportTelemetryGap(now);
+
+  // One deferred snapshot for DVDA rates. Keep all formatting out of the RF
+  // callbacks so diagnosing a missing downlink does not perturb slot timing.
+  static uint32_t dvdaSnapshotStartMs = 0;
+  static bool dvdaSnapshotPrinted = false;
+  const expresslrs_mod_settings_s *const dvdaParams =
+      ExpressLRS_currAirRate_Modparams;
+  const bool dvdaConnected =
+      connectionState == connected && dvdaParams != nullptr &&
+      dvdaParams->numOfSends > 1U && isGfskRate(dvdaParams);
+  if (!dvdaConnected) {
+    dvdaSnapshotStartMs = 0;
+    dvdaSnapshotPrinted = false;
+  } else {
+    if (dvdaSnapshotStartMs == 0U) {
+      dvdaSnapshotStartMs = now;
+    } else if (!dvdaSnapshotPrinted &&
+               (uint32_t)(now - dvdaSnapshotStartMs) >= 2000U) {
+      dvdaSnapshotPrinted = true;
+      printf("[DVDA_TLM] rate:%u sends:%u den:%u nonce:%u fhss:%u "
+             "conn:%d rxst:%d mm:%u tr:%u resp:%u tx:%lu ls:%lu data:%lu "
+             "fail:%lu supp:%lu active:%u st:%u wait:%u/%u lq:%u/%u "
+             "dvda:%u/%u pre:%lu/%lu/%lu pend:%u wd:%lu/%lu freq:%lu\n",
+             (unsigned)dvdaParams->index, (unsigned)dvdaParams->numOfSends,
+             (unsigned)ExpressLRS_currTlmDenom, (unsigned)OtaNonce,
+             (unsigned)FHSSgetCurrIndex(), connectionState, RXtimerState,
+             connectionHasModelMatch ? 1U : 0U,
+             teamraceHasModelMatch ? 1U : 0U, alreadyTLMresp ? 1U : 0U,
+             (unsigned long)telemetryTxCount,
+             (unsigned long)telemetryLinkStatsDlCount,
+             (unsigned long)telemetryDataDlCount,
+             (unsigned long)telemetryDispatchFailCount,
+             (unsigned long)telemetrySuppressedCount,
+             TelemetrySender.IsActive() ? 1U : 0U,
+             (unsigned)TelemetrySender.GetState(),
+             (unsigned)TelemetrySender.GetWaitCount(),
+             (unsigned)TelemetrySender.GetMaxPacketsBeforeResync(),
+             (unsigned)LQCalc.getLQRaw(), (unsigned)LQCalc.getCount(),
+             (unsigned)LQCalcDVDA.getLQRaw(),
+             (unsigned)LQCalcDVDA.getCount(),
+             (unsigned long)telemetryPrebuildCount,
+             (unsigned long)telemetryPrebuildHitCount,
+             (unsigned long)telemetryPrebuildMissCount,
+#if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
+             (unsigned)lr2021TelemetryTxPending,
+             (unsigned long)lr2021TelemetryTxWatchdogCount,
+             (unsigned long)lr2021TelemetryTxWatchdogIrqCount,
+#else
+             0U, 0UL, 0UL,
+#endif
+             (unsigned long)Radio.currFreq);
+    }
+  }
 
   if (do_packet_dump) {
     do_packet_dump = false;

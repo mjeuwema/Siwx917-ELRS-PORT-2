@@ -777,6 +777,10 @@ static volatile uint32_t dio1_last_edge_us = 0;
 static volatile uint32_t dio1_last_deferred_us = 0;
 static volatile uint32_t dio2_last_edge_us = 0;
 static volatile uint32_t dio2_last_deferred_us = 0;
+// Correctness state, not diagnostics: distinguishes a fresh radio edge from a
+// stale software-pending stage IRQ when telemetry TX is armed.
+static volatile uint32_t dio1_edge_sequence = 0;
+static volatile uint32_t dio2_edge_sequence = 0;
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static volatile bool dio1_stage_irq_installed = false;
 static volatile uint32_t dio1_stage_irq_count = 0;
@@ -851,12 +855,28 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   SIW917_DIO_STAT_INC(dio1_stage_irq_count);
 
   const bool dio1WasPending = dio1_isr_pending;
-  bool dio1Seen = dio1WasPending || (lr1121_dio1_read() != 0);
+  bool dio1Seen = lr1121_dio1_read() != 0;
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
   const bool dio2WasPending = dio2_isr_pending;
-  bool dio2Seen = dio2WasPending || (lr1121_dio2_read() != 0);
+  bool dio2Seen = lr1121_dio2_read() != 0;
 #else
   constexpr bool dio2Seen = false;
+#endif
+
+  // LR2021 DIO is level-held until its routed IRQ is cleared. A pending stage
+  // bit with a low pin therefore represents an already-serviced edge. Do not
+  // let it enter the driver later and masquerade as the next TX_DONE.
+  if (dio1WasPending && !dio1Seen) {
+    dio1_isr_pending = false;
+    isr_1_pending = false;
+    lr1121_dio1_resume_isr();
+  }
+#if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  if (dio2WasPending && !dio2Seen) {
+    dio2_isr_pending = false;
+    isr_2_pending = false;
+    lr1121_dio2_resume_isr();
+  }
 #endif
 
 #if SIW917_ELRS_DIO_EDGE_TIMESTAMPS
@@ -1022,6 +1042,14 @@ extern "C" uint32_t lr1121_hal_get_last_dio1_edge_us(void) {
   return dio1_last_edge_us;
 }
 
+extern "C" uint32_t lr1121_hal_get_dio1_edge_sequence(void) {
+  return dio1_edge_sequence;
+}
+
+extern "C" uint32_t lr1121_hal_get_dio2_edge_sequence(void) {
+  return dio2_edge_sequence;
+}
+
 extern "C" uint32_t lr1121_hal_get_last_deferred_us(void) {
   return dio1_last_deferred_us;
 }
@@ -1063,6 +1091,7 @@ extern "C" uint32_t lr1121_hal_get_deferred_max_us(void) {
 }
 
 void LR1121Hal::dioISR_1() {
+  dio1_edge_sequence++;
   SIW917_DIO_TIMESTAMP(dio1_last_edge_us);
   SIW917_DIO_STAT_INC(isr_1_total_count);
 
@@ -1155,6 +1184,11 @@ void LR1121Hal::dioISR_1() {
 // Called from elrs_loop() to process deferred radio IRQ interrupts safely
 void LR1121Hal::handleDeferredISR() {
   const bool dio1High = lr1121_dio1_read() != 0;
+  if (dio1_isr_pending && !dio1High) {
+    dio1_isr_pending = false;
+    isr_1_pending = false;
+    lr1121_dio1_resume_isr();
+  }
   if (dio1_isr_pending || dio1High) {
     SIW917_DIO_TIMESTAMP(dio1_last_deferred_us);
   }
@@ -1229,6 +1263,7 @@ void LR1121Hal::handleDeferredISR() {
 
 void LR1121Hal::dioISR_2() {
 #if SIW917_ELRS_UPSTREAM_DUAL_RADIO
+  dio2_edge_sequence++;
   SIW917_DIO_TIMESTAMP(dio2_last_edge_us);
   SIW917_DIO_STAT_INC(isr_2_pending_count);
 

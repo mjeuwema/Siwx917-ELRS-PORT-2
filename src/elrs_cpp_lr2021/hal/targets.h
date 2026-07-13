@@ -81,15 +81,37 @@
 #define SIW917_ELRS_TLM_GAP_PERIOD_MS 0
 #endif
 #ifndef SIW917_ELRS_PREBUILD_TLM_PACKET
+// Keep telemetry construction in the ELRS tock path. This matches upstream
+// and avoids publishing a nonce-specific DVDA packet from main-loop context.
 #define SIW917_ELRS_PREBUILD_TLM_PACKET 0
+#endif
+#ifndef SIW917_ELRS_LR2021_PREENCODE_TLM
+// Upstream encodes the final packet in TXnb. Keep DK500 on that same path so
+// the encoded bytes and the live OtaNonce can never come from different slots.
+#define SIW917_ELRS_LR2021_PREENCODE_TLM 0
+#endif
+#ifndef SIW917_ELRS_LR2021_DVDA_PREHOP_TLM
+// Pre-hopping after RX_DONE made the previously working DK250 downlink
+// invisible in v207. Preserve upstream's at-tock FHSS ordering.
+#define SIW917_ELRS_LR2021_DVDA_PREHOP_TLM 0
+#endif
+#ifndef SIW917_ELRS_LR2021_DVDA_NONCE_FREE_TLM_PROBE
+// Diagnostic only: classify DVDA downlinks as SYNC so the OTA CRC does not
+// include OtaNonce. The TX records a valid downlink before payload dispatch,
+// cleanly separating nonce-phase failures from RF/PHY failures.
+#define SIW917_ELRS_LR2021_DVDA_NONCE_FREE_TLM_PROBE 0
+#endif
+#ifndef SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE
+// Diagnostic only: send DVDA telemetry on the completed uplink frequency,
+// then advance FHSS at TX_DONE before returning to RX.
+#define SIW917_ELRS_LR2021_DVDA_DEFER_TLM_HOP_PROBE 0
 #endif
 #ifndef SIW917_ELRS_LR2021_FORCE_RF_TLM
 #define SIW917_ELRS_LR2021_FORCE_RF_TLM 1
 #endif
 #ifndef SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX
-// SetAutoRxTx does not produce any RX IRQs on the Core2021-XF in the ELRS
-// continuous-RX/FHSS flow. Keep the proven explicit TX_DONE -> SetRx path
-// active while the hardware-auto sequence remains isolated for investigation.
+// Hardware AutoRxTx does not preserve the LR2021 continuous-RX/FHSS flow:
+// v192 repeatedly relocked with zero LQ. Keep explicit TX_DONE -> SetRx.
 #define SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX 0
 #endif
 #ifndef SIW917_ELRS_LR2021_AUTO_RX_AFTER_TX_LOCKED_ONLY
@@ -105,9 +127,8 @@
 #define SIW917_ELRS_LR2021_RX_TX_FALLBACK_FS 1
 #endif
 #ifndef SIW917_ELRS_LR2021_TLM_AFTER_TIMER_LOCK
-// Match upstream RX behavior: telemetry slots are valid once the receiver is
-// out of disconnected state. Gating LR2021 downlink until tim_locked can leave
-// the TX with no telemetry during long tentative/settling periods.
+// The shared telemetry-slot predicate now matches the working LR1121 path and
+// requires tim_locked. Keep this legacy secondary gate disabled.
 #define SIW917_ELRS_LR2021_TLM_AFTER_TIMER_LOCK 0
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_TLM_BEFORE_TIMER_LOCK
@@ -189,10 +210,20 @@
 #define SIW917_ELRS_LR2021_FORCE_LORA_DETECTOR_DISABLE 0
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_DETECT_ON_SYNCWORD
+// K1000 acquisition was proven with the LR11xx-compatible 8-bit detector in
+// v105-v142. Syncword-only detection produced no tentative lock in v104/v187.
 #define SIW917_ELRS_LR2021_GFSK_DETECT_ON_SYNCWORD 0
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_SET_WHITENING_PARAMS
-#define SIW917_ELRS_LR2021_GFSK_SET_WHITENING_PARAMS 1
+// Preserve the LR2021 reset/default whitening parameters. Explicitly writing
+// type=LR11xx, seed=0x01FF eliminated K1000 acquisition in v103 and v122.
+#define SIW917_ELRS_LR2021_GFSK_SET_WHITENING_PARAMS 0
+#endif
+#ifndef SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH
+// GFSK needs the shortest TX-to-RX handoff at dense telemetry ratios. TX state
+// is armed immediately before SetTx so an early TX_DONE cannot race the launch
+// bookkeeping, and the ISR clears the IRQ before returning the radio to RX.
+#define SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH 1
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_SKIP_IMMEDIATE_TOCK
 #define SIW917_ELRS_LR2021_GFSK_SKIP_IMMEDIATE_TOCK 0
@@ -210,7 +241,10 @@
 #define SIW917_ELRS_LR2021_GFSK_CONNECTED_NONCE_RESYNC_MAX_DELTA 16
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_SOFT_SYNC_RESYNC
-#define SIW917_ELRS_LR2021_GFSK_SOFT_SYNC_RESYNC 1
+// Match upstream ELRS: a mismatched connected SYNC must pass through
+// TentativeConnection() so nonce/FHSS and the receiver timer are realigned
+// together. Updating nonce/FHSS alone can leave downlink slots out of phase.
+#define SIW917_ELRS_LR2021_GFSK_SOFT_SYNC_RESYNC 0
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_RESYNC_ADJUST_FHSS
 #define SIW917_ELRS_LR2021_GFSK_RESYNC_ADJUST_FHSS 1
