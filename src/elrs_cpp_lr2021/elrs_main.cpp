@@ -99,6 +99,11 @@ void lr1121_tlm_miss_irq_trace_latch(
 void lr1121_get_isr_stats(uint32_t *isr_count, uint32_t *rx_count,
                           uint32_t *tx_count, uint32_t *other_count,
                           uint32_t *last_irq);
+void lr1121_get_sf5_stage_stats(uint32_t *rx_done, uint32_t *with_fifo,
+                                uint32_t *without_fifo);
+void lr1121_get_sf5_raw_scan_stats(
+    uint32_t *sync_matches, uint32_t *any_matches, uint8_t *sync_offset,
+    uint8_t *any_offset, uint8_t *any_nonce, uint8_t *any_type);
 void lr1121_get_radio_isr_stats(uint32_t *isr_1, uint32_t *isr_2,
                                 uint32_t *rx_1, uint32_t *rx_2);
 bool lr1121_get_status(uint8_t *stat1, uint8_t *stat2, uint8_t *irq_status);
@@ -130,6 +135,7 @@ void elrs_enter_binding_mode(void);
 #define ELRS_DIAG_PERIODIC_STATS SIW917_ELRS_DISCONNECTED_SCAN_DIAG
 #define ELRS_DIAG_RF_RATE_LOG SIW917_ELRS_RF_RATE_DIAG
 #define ELRS_DIAG_SCAN_TRACE SIW917_ELRS_LR2021_SCAN_TRACE
+#define ELRS_DIAG_SF5_SCAN SIW917_ELRS_LR2021_SF5_SCAN_DIAG
 #define ELRS_DIAG_PERIODIC_STATS_WHEN_CONNECTED 0
 #define ELRS_DIAG_PRINT_AFTER_LOSS 0
 #define ELRS_DIAG_LOSS_PACKET_STATS 1
@@ -3612,7 +3618,7 @@ static volatile uint32_t crcNonceDiagMissCount = 0;
 static uint8_t gfskNonceResyncLogCount = 0;
 static volatile uint8_t gfskCrcFailDiagCount = 0;
 
-#if ELRS_DIAG_SCAN_TRACE
+#if ELRS_DIAG_SCAN_TRACE || ELRS_DIAG_SF5_SCAN
 static volatile uint32_t scanCrcRejectCount = 0;
 static volatile uint8_t scanCrcRejectRate = 0xFF;
 static volatile uint8_t scanCrcRejectType = 0xFF;
@@ -4134,7 +4140,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
     memcpy(&rawOtaPacket, otaPktPtr, sizeof(rawOtaPacket));
   }
 
-#if ELRS_DIAG_SCAN_TRACE
+#if ELRS_DIAG_SCAN_TRACE || ELRS_DIAG_SF5_SCAN
   uint8_t scanRawLen = 0;
   uint8_t scanRawBytes[13] = {};
   if (connectionState == disconnected) {
@@ -4224,7 +4230,7 @@ ProcessRFPacket(SX12xxDriverCommon::rx_status const status) {
   if (!crcValid) {
     ELRS_PACKET_STAT_INC(crcFailCount);
     ELRS_PACKET_STAT_INC(crcFailTypeCount[type]);
-#if ELRS_DIAG_SCAN_TRACE
+#if ELRS_DIAG_SCAN_TRACE || ELRS_DIAG_SF5_SCAN
     if (connectionState == disconnected) {
       scanCrcRejectRate =
           ExpressLRS_currAirRate_Modparams != nullptr
@@ -4662,6 +4668,161 @@ static inline bool isGfskRate(const expresslrs_mod_settings_s *params) {
           params->radio_type == RADIO_TYPE_LR1121_GFSK_2G4);
 }
 
+#if ELRS_DIAG_SF5_SCAN
+static bool sf5ScanDiagIsRate(const expresslrs_mod_settings_s *params) {
+  return params != nullptr &&
+         (params->enum_rate == RATE_LORA_900_250HZ ||
+          params->enum_rate == RATE_LORA_900_200HZ_8CH);
+}
+
+static bool sf5ScanDiagActive = false;
+static uint32_t sf5ScanDiagStartMs = 0;
+static uint32_t sf5ScanDiagIsrBase = 0;
+static uint32_t sf5ScanDiagRxIrqBase = 0;
+static uint32_t sf5ScanDiagOtherIrqBase = 0;
+static uint32_t sf5ScanDiagPassBase = 0;
+static uint32_t sf5ScanDiagFailBase = 0;
+static uint32_t sf5ScanDiagRejectBase = 0;
+static uint32_t sf5ScanDiagRxDoneStageBase = 0;
+static uint32_t sf5ScanDiagRxDoneWithFifoBase = 0;
+static uint32_t sf5ScanDiagRxDoneWithoutFifoBase = 0;
+static uint32_t sf5ScanDiagRawSyncBase = 0;
+static uint32_t sf5ScanDiagRawAnyBase = 0;
+
+static void sf5ScanDiagEnter(const expresslrs_mod_settings_s *params,
+                             uint32_t initialFreq, bool bindMode) {
+  sf5ScanDiagActive = sf5ScanDiagIsRate(params) && !bindMode;
+  if (!sf5ScanDiagActive) {
+    return;
+  }
+
+  uint32_t txIrq = 0;
+  uint32_t lastIrq = 0;
+  lr1121_get_isr_stats(&sf5ScanDiagIsrBase, &sf5ScanDiagRxIrqBase, &txIrq,
+                       &sf5ScanDiagOtherIrqBase, &lastIrq);
+  sf5ScanDiagStartMs = millis();
+  sf5ScanDiagPassBase = crcPassCount;
+  sf5ScanDiagFailBase = crcFailCount;
+  sf5ScanDiagRejectBase = scanCrcRejectCount;
+  lr1121_get_sf5_stage_stats(&sf5ScanDiagRxDoneStageBase,
+                             &sf5ScanDiagRxDoneWithFifoBase,
+                             &sf5ScanDiagRxDoneWithoutFifoBase);
+  lr1121_get_sf5_raw_scan_stats(&sf5ScanDiagRawSyncBase,
+                                &sf5ScanDiagRawAnyBase, nullptr, nullptr,
+                                nullptr, nullptr);
+
+  const uint8_t packetType = Radio.GetPacketType(SX12XX_Radio_1);
+  printf("[SF5SCAN] enter idx:%u enum:%u sf:%u bw:%u cr:%u pre:%u pay:%u "
+         "int:%lu hop:%u freq:%lu ptype:%02X compat:%u sync:%u/%04X\n",
+         (unsigned)params->index, (unsigned)params->enum_rate,
+         (unsigned)params->sf, (unsigned)params->bw, (unsigned)params->cr,
+         (unsigned)params->PreambleLen, (unsigned)params->PayloadLength,
+         (unsigned long)params->interval, (unsigned)params->FHSShopInterval,
+         (unsigned long)initialFreq, (unsigned)packetType,
+         (unsigned)SIW917_ELRS_LR2021_LORA_SF5_SX1276_COMPAT,
+         (unsigned)Radio.GetLoRaSyncModeDiag(),
+         (unsigned)Radio.GetLoRaSyncCommandStatusDiag());
+}
+
+static void sf5ScanDiagExit(const expresslrs_mod_settings_s *params) {
+  if (!sf5ScanDiagActive || !sf5ScanDiagIsRate(params)) {
+    sf5ScanDiagActive = false;
+    return;
+  }
+
+  uint16_t rxTotal = 0;
+  uint16_t crcError = 0;
+  uint16_t headerError = 0;
+  uint16_t headerValid = 0;
+  uint16_t falseSync = 0;
+  Radio.GetLoRaRxStats(SX12XX_Radio_1, &rxTotal, &crcError, &headerError,
+                       &headerValid, &falseSync);
+  lr2021_lora_packet_status_diag_t packetStatus = {};
+  Radio.GetLoRaPacketStatusDiag(SX12XX_Radio_1, &packetStatus);
+  const uint32_t compatibilityConfig =
+      Radio.GetLoRaCompatibilityConfigDiag(SX12XX_Radio_1);
+  const uint32_t pendingIrq = Radio.PeekIrqStatus(SX12XX_Radio_1);
+  const uint16_t deviceErrors = Radio.GetErrors(SX12XX_Radio_1);
+
+  uint32_t isrCount = 0;
+  uint32_t rxIrqCount = 0;
+  uint32_t txIrqCount = 0;
+  uint32_t otherIrqCount = 0;
+  uint32_t lastIrq = 0;
+  lr1121_get_isr_stats(&isrCount, &rxIrqCount, &txIrqCount, &otherIrqCount,
+                       &lastIrq);
+  uint32_t rxDoneStageCount = 0;
+  uint32_t rxDoneWithFifoCount = 0;
+  uint32_t rxDoneWithoutFifoCount = 0;
+  lr1121_get_sf5_stage_stats(&rxDoneStageCount, &rxDoneWithFifoCount,
+                             &rxDoneWithoutFifoCount);
+  uint32_t rawSyncMatchCount = 0;
+  uint32_t rawAnyMatchCount = 0;
+  uint8_t rawSyncOffset = 0xFF;
+  uint8_t rawAnyOffset = 0xFF;
+  uint8_t rawAnyNonce = 0xFF;
+  uint8_t rawAnyType = 0xFF;
+  lr1121_get_sf5_raw_scan_stats(
+      &rawSyncMatchCount, &rawAnyMatchCount, &rawSyncOffset, &rawAnyOffset,
+      &rawAnyNonce, &rawAnyType);
+
+  uint8_t rejectBytes[13] = {};
+  const bool rejectFromThisRate = scanCrcRejectRate == params->index;
+  if (rejectFromThisRate) {
+    for (uint8_t i = 0; i < sizeof(rejectBytes); ++i) {
+      rejectBytes[i] = scanCrcRejectBytes[i];
+    }
+  }
+
+  printf("[SF5SCAN] exit idx:%u ms:%lu hw:%u/%u/%u/%u/%u "
+         "irq:%lu/%lu/%lu last:%08lX pend:%08lX dio:%u "
+         "pst:%04X/%u/%u/%u/%d/%u/%u/%u/%ld cfg:%08lX err:%04X "
+         "ota:%lu/%lu rej:%lu stage:%lu/%lu/%lu "
+         "raw:%lu/%lu/%u/%u/%u/%u type:%u len:%u "
+         "data:%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+         (unsigned)params->index,
+         (unsigned long)(millis() - sf5ScanDiagStartMs), (unsigned)rxTotal,
+         (unsigned)crcError, (unsigned)headerError, (unsigned)headerValid,
+         (unsigned)falseSync,
+         (unsigned long)(isrCount - sf5ScanDiagIsrBase),
+         (unsigned long)(rxIrqCount - sf5ScanDiagRxIrqBase),
+         (unsigned long)(otherIrqCount - sf5ScanDiagOtherIrqBase),
+         (unsigned long)lastIrq, (unsigned long)pendingIrq,
+         lr1121_hal_has_pending_dio1() ? 1U : 0U,
+         (unsigned)packetStatus.commandStatus, (unsigned)packetStatus.crc,
+         (unsigned)packetStatus.codingRate,
+         (unsigned)packetStatus.packetLength, (int)packetStatus.snrRaw,
+         (unsigned)packetStatus.rssiRaw,
+         (unsigned)packetStatus.signalRssiRaw,
+         (unsigned)packetStatus.detector,
+         (long)packetStatus.frequencyOffsetHz,
+         (unsigned long)compatibilityConfig,
+         (unsigned)deviceErrors,
+         (unsigned long)(crcPassCount - sf5ScanDiagPassBase),
+         (unsigned long)(crcFailCount - sf5ScanDiagFailBase),
+         (unsigned long)(scanCrcRejectCount - sf5ScanDiagRejectBase),
+         (unsigned long)(rxDoneStageCount - sf5ScanDiagRxDoneStageBase),
+         (unsigned long)(rxDoneWithFifoCount -
+                         sf5ScanDiagRxDoneWithFifoBase),
+         (unsigned long)(rxDoneWithoutFifoCount -
+                         sf5ScanDiagRxDoneWithoutFifoBase),
+         (unsigned long)(rawSyncMatchCount - sf5ScanDiagRawSyncBase),
+         (unsigned long)(rawAnyMatchCount - sf5ScanDiagRawAnyBase),
+         (unsigned)rawSyncOffset, (unsigned)rawAnyOffset,
+         (unsigned)rawAnyNonce, (unsigned)rawAnyType,
+         rejectFromThisRate ? (unsigned)scanCrcRejectType : 0xFFU,
+         rejectFromThisRate ? (unsigned)scanCrcRejectLen : 0U,
+         (unsigned)rejectBytes[0], (unsigned)rejectBytes[1],
+         (unsigned)rejectBytes[2], (unsigned)rejectBytes[3],
+         (unsigned)rejectBytes[4], (unsigned)rejectBytes[5],
+         (unsigned)rejectBytes[6], (unsigned)rejectBytes[7],
+         (unsigned)rejectBytes[8], (unsigned)rejectBytes[9],
+         (unsigned)rejectBytes[10], (unsigned)rejectBytes[11],
+         (unsigned)rejectBytes[12]);
+  sf5ScanDiagActive = false;
+}
+#endif
+
 #if ELRS_DIAG_RF_RATE_LOG || ELRS_DIAG_PERIODIC_STATS || ELRS_DIAG_SCAN_TRACE
 static void printRadioRxStats(const char *tag,
                               const expresslrs_mod_settings_s *params) {
@@ -4674,6 +4835,7 @@ static void printRadioRxStats(const char *tag,
   uint16_t loraRxTotal = 0;
   uint16_t loraCrcError = 0;
   uint16_t loraHeaderCrcError = 0;
+  uint16_t loraHeaderValid = 0;
   uint16_t loraFalseSync = 0;
   uint16_t gfskRxTotal = 0;
   uint16_t gfskCrcError = 0;
@@ -4689,15 +4851,17 @@ static void printRadioRxStats(const char *tag,
                          &gfskSyncFail, &gfskTimeout);
   } else {
     Radio.GetLoRaRxStats(SX12XX_Radio_1, &loraRxTotal, &loraCrcError,
-                         &loraHeaderCrcError, &loraFalseSync);
+                         &loraHeaderCrcError, &loraHeaderValid,
+                         &loraFalseSync);
   }
 
   DBGLN("SCAN_STAT %s rate:%u exp:%c ptype:0x%02X "
-        "lora:%u/%u/%u/%u fsk:%u/%u/%u/%u/%u/%u/%u",
+        "lora:%u/%u/%u/%u/%u fsk:%u/%u/%u/%u/%u/%u/%u",
         tag, (unsigned)params->index, expectGfsk ? 'F' : 'L',
         (unsigned)packetType, (unsigned)loraRxTotal,
         (unsigned)loraCrcError, (unsigned)loraHeaderCrcError,
-        (unsigned)loraFalseSync, (unsigned)gfskRxTotal,
+        (unsigned)loraHeaderValid, (unsigned)loraFalseSync,
+        (unsigned)gfskRxTotal,
         (unsigned)gfskCrcError, (unsigned)gfskLenError,
         (unsigned)gfskPreamble, (unsigned)gfskSyncOk,
         (unsigned)gfskSyncFail, (unsigned)gfskTimeout);
@@ -4867,6 +5031,9 @@ static void SetRFLinkRate(uint8_t index, bool bindMode) {
   ExpressLRS_currAirRate_Modparams = ModParams;
   ExpressLRS_currAirRate_RFperfParams = RFperf;
   ExpressLRS_nextAirRateIndex = index;
+#if ELRS_DIAG_SF5_SCAN
+  sf5ScanDiagEnter(ModParams, initFreq, bindMode);
+#endif
 #if SIW917_ELRS_LR2021_TXDONE_WATCHDOG
   lr2021TelemetryTxWatchdogUs = Lr2021TxDoneWatchdogUs();
 #endif
@@ -6030,6 +6197,9 @@ static void cycleRfMode() {
           : requestedDwellMs;
 
   if ((now - RFmodeLastCycled) > dwellMs) {
+#if ELRS_DIAG_SF5_SCAN
+    sf5ScanDiagExit(ExpressLRS_currAirRate_Modparams);
+#endif
 #if ELRS_DIAG_RF_RATE_LOG || ELRS_DIAG_SCAN_TRACE
     printRadioRxStats("exit", ExpressLRS_currAirRate_Modparams);
 #endif
@@ -6363,8 +6533,9 @@ void elrs_loop(void) {
   static uint32_t lr2021PolledRxCount = 0;
   static uint32_t lr2021PolledLastIrq = 0;
   static uint32_t lr2021LastPollUs = 0;
-  constexpr uint32_t lr2021TerminalIrqMask =
-      LR1121_IRQ_RX_DONE | LR1121_IRQ_TX_DONE | LR1121_IRQ_TIMEOUT |
+  const uint32_t lr2021RxCompletionMask = LR1121_IRQ_RX_DONE;
+  const uint32_t lr2021TerminalIrqMask =
+      lr2021RxCompletionMask | LR1121_IRQ_TX_DONE | LR1121_IRQ_TIMEOUT |
       LR20XX_IRQ_CRC_ERROR | LR20XX_IRQ_LEN_ERROR | LR20XX_IRQ_ADDR_ERROR
 #if defined(SIW917_ELRS_LR2021_RX_FIFO_AS_RX_DONE) &&                         \
     SIW917_ELRS_LR2021_RX_FIFO_AS_RX_DONE
@@ -6383,7 +6554,7 @@ void elrs_loop(void) {
     }
     if ((peekIrq & lr2021TerminalIrqMask) != 0) {
       const uint32_t polledIrq = Radio.GetIrqStatus(SX12XX_Radio_1);
-      if (polledIrq & (LR1121_IRQ_RX_DONE
+      if (polledIrq & (lr2021RxCompletionMask
 #if defined(SIW917_ELRS_LR2021_RX_FIFO_AS_RX_DONE) &&                         \
                        SIW917_ELRS_LR2021_RX_FIFO_AS_RX_DONE
                        | LR20XX_IRQ_RX_FIFO
@@ -6508,6 +6679,7 @@ void elrs_loop(void) {
     uint16_t loraRxTotal = 0;
     uint16_t loraCrcError = 0;
     uint16_t loraHeaderCrcError = 0;
+    uint16_t loraHeaderValid = 0;
     uint16_t loraFalseSync = 0;
     bool loraStatsValid = false;
     uint16_t gfskRxTotal = 0;
@@ -6535,7 +6707,8 @@ void elrs_loop(void) {
         gfskStatsValid = true;
       } else {
         Radio.GetLoRaRxStats(SX12XX_Radio_1, &loraRxTotal, &loraCrcError,
-                             &loraHeaderCrcError, &loraFalseSync);
+                             &loraHeaderCrcError, &loraHeaderValid,
+                             &loraFalseSync);
         loraStatsValid = true;
       }
     }
@@ -6622,11 +6795,12 @@ void elrs_loop(void) {
             (unsigned long)Radio.currFreq);
     }
     if (connectionState == disconnected) {
-      DBGLN("RSTAT ptype:0x%02X lora:%u/%u/%u/%u valid:%u "
+      DBGLN("RSTAT ptype:0x%02X lora:%u/%u/%u/%u/%u valid:%u "
             "fsk:%u/%u/%u/%u/%u/%u/%u valid:%u",
             (unsigned)radioPacketType, (unsigned)loraRxTotal,
             (unsigned)loraCrcError, (unsigned)loraHeaderCrcError,
-            (unsigned)loraFalseSync, loraStatsValid ? 1U : 0U,
+            (unsigned)loraHeaderValid, (unsigned)loraFalseSync,
+            loraStatsValid ? 1U : 0U,
             (unsigned)gfskRxTotal, (unsigned)gfskCrcError,
             (unsigned)gfskLenError, (unsigned)gfskPreamble,
             (unsigned)gfskSyncOk, (unsigned)gfskSyncFail,

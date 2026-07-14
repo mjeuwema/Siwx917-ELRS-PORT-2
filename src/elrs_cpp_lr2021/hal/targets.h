@@ -170,6 +170,10 @@
 // Quiet timing: scan serial competes with SYNC acquisition at high rates.
 #define SIW917_ELRS_LR2021_SCAN_TRACE 0
 #endif
+#ifndef SIW917_ELRS_LR2021_SF5_SCAN_DIAG
+// Keep acquisition quiet; enable only for a targeted SF5 capture.
+#define SIW917_ELRS_LR2021_SF5_SCAN_DIAG 0
+#endif
 #ifndef SIW917_ELRS_LR2021_ROUTE_SCAN_DIAG_IRQS
 #define SIW917_ELRS_LR2021_ROUTE_SCAN_DIAG_IRQS 0
 #endif
@@ -180,22 +184,29 @@
 #define SIW917_ELRS_LR2021_LORA_SF5_MIN_PREAMBLE                              \
   SIW917_ELRS_LR2021_LORA_SF5_SF6_MIN_PREAMBLE
 #endif
-#ifndef SIW917_ELRS_LR2021_LORA_SF5_FREQ_RANGE
-// LR20xx LoRa detector frequency-error range for SF5 only:
-// 0 = +/-BW/4, 1 = +/-BW/3, 2 = +/-BW/2.
-#define SIW917_ELRS_LR2021_LORA_SF5_FREQ_RANGE 1
-#endif
 #ifndef SIW917_ELRS_LR2021_LORA_SF5_SX1276_COMPAT
+// The ExpressLRS transmitter is LR1121-based, so preserve the native state
+// established by SetModulationParams. Enable only for an SX1276-generation
+// peer that requires Semtech's compatibility workaround.
 #define SIW917_ELRS_LR2021_LORA_SF5_SX1276_COMPAT 0
 #endif
 #ifndef SIW917_ELRS_LR2021_LORA_COMPAT_EXT_SYNCWORD
 #define SIW917_ELRS_LR2021_LORA_COMPAT_EXT_SYNCWORD 0
 #endif
-#ifndef SIW917_ELRS_LR2021_SF5_OTA8_FORCE_CR_LI_4_8
-#define SIW917_ELRS_LR2021_SF5_OTA8_FORCE_CR_LI_4_8 0
+#ifndef SIW917_ELRS_LR2021_SUBGHZ_SF5_EXT_SYNCWORD
+// Semtech's LR20xx driver uses the standard one-byte 0x12 private-network
+// syncword with the mandatory SF5/SF6 compatibility field.
+#define SIW917_ELRS_LR2021_SUBGHZ_SF5_EXT_SYNCWORD 0
+#endif
+#ifndef SIW917_ELRS_LR2021_SUBGHZ_SF5_FIFO_HANDOFF
+// The normal LR20xx RX_DONE path owns packet handoff. The FIFO-threshold mode
+// is diagnostic-only and is not part of Semtech's LoRa setup sequence.
+#define SIW917_ELRS_LR2021_SUBGHZ_SF5_FIFO_HANDOFF 0
 #endif
 #ifndef SIW917_ELRS_LR2021_FORCE_2G4_DOMAIN
-#define SIW917_ELRS_LR2021_FORCE_2G4_DOMAIN 1
+// Use the configured low-band regulatory domain for sub-GHz testing. The
+// diagnostic 2.4GHz override bypasses FCC915 rate scanning entirely.
+#define SIW917_ELRS_LR2021_FORCE_2G4_DOMAIN 0
 #endif
 #ifndef SIW917_ELRS_LR2021_FREQ_OFFSET_PPM_SWEEP
 #define SIW917_ELRS_LR2021_FREQ_OFFSET_PPM_SWEEP 0
@@ -224,6 +235,11 @@
 // is armed immediately before SetTx so an early TX_DONE cannot race the launch
 // bookkeeping, and the ISR clears the IRQ before returning the radio to RX.
 #define SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH 1
+#endif
+#ifndef SIW917_ELRS_LR2021_LORA_TXDONE_FAST_PATH
+// SF5/BW500 leaves less than one millisecond after downlink airtime at 250 Hz.
+// Use the same fresh-edge, clear-before-RX handoff already proven for GFSK.
+#define SIW917_ELRS_LR2021_LORA_TXDONE_FAST_PATH 1
 #endif
 #ifndef SIW917_ELRS_LR2021_GFSK_SKIP_IMMEDIATE_TOCK
 #define SIW917_ELRS_LR2021_GFSK_SKIP_IMMEDIATE_TOCK 0

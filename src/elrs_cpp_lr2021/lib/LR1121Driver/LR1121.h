@@ -16,6 +16,18 @@ typedef struct {
   uint16_t version;
 } __attribute__((packed)) firmware_version_t;
 
+typedef struct {
+  uint16_t commandStatus;
+  uint8_t crc;
+  uint8_t codingRate;
+  uint8_t packetLength;
+  int8_t snrRaw;
+  uint16_t rssiRaw;
+  uint16_t signalRssiRaw;
+  uint8_t detector;
+  int32_t frequencyOffsetHz;
+} lr2021_lora_packet_status_diag_t;
+
 class BufferCodec {
 public:
   virtual ~BufferCodec() {}
@@ -76,7 +88,16 @@ public:
   uint8_t GetPacketType(SX12XX_Radio_Number_t radioNumber);
   void GetLoRaRxStats(SX12XX_Radio_Number_t radioNumber, uint16_t *pktRxTotal,
                       uint16_t *pktCrcError, uint16_t *headerCrcError,
-                      uint16_t *falseSync);
+                      uint16_t *headerValid, uint16_t *falseSync);
+  void GetLoRaPacketStatusDiag(
+      SX12XX_Radio_Number_t radioNumber,
+      lr2021_lora_packet_status_diag_t *packetStatus);
+  uint32_t
+  GetLoRaCompatibilityConfigDiag(SX12XX_Radio_Number_t radioNumber);
+  uint8_t GetLoRaSyncModeDiag() const { return lastLoRaSyncMode; }
+  uint16_t GetLoRaSyncCommandStatusDiag() const {
+    return lastLoRaSyncCommandStatus;
+  }
   void GetGfskRxStats(SX12XX_Radio_Number_t radioNumber,
                       uint16_t *pktRxTotal, uint16_t *pktCrcError,
                       uint16_t *pktLenError, uint16_t *preambleDetected,
@@ -101,6 +122,7 @@ private:
   // LR1121_RadioOperatingModes_t currOpmode;
   bool useFSK;
   bool rxContinuousActive;
+  bool rxFifoStageActive;
   volatile bool txInProgress;
   volatile uint32_t txArmDioSequence;
   volatile bool lastTxStartSuccessful;
@@ -113,6 +135,8 @@ private:
   bool pwrForceUpdate;
   bool radio1isSubGHz;
   bool radio2isSubGHz;
+  uint8_t lastLoRaSyncMode;
+  uint16_t lastLoRaSyncCommandStatus;
   uint32_t feCalFreqRadio1;
   uint32_t feCalFreqRadio2;
   enum { FE_CAL_CACHE_SIZE = 3 };
@@ -157,6 +181,10 @@ private:
                       SX12XX_Radio_Number_t radioNumber);
 
   void SetDioIrqParams();
+  void ConfigureRxFifoHandoff(uint8_t payloadLength, bool enable,
+                              SX12XX_Radio_Number_t radioNumber);
+  void ClearRxFifoIrqFlags(uint8_t flags,
+                           SX12XX_Radio_Number_t radioNumber);
   void SetDioFunctionIrq(SX12XX_Radio_Number_t radioNumber);
   void SetRxTimeoutStopOnPreamble(bool stopOnPreamble,
                                   SX12XX_Radio_Number_t radioNumber);
@@ -187,17 +215,15 @@ private:
   void ClearIrqStatusMask(uint32_t irqMask, SX12XX_Radio_Number_t radioNumber);
   void WriteRegMem32(uint32_t addr, uint32_t data,
                      SX12XX_Radio_Number_t radioNumber);
+  void WriteRegMem32Block(uint32_t addr, const uint32_t *data, uint8_t words,
+                          SX12XX_Radio_Number_t radioNumber);
   uint32_t ReadRegMem32(uint32_t addr, SX12XX_Radio_Number_t radioNumber);
+  uint16_t ReadStatusWordDiag(SX12XX_Radio_Number_t radioNumber);
   void WriteRegMemMask32(uint32_t addr, uint32_t mask, uint32_t data,
                          SX12XX_Radio_Number_t radioNumber);
+  bool LoadLr2021Pram(SX12XX_Radio_Number_t radioNumber);
   void ConfigureLoraSx1276Compatibility(uint8_t sf,
                                         SX12XX_Radio_Number_t radioNumber);
-  void ConfigureLoraFrequencyRange(uint8_t sf,
-                                   SX12XX_Radio_Number_t radioNumber);
-  void ApplyDcdcReset(SX12XX_Radio_Number_t radioNumber);
-  void ApplyDcdcConfigure(SX12XX_Radio_Number_t radioNumber);
-  void SetDcdcFrequency(uint32_t frequencyHz,
-                        SX12XX_Radio_Number_t radioNumber);
 
   static void IsrCallback(SX12XX_Radio_Number_t radioNumber);
 

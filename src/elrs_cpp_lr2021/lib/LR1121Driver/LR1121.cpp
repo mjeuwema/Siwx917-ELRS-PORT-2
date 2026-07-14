@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "LR1121.h"
 #include "LR1121_hal.h"
+#include "lr20xx_pram_lr2021.h"
 #include "../../include/common.h"
 #include "OTA.h"
 #include "logging.h"
@@ -34,6 +35,53 @@ siw917Lr2021DioEdgeSequence(SX12XX_Radio_Number_t radioNumber) {
 LR1121Hal hal;
 LR1121Driver *LR1121Driver::instance = NULL;
 extern RXtimerState_e RXtimerState;
+
+static volatile uint32_t sf5RxDoneStageCount = 0;
+static volatile uint32_t sf5RxDoneWithFifoCount = 0;
+static volatile uint32_t sf5RxDoneWithoutFifoCount = 0;
+static volatile uint32_t sf5RawSyncMatchCount = 0;
+static volatile uint32_t sf5RawAnyMatchCount = 0;
+static volatile uint8_t sf5RawLastSyncOffset = 0xFF;
+static volatile uint8_t sf5RawLastAnyOffset = 0xFF;
+static volatile uint8_t sf5RawLastAnyNonce = 0xFF;
+static volatile uint8_t sf5RawLastAnyType = 0xFF;
+
+extern "C" void lr1121_get_sf5_stage_stats(uint32_t *rx_done,
+                                             uint32_t *with_fifo,
+                                             uint32_t *without_fifo) {
+  if (rx_done != nullptr) {
+    *rx_done = sf5RxDoneStageCount;
+  }
+  if (with_fifo != nullptr) {
+    *with_fifo = sf5RxDoneWithFifoCount;
+  }
+  if (without_fifo != nullptr) {
+    *without_fifo = sf5RxDoneWithoutFifoCount;
+  }
+}
+
+extern "C" void lr1121_get_sf5_raw_scan_stats(
+    uint32_t *sync_matches, uint32_t *any_matches, uint8_t *sync_offset,
+    uint8_t *any_offset, uint8_t *any_nonce, uint8_t *any_type) {
+  if (sync_matches != nullptr) {
+    *sync_matches = sf5RawSyncMatchCount;
+  }
+  if (any_matches != nullptr) {
+    *any_matches = sf5RawAnyMatchCount;
+  }
+  if (sync_offset != nullptr) {
+    *sync_offset = sf5RawLastSyncOffset;
+  }
+  if (any_offset != nullptr) {
+    *any_offset = sf5RawLastAnyOffset;
+  }
+  if (any_nonce != nullptr) {
+    *any_nonce = sf5RawLastAnyNonce;
+  }
+  if (any_type != nullptr) {
+    *any_type = sf5RawLastAnyType;
+  }
+}
 
 extern "C" {
 volatile uint8_t lr1121_tlm_miss_irq_trace_active = 0;
@@ -194,15 +242,13 @@ static constexpr uint32_t LR20XX_LORA_SX1276_COMPAT_ADDR = 0x00F30A14UL;
 static constexpr uint32_t LR20XX_LORA_SX1276_COMPAT_MASK = (3UL << 18);
 static constexpr uint32_t LR20XX_LORA_SX1276_COMPAT_ENABLE = (1UL << 19);
 static constexpr uint32_t LR20XX_LORA_SX1276_COMPAT_DISABLE = 0;
-static constexpr uint32_t LR20XX_LORA_RX_CFG_ADDR = 0x00F30A2CUL;
-static constexpr uint32_t LR20XX_LORA_FREQ_RANGE_MASK = (3UL << 16);
-static constexpr uint32_t LR20XX_DCDC_ADC_CTRL_ADDR = 0x00F40200UL;
-static constexpr uint32_t LR20XX_DCDC_RX_PATH_ADDR = 0x00F40430UL;
-static constexpr uint32_t LR20XX_DCDC_SWITCHER_ADDR = 0x00F20024UL;
-static constexpr uint32_t LR20XX_DCDC_SWITCHER_RISE_MASK = (0xFUL << 20);
-static constexpr uint32_t LR20XX_DCDC_SWITCHER_FALL_MASK = (0xFUL << 16);
-static constexpr uint32_t LR20XX_DCDC_FREQ_LF_ADDR = 0x0080004CUL;
-static constexpr uint32_t LR20XX_DCDC_RF_FREQ_ADDR = 0x00F40144UL;
+static constexpr uint32_t LR20XX_PRAM_BASE_ADDR = 0x00801000UL;
+static constexpr uint32_t LR20XX_PRAM_MAGIC_ADDR = 0x00800FF8UL;
+static constexpr uint32_t LR20XX_PRAM_VERSION_ADDR = 0x00800FFCUL;
+static constexpr uint32_t LR20XX_PRAM_MAGIC_EXPECTED = 0x600DB002UL;
+static constexpr uint8_t LR20XX_PRAM_WRITE_WORDS = 32;
+static constexpr uint8_t LR20XX_FIFO_FLAG_THRESHOLD_HIGH = (1U << 2);
+static constexpr uint8_t LR20XX_FIFO_FLAG_ALL = 0x3FU;
 static constexpr uint32_t LR20XX_FE_CAL_FCC915_LOW_HZ = 903500000UL;
 static constexpr uint32_t LR20XX_FE_CAL_FCC915_MID_HZ = 915500000UL;
 static constexpr uint32_t LR20XX_FE_CAL_FCC915_HIGH_HZ = 926900000UL;
@@ -389,13 +435,6 @@ static uint8_t LR2021SpiRadioForMask(SX12XX_Radio_Number_t radioNumber) {
   return (radioNumber == SX12XX_Radio_2) ? LR1121_RADIO_2 : LR1121_RADIO_1;
 }
 
-static uint32_t LR20xxPllStepToHz(uint32_t pllSteps) {
-  const uint64_t numerator =
-      (uint64_t)pllSteps * (uint64_t)15625ULL;
-  const uint64_t denominator = (uint64_t)(1UL << 14);
-  return (uint32_t)((numerator + denominator - 1ULL) / denominator);
-}
-
 extern "C" uint32_t lr1121_get_last_rxnbisr_entry_us(void) {
   return siw917_rxnbisr_entry_us;
 }
@@ -446,6 +485,7 @@ CopyCodec::decode(uint8_t *out, uint8_t *in, const uint32_t len) {
 LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   useFSK = false;
   rxContinuousActive = false;
+  rxFifoStageActive = false;
   txInProgress = false;
   txArmDioSequence = 0;
   lastTxStartSuccessful = false;
@@ -457,6 +497,8 @@ LR1121Driver::LR1121Driver() : SX12xxDriverCommon() {
   pwrForceUpdate = false;
   radio1isSubGHz = true;
   radio2isSubGHz = true;
+  lastLoRaSyncMode = 0;
+  lastLoRaSyncCommandStatus = 0;
   feCalFreqRadio1 = 0;
   feCalFreqRadio2 = 0;
   ResetFrontEndCalCache();
@@ -489,7 +531,15 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
   // hal.init() already does GPIO/SPI/reset/DIO setup. Keep the post-init
   // sequence aligned with the Waveshare XTAL=true examples.
 
-  // Validate that the LR2021(s) are working.
+  // Semtech USP v1.1.2 requires the device-specific PRAM immediately after
+  // reset, before any other radio command. It replaces the retired host-side
+  // DCDC sensitivity workaround.
+  if (!LoadLr2021Pram(SX12XX_Radio_1))
+    return false;
+  if (GPIO_PIN_NSS_2 != UNDEF_PIN && !LoadLr2021Pram(SX12XX_Radio_2))
+    return false;
+
+  // Validate that the LR2021(s) are working after the mandatory patch load.
   if (!CheckVersion(SX12XX_Radio_1))
     return false;
   if (GPIO_PIN_NSS_2 != UNDEF_PIN) {
@@ -497,7 +547,7 @@ bool LR1121Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency) {
       return false;
   }
 
-  printf("LR2021 port build marker: rx-stage-v216-locked-tlm-slots\n");
+  printf("LR2021 port build marker: rx-stage-v237-lora-txdone-fast\n");
 
   hal.IsrCallback_1 = &LR1121Driver::IsrCallback_1;
   hal.IsrCallback_2 = &LR1121Driver::IsrCallback_2;
@@ -610,9 +660,6 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
                            : LR20XX_PACKET_TYPE_LORA};
   hal.WriteCommand(LR20XX_RADIO_SET_PACKET_TYPE, buf, sizeof(buf), radioNumber);
   SetRxTimeoutStopOnPreamble(false, radioNumber);
-  if (isSubGHz) {
-    ApplyDcdcReset(radioNumber);
-  }
 
   codec = &copyCodec;
   if (useFSK) {
@@ -653,6 +700,14 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
     ConfigureLoRaRxDetector(sf, inverted, radioNumber);
   }
 
+#if SIW917_ELRS_LR2021_SUBGHZ_SF5_FIFO_HANDOFF
+  rxFifoStageActive =
+      !useFSK && isSubGHz && sf == LR11XX_RADIO_LORA_SF5 &&
+      PayloadLength > 0;
+#else
+  rxFifoStageActive = false;
+#endif
+
   SetRxPath(isSubGHz, radioNumber);
   // CalibFE is rejected in RX/TX. Enter FS before updating the three on-chip
   // calibration slots; the command returns to this mode when complete.
@@ -678,25 +733,32 @@ void LR1121Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
             // changed, and we need to configure the power for the band.
   CommitOutputPower();
 
-  // Keep the LR2021 RX arm sequence close to Waveshare RadioLib: leave RX path,
-  // DIO routing, and IRQ state as the last touched radio config before SetRx.
+  // Keep packet/FIFO state settled before routing DIO. This avoids presenting
+  // a stale level-held FIFO interrupt while changing rates.
   SetRxPath(isSubGHz, radioNumber);
-  if (isSubGHz) {
-    ApplyDcdcConfigure(radioNumber);
-  }
-  SetDioIrqParams();
   if (!useFSK) {
     const uint8_t loraPreambleLength =
         LR2021LoRaPreambleForSf(PreambleLength, sf);
+    // Leave the effective LoRa state in the same order as Semtech's LR20xx
+    // setup path. Calibration and frequency changes must not be the last
+    // operations after the modulation/sync configuration.
+    ConfigModParamsLoRa(bw, sf, cr, radioNumber);
     SetPacketParamsLoRa(loraPreambleLength, loraPacketLengthType,
                         PayloadLength, inverted, radioNumber);
+    SetLoRaSyncWord(LR20XX_LORA_SYNC_WORD_PRIVATE, sf, radioNumber);
     ConfigureLoRaRxDetector(sf, inverted, radioNumber);
   }
   ClearRxFifo(radioNumber);
+#if SIW917_ELRS_LR2021_SUBGHZ_SF5_FIFO_HANDOFF
+  ConfigureRxFifoHandoff(PayloadLength, rxFifoStageActive, radioNumber);
+#endif
+  SetDioIrqParams();
 #if (defined(SIW917_ELRS_DISCONNECTED_SCAN_DIAG) &&                            \
      SIW917_ELRS_DISCONNECTED_SCAN_DIAG) ||                                    \
     (defined(SIW917_ELRS_LR2021_SCAN_TRACE) &&                                 \
-     SIW917_ELRS_LR2021_SCAN_TRACE)
+     SIW917_ELRS_LR2021_SCAN_TRACE) ||                                         \
+    (defined(SIW917_ELRS_LR2021_SF5_SCAN_DIAG) &&                              \
+     SIW917_ELRS_LR2021_SF5_SCAN_DIAG)
   hal.WriteCommand(LR20XX_RADIO_RESET_RX_STATS, radioNumber);
 #endif
   ClearIrqStatus(radioNumber);
@@ -823,6 +885,31 @@ void LR1121Driver::WriteRegMem32(uint32_t addr, uint32_t data,
                    radioNumber);
 }
 
+void LR1121Driver::WriteRegMem32Block(
+    uint32_t addr, const uint32_t *data, uint8_t words,
+    SX12XX_Radio_Number_t radioNumber) {
+  if (data == nullptr || words == 0 || words > LR20XX_PRAM_WRITE_WORDS) {
+    return;
+  }
+
+  uint8_t buf[3 + (LR20XX_PRAM_WRITE_WORDS * sizeof(uint32_t))] = {};
+  buf[0] = (uint8_t)((addr >> 16) & 0xFF);
+  buf[1] = (uint8_t)((addr >> 8) & 0xFF);
+  buf[2] = (uint8_t)(addr & 0xFF);
+  for (uint8_t index = 0; index < words; ++index) {
+    const uint32_t value = data[index];
+    const uint16_t offset = 3U + ((uint16_t)index * sizeof(uint32_t));
+    buf[offset + 0] = (uint8_t)(value >> 24);
+    buf[offset + 1] = (uint8_t)(value >> 16);
+    buf[offset + 2] = (uint8_t)(value >> 8);
+    buf[offset + 3] = (uint8_t)value;
+  }
+
+  hal.WriteCommand(LR20XX_REGMEM_WRITE_REGMEM32, buf,
+                   (uint8_t)(3U + ((uint16_t)words * sizeof(uint32_t))),
+                   radioNumber);
+}
+
 uint32_t LR1121Driver::ReadRegMem32(uint32_t addr,
                                     SX12XX_Radio_Number_t radioNumber) {
   uint8_t req[4] = {
@@ -859,6 +946,31 @@ void LR1121Driver::WriteRegMemMask32(uint32_t addr, uint32_t mask,
                    radioNumber);
 }
 
+bool LR1121Driver::LoadLr2021Pram(SX12XX_Radio_Number_t radioNumber) {
+  for (uint32_t offset = 0; offset < pram_lr2021_size;) {
+    const uint32_t remaining = pram_lr2021_size - offset;
+    const uint8_t words =
+        (remaining > LR20XX_PRAM_WRITE_WORDS)
+            ? LR20XX_PRAM_WRITE_WORDS
+            : (uint8_t)remaining;
+    WriteRegMem32Block(LR20XX_PRAM_BASE_ADDR + (offset * sizeof(uint32_t)),
+                       &pram_lr2021[offset], words, radioNumber);
+    offset += words;
+  }
+
+  uint8_t enable[1] = {0};
+  hal.WriteCommand(LR20XX_PATCH_ENABLE_PRAM, enable, sizeof(enable),
+                   radioNumber);
+
+  const uint32_t magic = ReadRegMem32(LR20XX_PRAM_MAGIC_ADDR, radioNumber);
+  const uint32_t version = ReadRegMem32(LR20XX_PRAM_VERSION_ADDR, radioNumber);
+  printf("LR2021 #%u PRAM magic=0x%08lX type=%u version=0x%02lX\n",
+         (unsigned)radioNumber, (unsigned long)magic,
+         (unsigned)((version >> 16) & 0xFFU),
+         (unsigned long)((version >> 8) & 0xFFU));
+  return magic == LR20XX_PRAM_MAGIC_EXPECTED;
+}
+
 void LR1121Driver::ConfigureLoraSx1276Compatibility(
     uint8_t sf, SX12XX_Radio_Number_t radioNumber) {
   // Match Semtech's LR20xx workaround behavior. v91 tried native SF5, but that
@@ -873,79 +985,6 @@ void LR1121Driver::ConfigureLoraSx1276Compatibility(
   DBGLN("LR2021 SX1276 LoRa compatibility %s for sf=%u",
         enable ? "enabled" : "disabled", (unsigned)sf);
 #endif
-}
-
-void LR1121Driver::ConfigureLoraFrequencyRange(
-    uint8_t sf, SX12XX_Radio_Number_t radioNumber) {
-#if SIW917_ELRS_LR2021_LORA_SF5_FREQ_RANGE > 0
-  if (sf == LR11XX_RADIO_LORA_SF5) {
-    const uint32_t range =
-        ((uint32_t)SIW917_ELRS_LR2021_LORA_SF5_FREQ_RANGE & 0x3UL) << 16;
-    WriteRegMemMask32(LR20XX_LORA_RX_CFG_ADDR, LR20XX_LORA_FREQ_RANGE_MASK,
-                      range, radioNumber);
-#if defined(SIW917_ELRS_RADIO_INIT_VERBOSE) && SIW917_ELRS_RADIO_INIT_VERBOSE
-    DBGLN("LR2021 LoRa SF5 freq range set=%lu",
-          (unsigned long)SIW917_ELRS_LR2021_LORA_SF5_FREQ_RANGE);
-#endif
-  }
-#else
-  (void)sf;
-  (void)radioNumber;
-#endif
-}
-
-void LR1121Driver::ApplyDcdcReset(SX12XX_Radio_Number_t radioNumber) {
-  WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR, LR20XX_DCDC_SWITCHER_RISE_MASK,
-                    15UL << 20, radioNumber);
-  WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR, LR20XX_DCDC_SWITCHER_FALL_MASK,
-                    15UL << 16, radioNumber);
-  SetDcdcFrequency(2800000UL, radioNumber);
-#if defined(SIW917_ELRS_RADIO_INIT_VERBOSE) && SIW917_ELRS_RADIO_INIT_VERBOSE
-  DBGLN("LR2021 DCDC reset workaround applied");
-#endif
-}
-
-void LR1121Driver::ApplyDcdcConfigure(SX12XX_Radio_Number_t radioNumber) {
-  const uint32_t adcCtrl = ReadRegMem32(LR20XX_DCDC_ADC_CTRL_ADDR, radioNumber);
-  const uint32_t anaDec = (adcCtrl >> 8) & 0x7UL;
-  const uint32_t rxPath = ReadRegMem32(LR20XX_DCDC_RX_PATH_ADDR, radioNumber);
-  const bool isRxHf = ((rxPath & 0x3UL) == 1UL);
-
-  if (!isRxHf && (anaDec == 1UL || anaDec == 2UL)) {
-    WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR,
-                      LR20XX_DCDC_SWITCHER_RISE_MASK, 11UL << 20,
-                      radioNumber);
-    WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR,
-                      LR20XX_DCDC_SWITCHER_FALL_MASK, 13UL << 16,
-                      radioNumber);
-  } else {
-    WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR,
-                      LR20XX_DCDC_SWITCHER_RISE_MASK, 15UL << 20,
-                      radioNumber);
-    WriteRegMemMask32(LR20XX_DCDC_SWITCHER_ADDR,
-                      LR20XX_DCDC_SWITCHER_FALL_MASK, 15UL << 16,
-                      radioNumber);
-  }
-
-  SetDcdcFrequency((anaDec == 1UL) ? 4300000UL : 2800000UL, radioNumber);
-#if defined(SIW917_ELRS_RADIO_INIT_VERBOSE) && SIW917_ELRS_RADIO_INIT_VERBOSE
-  DBGLN("LR2021 DCDC configure workaround applied adc=0x%08lX rx=0x%08lX",
-        (unsigned long)adcCtrl, (unsigned long)rxPath);
-#endif
-}
-
-void LR1121Driver::SetDcdcFrequency(uint32_t frequencyHz,
-                                    SX12XX_Radio_Number_t radioNumber) {
-  const uint32_t freqLf = (uint32_t)((uint64_t)frequencyHz * 1048576ULL /
-                                    1000000ULL);
-  WriteRegMem32(LR20XX_DCDC_FREQ_LF_ADDR, freqLf, radioNumber);
-
-  const uint32_t rfPllSteps = ReadRegMem32(LR20XX_DCDC_RF_FREQ_ADDR,
-                                           radioNumber);
-  const uint32_t rfHz = LR20xxPllStepToHz(rfPllSteps);
-  if (rfHz != 0) {
-    SetFrequencyReg(rfHz, radioNumber, false);
-  }
 }
 
 void LR1121Driver::ConfigureRegulatorMode(SX12XX_Radio_Number_t radioNumber) {
@@ -996,8 +1035,9 @@ void LR1121Driver::GetLoRaRxStats(SX12XX_Radio_Number_t radioNumber,
                                   uint16_t *pktRxTotal,
                                   uint16_t *pktCrcError,
                                   uint16_t *headerCrcError,
+                                  uint16_t *headerValid,
                                   uint16_t *falseSync) {
-  uint8_t buffer[LR20XX_RESPONSE_STATUS_LEN + 8] = {};
+  uint8_t buffer[LR20XX_RESPONSE_STATUS_LEN + 10] = {};
   hal.WriteCommand(LR20XX_LORA_GET_RX_STATS, radioNumber);
   hal.ReadCommand(buffer, sizeof(buffer), radioNumber);
   const uint8_t *stats = buffer + LR20XX_RESPONSE_STATUS_LEN;
@@ -1011,9 +1051,60 @@ void LR1121Driver::GetLoRaRxStats(SX12XX_Radio_Number_t radioNumber,
   if (headerCrcError != nullptr) {
     *headerCrcError = ((uint16_t)stats[4] << 8) | (uint16_t)stats[5];
   }
-  if (falseSync != nullptr) {
-    *falseSync = ((uint16_t)stats[6] << 8) | (uint16_t)stats[7];
+  if (headerValid != nullptr) {
+    *headerValid = ((uint16_t)stats[6] << 8) | (uint16_t)stats[7];
   }
+  if (falseSync != nullptr) {
+    *falseSync = ((uint16_t)stats[8] << 8) | (uint16_t)stats[9];
+  }
+}
+
+void LR1121Driver::GetLoRaPacketStatusDiag(
+    SX12XX_Radio_Number_t radioNumber,
+    lr2021_lora_packet_status_diag_t *packetStatus) {
+  if (packetStatus == nullptr) {
+    return;
+  }
+
+  uint8_t buffer[LR20XX_RESPONSE_STATUS_LEN + 9] = {};
+  hal.WriteCommand(LR20XX_LORA_GET_PACKET_STATUS, radioNumber);
+  hal.ReadCommand(buffer, sizeof(buffer), radioNumber);
+
+  packetStatus->commandStatus =
+      ((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1];
+  packetStatus->crc = (buffer[2] >> 4) & 0x01U;
+  packetStatus->codingRate = buffer[2] & 0x0FU;
+  packetStatus->packetLength = buffer[3];
+  packetStatus->snrRaw = (int8_t)buffer[4];
+  packetStatus->rssiRaw =
+      ((uint16_t)buffer[5] << 1) | (uint16_t)((buffer[7] >> 1) & 0x01U);
+  packetStatus->signalRssiRaw =
+      ((uint16_t)buffer[6] << 1) | (uint16_t)(buffer[7] & 0x01U);
+  packetStatus->detector = (buffer[7] >> 2) & 0x0FU;
+  uint32_t frequencyOffset = ((uint32_t)buffer[8] << 16) |
+                             ((uint32_t)buffer[9] << 8) |
+                             (uint32_t)buffer[10];
+  if ((frequencyOffset & 0x00800000UL) != 0U) {
+    frequencyOffset |= 0xFF000000UL;
+  }
+  packetStatus->frequencyOffsetHz = (int32_t)frequencyOffset;
+}
+
+uint32_t LR1121Driver::GetLoRaCompatibilityConfigDiag(
+    SX12XX_Radio_Number_t radioNumber) {
+  return ReadRegMem32(LR20XX_LORA_SX1276_COMPAT_ADDR, radioNumber);
+}
+
+uint16_t LR1121Driver::ReadStatusWordDiag(
+    SX12XX_Radio_Number_t radioNumber) {
+  uint8_t status[LR20XX_RESPONSE_STATUS_LEN] = {};
+  hal.WaitOnBusy(radioNumber);
+  lr1121_select_radio(LR2021SpiRadioForMask(radioNumber));
+  lr1121_cs_assert();
+  const bool ok = lr1121_spi_transfer_raw(nullptr, status, sizeof(status));
+  lr1121_cs_deassert();
+  lr1121_select_radio(LR1121_RADIO_1);
+  return ok ? (uint16_t)(((uint16_t)status[0] << 8) | status[1]) : 0U;
 }
 
 void LR1121Driver::GetGfskRxStats(SX12XX_Radio_Number_t radioNumber,
@@ -1485,6 +1576,9 @@ void LR1121Driver::ConfigModParamsLoRa(uint8_t bw, uint8_t sf, uint8_t cr,
         (unsigned)buf[1]);
 #endif
 
+#if SIW917_ELRS_LR2021_LORA_SF5_SX1276_COMPAT
+  // This workaround is for communication with SX1276 generation radios. An
+  // LR1121 peer uses the native LR20xx state established by SetModulationParams.
   if (radioNumber & SX12XX_Radio_1 && radio1isSubGHz)
     ConfigureLoraSx1276Compatibility(sf, SX12XX_Radio_1);
 
@@ -1492,8 +1586,7 @@ void LR1121Driver::ConfigModParamsLoRa(uint8_t bw, uint8_t sf, uint8_t cr,
     if (radioNumber & SX12XX_Radio_2 && radio2isSubGHz)
       ConfigureLoraSx1276Compatibility(sf, SX12XX_Radio_2);
   }
-
-  ConfigureLoraFrequencyRange(sf, radioNumber);
+#endif
 }
 
 void LR1121Driver::SetPacketParamsLoRa(
@@ -1528,12 +1621,30 @@ void LR1121Driver::SetPacketParamsLoRa(
 void LR1121Driver::SetLoRaSyncWord(uint8_t syncWord, uint8_t sf,
                                    SX12XX_Radio_Number_t radioNumber) {
   (void)sf;
+  bool useExtendedSyncWord = false;
 #if SIW917_ELRS_LR2021_LORA_COMPAT_EXT_SYNCWORD
-  if (syncWord == LR20XX_LORA_SYNC_WORD_PRIVATE) {
+  useExtendedSyncWord = true;
+#endif
+#if SIW917_ELRS_LR2021_SUBGHZ_SF5_EXT_SYNCWORD
+  const bool targetsSubGHz =
+      (((radioNumber & SX12XX_Radio_1) != 0) && radio1isSubGHz) ||
+      (((radioNumber & SX12XX_Radio_2) != 0) && radio2isSubGHz);
+  useExtendedSyncWord |=
+      (sf == LR11XX_RADIO_LORA_SF5) && targetsSubGHz;
+#endif
+
+  lastLoRaSyncMode = useExtendedSyncWord ? 2U : 1U;
+  lastLoRaSyncCommandStatus = 0U;
+
+  if (useExtendedSyncWord &&
+      syncWord == LR20XX_LORA_SYNC_WORD_PRIVATE) {
     uint8_t buf[2] = {LR20XX_LORA_SYNC_WORD_PRIVATE_EXT_1,
                       LR20XX_LORA_SYNC_WORD_PRIVATE_EXT_2};
     hal.WriteCommand(LR20XX_LORA_SET_SYNCWORD_EXT, buf, sizeof(buf),
                      radioNumber);
+#if SIW917_ELRS_LR2021_SF5_SCAN_DIAG
+    lastLoRaSyncCommandStatus = ReadStatusWordDiag(radioNumber);
+#endif
 
 #if defined(SIW917_ELRS_RADIO_INIT_VERBOSE) && SIW917_ELRS_RADIO_INIT_VERBOSE
     DBGLN("LR2021 LoRa syncword-ext: private (%u,%u) sf=%u",
@@ -1541,10 +1652,12 @@ void LR1121Driver::SetLoRaSyncWord(uint8_t syncWord, uint8_t sf,
 #endif
     return;
   }
-#endif
 
   uint8_t buf[1] = {syncWord};
   hal.WriteCommand(LR20XX_LORA_SET_SYNCWORD, buf, sizeof(buf), radioNumber);
+#if SIW917_ELRS_LR2021_SF5_SCAN_DIAG
+  lastLoRaSyncCommandStatus = ReadStatusWordDiag(radioNumber);
+#endif
 
 #if defined(SIW917_ELRS_RADIO_INIT_VERBOSE) && SIW917_ELRS_RADIO_INIT_VERBOSE
   DBGLN("LR2021 LoRa syncword: 0x%02X sf=%u", (unsigned)syncWord,
@@ -1738,6 +1851,36 @@ LR1121Driver::ClearIrqStatus(SX12XX_Radio_Number_t radioNumber) {
 
 void LR1121Driver::ClearRxFifo(SX12XX_Radio_Number_t radioNumber) {
   hal.WriteCommand(LR20XX_SYSTEM_CLEAR_RX_FIFO, radioNumber);
+}
+
+void LR1121Driver::ConfigureRxFifoHandoff(
+    uint8_t payloadLength, bool enable,
+    SX12XX_Radio_Number_t radioNumber) {
+  const uint16_t highThreshold =
+      enable && payloadLength > 0 ? (uint16_t)(payloadLength - 1U) : 0U;
+  uint8_t buf[10] = {
+      (uint8_t)(enable ? LR20XX_FIFO_FLAG_THRESHOLD_HIGH : 0U),
+      0U,
+      (uint8_t)(highThreshold >> 8),
+      (uint8_t)highThreshold,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+  };
+  hal.WriteCommand(LR20XX_SYSTEM_CONFIG_FIFO_IRQ, buf, sizeof(buf),
+                   radioNumber);
+  ClearRxFifoIrqFlags(LR20XX_FIFO_FLAG_ALL, radioNumber);
+}
+
+void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR
+LR1121Driver::ClearRxFifoIrqFlags(
+    uint8_t flags, SX12XX_Radio_Number_t radioNumber) {
+  uint8_t buf[2] = {flags, 0U};
+  hal.WriteCommand(LR20XX_SYSTEM_CLEAR_FIFO_IRQ_FLAGS, buf, sizeof(buf),
+                   radioNumber);
 }
 
 void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::ClearIrqStatusMask(
@@ -2031,6 +2174,11 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
   rx_buf[0] = (uint8_t)(LR20XX_CMD_READ_RADIO_RX_FIFO >> 8);
   rx_buf[1] = (uint8_t)(LR20XX_CMD_READ_RADIO_RX_FIFO & 0xFF);
   hal.ReadCommand(rx_buf, rxReadLength, radioNumber);
+  if (rxFifoStageActive) {
+    // RX_DONE finalizes the packet. Reading now drops FIFO below the staged
+    // threshold; clear its diagnostic latch for the following packet.
+    ClearRxFifoIrqFlags(LR20XX_FIFO_FLAG_THRESHOLD_HIGH, radioNumber);
+  }
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   siw917_packet_ready_us = micros();
 #endif
@@ -2051,6 +2199,16 @@ LR1121Driver::RXnbISR(SX12XX_Radio_Number_t radioNumber) {
                               true, &syncOffset, &syncNonce, &syncType);
     crcAny = siw917FindOtaCrcMatch(rx_buf, rxReadLength, effectivePayloadLength,
                                    false, &crcOffset, &crcNonce, &crcType);
+    if (rxFifoStageActive && crcSync) {
+      sf5RawSyncMatchCount++;
+      sf5RawLastSyncOffset = syncOffset;
+    }
+    if (rxFifoStageActive && crcAny) {
+      sf5RawAnyMatchCount++;
+      sf5RawLastAnyOffset = crcOffset;
+      sf5RawLastAnyNonce = crcNonce;
+      sf5RawLastAnyType = crcType;
+    }
     if (crcSync && syncOffset >= LR2021_RX_FIFO_COMMAND_PHASE_BYTES &&
         ((uint16_t)syncOffset + effectivePayloadLength) <= rxReadLength) {
       fifoPayloadOffset = syncOffset;
@@ -2382,22 +2540,25 @@ bool lr1121_spi_transfer_polled(const uint8_t *tx_data, uint8_t *rx_data,
 
 void SIW917_ELRS_RAMFUNC_ATTR
 LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber) {
-#if defined(SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH) &&                     \
-    SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH
+#if (defined(SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH) &&                    \
+     SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH) ||                            \
+    (defined(SIW917_ELRS_LR2021_LORA_TXDONE_FAST_PATH) &&                    \
+     SIW917_ELRS_LR2021_LORA_TXDONE_FAST_PATH)
   const uint32_t dioEdgeSequence =
       siw917Lr2021DioEdgeSequence(radioNumber);
   const bool freshTxEdge = dioEdgeSequence != instance->txArmDioSequence;
-  const bool useGfskFastTxDone =
-      instance->txInProgress && instance->useFSK && freshTxEdge;
-  if (useGfskFastTxDone) {
+  const bool useFastTxDone =
+      instance->txInProgress && freshTxEdge &&
+      ((instance->useFSK && SIW917_ELRS_LR2021_GFSK_TXDONE_FAST_PATH) ||
+       (!instance->useFSK && SIW917_ELRS_LR2021_LORA_TXDONE_FAST_PATH));
+  if (useFastTxDone) {
     LR1121_ISR_STAT_INC(isrCallCount);
     LR1121_ISR_STAT_INC(txDoneCount);
     LR1121_ISR_STAT_SET(lastIrqStatus, LR1121_IRQ_TX_DONE);
     instance->processingPacketRadio = radioNumber;
 
     // Keep the fast path upstream-shaped: deassert the level-held DIO source
-    // before SetRx. This uses the same two commands as the old ordering while
-    // ensuring the next RX_DONE can create a fresh rising edge.
+    // before SetRx so the next RX_DONE can create a fresh rising edge.
     instance->ClearIrqStatusMask(LR1121_IRQ_TX_DONE, radioNumber);
     instance->TXnbISR();
     return;
@@ -2459,6 +2620,14 @@ void SIW917_ELRS_RAMFUNC_ATTR LR1121Driver::IsrCallbackWithStatus(
                          | LR20XX_IRQ_RX_FIFO
 #endif
                          )) {
+    if (instance->rxFifoStageActive) {
+      sf5RxDoneStageCount++;
+      if ((irqStatus & LR20XX_IRQ_RX_FIFO) != 0U) {
+        sf5RxDoneWithFifoCount++;
+      } else {
+        sf5RxDoneWithoutFifoCount++;
+      }
+    }
     LR1121_ISR_STAT_INC(rxDoneCount);
     if (radioNumber == SX12XX_Radio_1) {
       LR1121_ISR_STAT_INC(rxDoneCountRadio1);
