@@ -1,0 +1,93 @@
+# Build artifacts
+cmake_gcc/build/
+cmake_gcc/CMakeCache.txt
+cmake_gcc/CMakeFiles/
+cmake_iar/build/
+cmake_iar/CMakeCache.txt
+cmake_iar/CMakeFiles/
+
+# IDE files
+*.code-workspace
+.vscode/
+.settings/
+.project
+.cproject
+
+# Logs and temp files
+*.log
+serial_log.txt
+lr1121_firmware_check.txt
+
+# Python debug/analysis scripts
+*.py
+*.pyc
+__pycache__/
+
+# Upstream reference files (not needed for build)
+*_upstream.cpp
+*_upstream.h
+elrs_4_0_*.txt
+
+# Other reference/temp files
+*.zip
+wifi_http_otaf_soc/
+
+# Binary outputs (use releases instead)
+*.rps
+*.hex
+*.bin
+*.elf
+*.map
+*.axf
+
+# Large documentation PDFs (reference only)
+*.pdf
+
+# Ninja build files
+cmake_gcc/.ninja_deps
+cmake_gcc/.ninja_log
+cmake_gcc/build.ninja
+cmake_gcc/cmake_install.cmake
+
+# IDE/editor metadata
+.uceditor/
+.projectlinkstore
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files
+*_backup.c
+*_backup.h
+*.bak
+*.orig
+
+# Backup/trashed directories
+trashed_modified_files/
+src/old_c_code_backup/
+
+# Example/test directories not part of main project
+sl_si91x_gpio_uulp_example/
+sl_si91x_gpio_uulp_example_2/
+
+# Upstream ELRS reference clone (use upstream_elrs/ for selected reference files)
+ExpressLRS/
+
+# Claude session data
+.claude/
+
+# Local helper/codex folders
+_archive/
+_codex_skills/
+helper_repo/
+
+# Loose build outputs in cmake_gcc root
+cmake_gcc/*.out
+cmake_gcc/*.s37
+cmake_gcc/*.hex
+cmake_gcc/*.bin
+cmake_gcc/build_err.txt
+cmake_gcc/build_log.txt
+cmake_gcc/build_output.txt
