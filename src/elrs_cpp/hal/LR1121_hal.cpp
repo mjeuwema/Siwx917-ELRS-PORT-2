@@ -26,6 +26,7 @@
 #include "siw917_elrs_timing.h"
 #include "targets.h"
 
+#include <stdio.h>
 #include <string.h>
 
 // Include our proven C driver implementation
@@ -44,6 +45,9 @@ volatile bool isr_1_pending = false;
 volatile bool isr_2_pending = false;
 volatile uint32_t busy_timeout_count = 0;
 static volatile uint16_t last_command_opcode = 0;
+static volatile bool rate_configuration_active = false;
+static volatile uint32_t rate_configuration_extended_waits = 0;
+static volatile uint32_t rate_configuration_busy_timeouts = 0;
 #if SIW917_ELRS_FUSED_RX_RETUNE
 static volatile bool rx_continuous_active = false;
 static volatile bool pending_rx_retune = false;
@@ -76,7 +80,23 @@ extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
 
 static bool dio1StageInit();
+static bool waitOnBusyForCommand(LR1121Hal *hal,
+                                 SX12XX_Radio_Number_t radioNumber,
+                                 uint16_t opcode);
 static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size);
+
+extern "C" void siw917_lr1121_set_rate_configuration_active(bool active) {
+  if (active) {
+    rate_configuration_extended_waits = 0;
+    rate_configuration_busy_timeouts = 0;
+  } else if (rate_configuration_active) {
+    printf("[LR1121_CFG] rate transaction complete extended_waits=%lu "
+           "timeouts=%lu\n",
+           (unsigned long)rate_configuration_extended_waits,
+           (unsigned long)rate_configuration_busy_timeouts);
+  }
+  rate_configuration_active = active;
+}
 
 static inline bool handleBusyTimeout(const char *context, uint16_t opcode,
                                      uint8_t size) {
@@ -217,8 +237,9 @@ void LR1121Hal::WriteCommand(uint16_t opcode,
   }
 #endif
 
-  if (!WaitOnBusy(radioNumber) &&
-      !handleBusyTimeout("WriteCommand", opcode, 0)) {
+  if (!waitOnBusyForCommand(this, radioNumber, opcode) &&
+      (rate_configuration_active ||
+       !handleBusyTimeout("WriteCommand", opcode, 0))) {
     return;
   }
 
@@ -318,14 +339,17 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
   }
 #endif
 #if SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
-  if (attempted_fast_hot_command && connectionState != disconnected) {
+  if (attempted_fast_hot_command && connectionState != disconnected &&
+      !rate_configuration_active) {
     return;
   }
 #endif
 #endif
 
-  if (!handled_hot_command && !WaitOnBusy(radioNumber) &&
-      !handleBusyTimeout("WriteCommand", opcode, size)) {
+  if (!handled_hot_command &&
+      !waitOnBusyForCommand(this, radioNumber, opcode) &&
+      (rate_configuration_active ||
+       !handleBusyTimeout("WriteCommand", opcode, size))) {
     return;
   }
 
@@ -413,8 +437,9 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
         return;
       }
       memcpy(tx_buffer, buffer, size);
-      if (!WaitOnBusy(radioNumber) &&
-          !handleBusyTimeout("ReadCommand inline", inline_opcode, size)) {
+      if (!waitOnBusyForCommand(this, radioNumber, inline_opcode) &&
+          (rate_configuration_active ||
+           !handleBusyTimeout("ReadCommand inline", inline_opcode, size))) {
         memset(buffer, 0, size);
         last_command_opcode = inline_opcode;
         return;
@@ -450,8 +475,9 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
     return;
   }
 
-  if (!WaitOnBusy(radioNumber) &&
-      !handleBusyTimeout("ReadCommand", last_command_opcode, size)) {
+  if (!waitOnBusyForCommand(this, radioNumber, last_command_opcode) &&
+      (rate_configuration_active ||
+       !handleBusyTimeout("ReadCommand", last_command_opcode, size))) {
     if (buffer != nullptr && size > 0) {
       memset(buffer, 0, size);
     }
@@ -545,6 +571,27 @@ static inline bool dio1StagePathAllowed() {
 #endif
 }
 
+static bool waitOnBusyForCommand(LR1121Hal *hal,
+                                 SX12XX_Radio_Number_t radioNumber,
+                                 uint16_t opcode) {
+  if (!rate_configuration_active) {
+    return hal->WaitOnBusy(radioNumber);
+  }
+
+  if (lr1121_wait_busy_fast_us(SIW917_ELRS_BUSY_FAST_US)) {
+    return true;
+  }
+
+  rate_configuration_extended_waits++;
+  const bool ready = lr1121_wait_busy_timeout(100);
+  if (!ready) {
+    rate_configuration_busy_timeouts++;
+    busy_timeout_count++;
+    printf("[LR1121_CFG] BUSY timeout opcode=0x%04X\n", opcode);
+  }
+  return ready;
+}
+
 static uint32_t readBigEndianU32(const uint8_t *bytes) {
   return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
          ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
@@ -562,8 +609,9 @@ static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
   uint32_t actual = 0U;
   if (lr1121_read_regmem32(kSf6Register, &actual) &&
       (actual & mask) == expected) {
-    DBGLN("[LR1121_CFG] SF6 register verified value=0x%08lX",
-          (unsigned long)actual);
+    printf("[LR1121_CFG] SF6 compatibility verified value=0x%08lX "
+           "mask=0x%08lX\n",
+           (unsigned long)actual, (unsigned long)mask);
     return;
   }
 
@@ -574,9 +622,10 @@ static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
   const bool retryVerified = retrySent &&
                              lr1121_read_regmem32(kSf6Register, &actual) &&
                              (actual & mask) == expected;
-  DBGLN("[LR1121_CFG] SF6 register retry %s value=0x%08lX expected=0x%08lX mask=0x%08lX",
-        retryVerified ? "verified" : "FAILED", (unsigned long)actual,
-        (unsigned long)expected, (unsigned long)mask);
+  printf("[LR1121_CFG] SF6 compatibility retry %s value=0x%08lX "
+         "expected=0x%08lX mask=0x%08lX\n",
+         retryVerified ? "verified" : "FAILED", (unsigned long)actual,
+         (unsigned long)expected, (unsigned long)mask);
 }
 
 static inline bool dio1GpioDirectPathAllowed() {
