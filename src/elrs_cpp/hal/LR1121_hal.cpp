@@ -630,14 +630,7 @@ static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
 
 static inline bool dio1GpioDirectPathAllowed() {
 #if SIW917_ELRS_DIRECT_DIO_ISR
-#if defined(TARGET_TX)
-  // TX has no RX timer-lock state. Once the first valid downlink connects the
-  // link, service TX_DONE/RX_DONE directly so K1000 can arm its telemetry
-  // window inside the small post-TX margin.
-  return connectionState == connected;
-#else
   return connectionState == connected && RXtimerState == tim_locked;
-#endif
 #else
   return false;
 #endif
