@@ -64,6 +64,7 @@ extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
 
 static bool dio1StageInit();
+static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size);
 
 static inline bool handleBusyTimeout(const char *context, uint16_t opcode,
                                      uint8_t size) {
@@ -355,6 +356,8 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
   }
   if (!command_ok) {
     DBGLN("WriteCommand failed (opcode=0x%04X size=%u)", opcode, size);
+  } else if (opcode == LR11XX_REGMEM_WRITE_REGMEM32_MASK_OC) {
+    verifySf6CompatibilityWrite(tx_buffer, size);
   }
 
 #if SIW917_ELRS_FUSED_RX_RETUNE
@@ -490,6 +493,7 @@ static volatile uint32_t dio1_direct_reentrant_count = 0;
 static volatile uint32_t dio1_level_requeue_count = 0;
 static volatile uint32_t dio1_last_edge_us = 0;
 static volatile uint32_t dio1_last_deferred_us = 0;
+static volatile uint32_t dio1_stage_delay_max_us = 0;
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static volatile bool dio1_stage_irq_installed = false;
 static volatile uint32_t dio1_stage_irq_count = 0;
@@ -527,6 +531,40 @@ static inline bool dio1StagePathAllowed() {
 #else
   return false;
 #endif
+}
+
+static uint32_t readBigEndianU32(const uint8_t *bytes) {
+  return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+         ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
+}
+
+static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
+  constexpr uint32_t kSf6Register = 0x00F20414U;
+  if (buffer == nullptr || size != 12U ||
+      readBigEndianU32(buffer) != kSf6Register) {
+    return;
+  }
+
+  const uint32_t mask = readBigEndianU32(buffer + 4);
+  const uint32_t expected = readBigEndianU32(buffer + 8) & mask;
+  uint32_t actual = 0U;
+  if (lr1121_read_regmem32(kSf6Register, &actual) &&
+      (actual & mask) == expected) {
+    DBGLN("[LR1121_CFG] SF6 register verified value=0x%08lX",
+          (unsigned long)actual);
+    return;
+  }
+
+  const bool retrySent = lr1121_wait_busy_timeout(100) &&
+                         lr1121_send_command(
+                             LR11XX_REGMEM_WRITE_REGMEM32_MASK_OC, buffer,
+                             size);
+  const bool retryVerified = retrySent &&
+                             lr1121_read_regmem32(kSf6Register, &actual) &&
+                             (actual & mask) == expected;
+  DBGLN("[LR1121_CFG] SF6 register retry %s value=0x%08lX expected=0x%08lX mask=0x%08lX",
+        retryVerified ? "verified" : "FAILED", (unsigned long)actual,
+        (unsigned long)expected, (unsigned long)mask);
 }
 
 static inline bool dio1GpioDirectPathAllowed() {
@@ -580,6 +618,10 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   isr_1_pending = false;
   dio1_direct_count++;
   dio1_last_deferred_us = micros();
+  const uint32_t stageDelayUs = dio1_last_deferred_us - dio1_last_edge_us;
+  if (stageDelayUs < 1000000U && stageDelayUs > dio1_stage_delay_max_us) {
+    dio1_stage_delay_max_us = stageDelayUs;
+  }
   dio1_isr_processing = true;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t processStartUs = micros();
@@ -675,6 +717,14 @@ extern "C" uint32_t lr1121_hal_get_direct_reentrant_count(void) {
 
 extern "C" uint32_t lr1121_hal_get_level_requeue_count(void) {
   return dio1_level_requeue_count;
+}
+
+extern "C" uint32_t lr1121_hal_get_stage_delay_max_us(void) {
+  return dio1_stage_delay_max_us;
+}
+
+extern "C" void lr1121_hal_reset_stage_delay_stats(void) {
+  dio1_stage_delay_max_us = 0U;
 }
 
 extern "C" uint32_t lr1121_hal_get_stage_max_us(void) {

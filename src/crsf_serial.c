@@ -57,9 +57,9 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 
 /*
  * RX builds keep the original receiver-to-flight-controller USART0 route.
- * TX builds use UART1 as a normal, non-inverted SiW-side UART. The radio-side
- * inverted single-wire DATA bus is handled by an external inverter/tri-state
- * adapter whose active-low TX output-enable is controlled below.
+ * TX builds use UART1 as a normal, non-inverted SiW-side UART. The two-wire
+ * build connects directly to the custom EdgeTX RX/TX transport. Adapter builds
+ * use an external inverter/tri-state stage and active-low output enable.
  */
 #define CRSF_SERIAL_USE_ULP_UART 0
 
@@ -87,7 +87,11 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #ifndef CRSF_SERIAL_TX_OE_N_PAD
 #define CRSF_SERIAL_TX_OE_N_PAD RTE_UART1_RS485_DE_PAD
 #endif
+#if defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+#define CRSF_SERIAL_HAS_TX_OE_N 0
+#else
 #define CRSF_SERIAL_HAS_TX_OE_N 1
+#endif
 #define CRSF_SERIAL_UART_REGS UART1
 #if defined(RTE_UART1_DMA_MODE1_EN) && (RTE_UART1_DMA_MODE1_EN == 1)
 #define CRSF_SERIAL_DMA_ENABLED 1
@@ -144,7 +148,7 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_DMA_MODE_NAME "IRQ"
 #endif
 
-#if defined(SIW917_ELRS_TARGET_TX)
+#if defined(SIW917_ELRS_TARGET_TX) && !defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
 #define CRSF_SERIAL_SUPPRESS_TX_ECHO 1
 #else
 #define CRSF_SERIAL_SUPPRESS_TX_ECHO 0
@@ -1021,8 +1025,10 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
     const uint32_t oe_assert_cycles = DWT->CYCCNT;
 #endif
     crsf_serial_tx_oe_n_write(false);
-#if defined(SIW917_ELRS_TARGET_TX)
+#if CRSF_SERIAL_HAS_TX_OE_N
     delayMicroseconds(CRSF_SERIAL_TX_OE_SETUP_US);
+#endif
+#if defined(SIW917_ELRS_TARGET_TX)
     const uint32_t send_start_cycles = DWT->CYCCNT;
 #endif
     g_tx_in_progress = true;
@@ -1228,11 +1234,18 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
 
 #if defined(SIW917_ELRS_TARGET_TX)
     crsf_serial_configure_tx_oe_n_idle();
+#if defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+    CRSF_DBG("Init %s EdgeTX two-wire CRSF on TX GPIO_%lu, RX GPIO_%lu (normal 8N1, RX always enabled)\n",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned long)CRSF_SERIAL_TX_PIN,
+             (unsigned long)CRSF_SERIAL_RX_PIN);
+#else
     CRSF_DBG("Init %s handset CRSF normal UART on TX GPIO_%lu, RX GPIO_%lu, TX_OE_N GPIO_%lu\n",
              CRSF_SERIAL_DRIVER_NAME,
              (unsigned long)CRSF_SERIAL_TX_PIN,
              (unsigned long)CRSF_SERIAL_RX_PIN,
              (unsigned long)CRSF_SERIAL_TX_OE_N_PIN);
+#endif
 #if CRSF_SERIAL_TX_ECHO_PROBE
     CRSF_DBG("TXBUS echo probe enabled; OE setup=%u us, echo settle=%u us\n",
              (unsigned)CRSF_SERIAL_TX_OE_SETUP_US,

@@ -658,10 +658,34 @@ static inline void lr1121_diag_update_elapsed_us(volatile uint32_t *max_value,
 
 static volatile uint32_t lr1121_busy_fast_max_iterations = 0;
 static volatile uint32_t lr1121_busy_fast_fail_count = 0;
+static volatile uint32_t lr1121_rx_arm_max_us = 0;
+static volatile uint32_t lr1121_rx_arm_count = 0;
+static volatile uint32_t lr1121_rx_arm_fail_count = 0;
 
 enum {
   LR1121_OP_SET_RX = 0x0209,
+  LR1121_OP_SET_FREQ_SET_RX = 0x0701,
 };
+
+static inline bool lr1121_is_rx_arm_opcode(uint16_t opcode) {
+  return opcode == LR1121_OP_SET_RX || opcode == LR1121_OP_SET_FREQ_SET_RX;
+}
+
+static inline void lr1121_record_rx_arm(uint16_t opcode, uint32_t start_us,
+                                        bool ok) {
+  if (!lr1121_is_rx_arm_opcode(opcode)) {
+    return;
+  }
+
+  const uint32_t elapsed_us = micros() - start_us;
+  lr1121_rx_arm_count++;
+  if (elapsed_us < 1000000U && elapsed_us > lr1121_rx_arm_max_us) {
+    lr1121_rx_arm_max_us = elapsed_us;
+  }
+  if (!ok) {
+    lr1121_rx_arm_fail_count++;
+  }
+}
 
 static inline void lr1121_busy_fast_record(uint32_t iterations, bool ready) {
 #if SIW917_ELRS_RAW_GSPI_STATS_DIAG
@@ -1088,6 +1112,8 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #ifdef USE_SOFT_SPI
   return lr1121_send_command_raw_pub(opcode, params, param_len);
 #else
+  const bool is_rx_arm = lr1121_is_rx_arm_opcode(opcode);
+  const uint32_t rx_arm_start_us = is_rx_arm ? micros() : 0U;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
@@ -1102,6 +1128,9 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #else
   if (total_len > sizeof(tx) || (param_len > 0U && params == NULL)) {
 #endif
+    if (is_rx_arm) {
+      lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
+    }
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1120,6 +1149,9 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   const uint32_t busy_timeout_us = lr1121_fast_busy_timeout_us(opcode);
   const bool busy_ready = lr1121_wait_busy_fast_timeout(busy_timeout_us);
   if (!busy_ready && !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
+    if (is_rx_arm) {
+      lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
+    }
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1128,6 +1160,9 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
+    if (is_rx_arm) {
+      lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
+    }
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1235,6 +1270,10 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #endif
   if (!ok) {
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
+  }
+
+  if (is_rx_arm) {
+    lr1121_record_rx_arm(opcode, rx_arm_start_us, ok);
   }
 
   return ok;
@@ -2981,6 +3020,48 @@ bool lr1121_read_response(uint8_t *response, uint16_t response_len) {
    */
 
   return result;
+}
+
+bool lr1121_read_regmem32(uint32_t address, uint32_t *value) {
+  if (value == NULL) {
+    return false;
+  }
+
+  const uint8_t params[5] = {
+      (uint8_t)(address >> 24),
+      (uint8_t)(address >> 16),
+      (uint8_t)(address >> 8),
+      (uint8_t)address,
+      1U,
+  };
+  uint8_t response[5] = {0};
+
+  if (!lr1121_wait_busy_timeout(100) ||
+      !lr1121_send_command(0x0106U, params, sizeof(params)) ||
+      !lr1121_wait_busy_timeout(100) ||
+      !lr1121_read_response(response, sizeof(response))) {
+    return false;
+  }
+
+  *value = ((uint32_t)response[1] << 24) |
+           ((uint32_t)response[2] << 16) |
+           ((uint32_t)response[3] << 8) |
+           (uint32_t)response[4];
+  return true;
+}
+
+uint32_t lr1121_get_rx_arm_max_us(void) { return lr1121_rx_arm_max_us; }
+
+uint32_t lr1121_get_rx_arm_count(void) { return lr1121_rx_arm_count; }
+
+uint32_t lr1121_get_rx_arm_fail_count(void) {
+  return lr1121_rx_arm_fail_count;
+}
+
+void lr1121_reset_rx_arm_stats(void) {
+  lr1121_rx_arm_max_us = 0U;
+  lr1121_rx_arm_count = 0U;
+  lr1121_rx_arm_fail_count = 0U;
 }
 
 static bool soft_spi_transfer_with_cs(const uint8_t *tx_data, uint8_t *rx_data,
