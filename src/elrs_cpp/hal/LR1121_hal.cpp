@@ -60,6 +60,18 @@ static inline void dio1UpdateMax(volatile uint32_t &maxValue,
 }
 #endif
 
+#if SIW917_ELRS_DIO_EDGE_TIMESTAMPS
+#define SIW917_DIO_TIMESTAMP(var_) ((var_) = micros())
+#else
+#define SIW917_DIO_TIMESTAMP(var_) do { } while (0)
+#endif
+
+#if SIW917_ELRS_DIO_STATS_DIAG
+#define SIW917_DIO_STAT_INC(var_) ((var_)++)
+#else
+#define SIW917_DIO_STAT_INC(var_) do { } while (0)
+#endif
+
 extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
 
@@ -587,13 +599,13 @@ static void SIW917_ELRS_RAMFUNC_ATTR processDio1IrqNow() {
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
 static void SIW917_ELRS_RAMFUNC_ATTR dio1PendStageFromIsr() {
-  dio1_stage_pend_count++;
+  SIW917_DIO_STAT_INC(dio1_stage_pend_count);
   NVIC_SetPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
 }
 
 static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   NVIC_ClearPendingIRQ((IRQn_Type)DIO1_STAGE_IRQ);
-  dio1_stage_irq_count++;
+  SIW917_DIO_STAT_INC(dio1_stage_irq_count);
 
   if (!dio1StagePathAllowed()) {
     dio1_isr_pending = true;
@@ -603,7 +615,7 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
   }
 
   if (dio1_isr_processing) {
-    dio1_direct_reentrant_count++;
+    SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
     dio1_isr_pending = true;
     isr_1_pending = true;
     elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_DIO1);
@@ -616,12 +628,14 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
 
   dio1_isr_pending = false;
   isr_1_pending = false;
-  dio1_direct_count++;
-  dio1_last_deferred_us = micros();
+  SIW917_DIO_STAT_INC(dio1_direct_count);
+  SIW917_DIO_TIMESTAMP(dio1_last_deferred_us);
+#if SIW917_ELRS_DIO_EDGE_TIMESTAMPS
   const uint32_t stageDelayUs = dio1_last_deferred_us - dio1_last_edge_us;
   if (stageDelayUs < 1000000U && stageDelayUs > dio1_stage_delay_max_us) {
     dio1_stage_delay_max_us = stageDelayUs;
   }
+#endif
   dio1_isr_processing = true;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t processStartUs = micros();
@@ -634,7 +648,7 @@ static void SIW917_ELRS_RAMFUNC_ATTR dio1StageIrqHandler() {
 
   lr1121_dio1_resume_isr();
   if (lr1121_dio1_read() != 0) {
-    dio1_level_requeue_count++;
+    SIW917_DIO_STAT_INC(dio1_level_requeue_count);
     dio1_isr_pending = true;
     isr_1_pending = true;
     lr1121_dio1_pause_isr();
@@ -744,8 +758,8 @@ extern "C" uint32_t lr1121_hal_get_deferred_max_us(void) {
 }
 
 void LR1121Hal::dioISR_1() {
-  dio1_last_edge_us = micros();
-  isr_1_total_count++;
+  SIW917_DIO_TIMESTAMP(dio1_last_edge_us);
+  SIW917_DIO_STAT_INC(isr_1_total_count);
 
 #if SIW917_ELRS_TWO_STAGE_DIO_ISR
   dio1_isr_pending = true;
@@ -755,14 +769,14 @@ void LR1121Hal::dioISR_1() {
 #if SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED
   if (dio1_stage_irq_installed && dio1GpioDirectPathAllowed()) {
     if (dio1_isr_processing) {
-      dio1_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
       dio1PendStageFromIsr();
       return;
     }
 
     dio1_isr_pending = false;
     isr_1_pending = false;
-    dio1_direct_count++;
+    SIW917_DIO_STAT_INC(dio1_direct_count);
     dio1_last_deferred_us = dio1_last_edge_us;
     dio1_isr_processing = true;
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
@@ -776,7 +790,7 @@ void LR1121Hal::dioISR_1() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -798,7 +812,7 @@ void LR1121Hal::dioISR_1() {
 
   if (dio1GpioDirectPathAllowed()) {
     if (dio1_isr_processing) {
-      dio1_direct_reentrant_count++;
+      SIW917_DIO_STAT_INC(dio1_direct_reentrant_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -806,7 +820,7 @@ void LR1121Hal::dioISR_1() {
       return;
     }
 
-    dio1_direct_count++;
+    SIW917_DIO_STAT_INC(dio1_direct_count);
     dio1_isr_processing = true;
     lr1121_dio1_pause_isr();
     processDio1IrqNow();
@@ -814,7 +828,7 @@ void LR1121Hal::dioISR_1() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();
@@ -836,14 +850,14 @@ void LR1121Hal::dioISR_1() {
 void LR1121Hal::handleDeferredISR() {
   const bool dio1High = lr1121_dio1_read() != 0;
   if (dio1_isr_pending || dio1High) {
-    dio1_last_deferred_us = micros();
+    SIW917_DIO_TIMESTAMP(dio1_last_deferred_us);
   }
 
   if (!dio1_isr_pending && dio1High) {
     // DIO1 is level-high until the LR1121 IRQ is cleared. If a new IRQ arrives
     // while the GPIO edge is masked, there may be no fresh rising edge to wake
     // us, so synthesize one from the level.
-    dio1_level_requeue_count++;
+    SIW917_DIO_STAT_INC(dio1_level_requeue_count);
     dio1_last_edge_us = dio1_last_deferred_us;
     dio1_isr_pending = true;
     isr_1_pending = true;
@@ -867,7 +881,7 @@ void LR1121Hal::handleDeferredISR() {
 
     lr1121_dio1_resume_isr();
     if (lr1121_dio1_read() != 0) {
-      dio1_level_requeue_count++;
+      SIW917_DIO_STAT_INC(dio1_level_requeue_count);
       dio1_isr_pending = true;
       isr_1_pending = true;
       lr1121_dio1_pause_isr();

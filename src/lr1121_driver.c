@@ -639,6 +639,12 @@ static volatile uint32_t lr1121_raw_gspi_fail_count = 0;
 #define LR1121_RAW_GSPI_STAT_INC(var_) do { } while (0)
 #endif
 
+#if SIW917_ELRS_ISR_STATS_DIAG
+#define LR1121_ISR_STAT_INC(var_) ((var_)++)
+#else
+#define LR1121_ISR_STAT_INC(var_) do { } while (0)
+#endif
+
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
 static inline void lr1121_diag_update_max(volatile uint32_t *max_value,
                                           uint32_t value) {
@@ -667,6 +673,7 @@ enum {
   LR1121_OP_SET_FREQ_SET_RX = 0x0701,
 };
 
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
 static inline bool lr1121_is_rx_arm_opcode(uint16_t opcode) {
   return opcode == LR1121_OP_SET_RX || opcode == LR1121_OP_SET_FREQ_SET_RX;
 }
@@ -686,6 +693,7 @@ static inline void lr1121_record_rx_arm(uint16_t opcode, uint32_t start_us,
     lr1121_rx_arm_fail_count++;
   }
 }
+#endif
 
 static inline void lr1121_busy_fast_record(uint32_t iterations, bool ready) {
 #if SIW917_ELRS_RAW_GSPI_STATS_DIAG
@@ -1112,9 +1120,9 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #ifdef USE_SOFT_SPI
   return lr1121_send_command_raw_pub(opcode, params, param_len);
 #else
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const bool is_rx_arm = lr1121_is_rx_arm_opcode(opcode);
   const uint32_t rx_arm_start_us = is_rx_arm ? micros() : 0U;
-#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
 #if !SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
@@ -1128,9 +1136,11 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
 #else
   if (total_len > sizeof(tx) || (param_len > 0U && params == NULL)) {
 #endif
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
     if (is_rx_arm) {
       lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
     }
+#endif
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1149,9 +1159,11 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   const uint32_t busy_timeout_us = lr1121_fast_busy_timeout_us(opcode);
   const bool busy_ready = lr1121_wait_busy_fast_timeout(busy_timeout_us);
   if (!busy_ready && !SIW917_ELRS_CONTINUE_AFTER_BUSY_TIMEOUT) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
     if (is_rx_arm) {
       lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
     }
+#endif
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1160,9 +1172,11 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   }
 
   if (!wait_gspi_idle_timeout(10000U)) {
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
     if (is_rx_arm) {
       lr1121_record_rx_arm(opcode, rx_arm_start_us, false);
     }
+#endif
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -1272,9 +1286,11 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
   }
 
+#if SIW917_ELRS_HOTPATH_TIMING_DIAG
   if (is_rx_arm) {
     lr1121_record_rx_arm(opcode, rx_arm_start_us, ok);
   }
+#endif
 
   return ok;
 #endif
@@ -3865,7 +3881,7 @@ static volatile uint32_t dio1_direct_vector_count = 0;
 static void dio1_gpio_interrupt_callback(uint32_t pin_intr);
 
 static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_invoke_callback(void) {
-  dio1_isr_count++;
+  LR1121_ISR_STAT_INC(dio1_isr_count);
   if (dio1_callback_enabled && dio1_callback != NULL) {
     dio1_callback();
   }
@@ -3902,9 +3918,9 @@ static void SIW917_ELRS_RAMFUNC_ATTR lr1121_dio1_direct_irq(void) {
   /*
    * sl_gpio_clear_interrupts() takes the pin-interrupt channel index, not a
    * bitmask. This mirrors PIN_IRQ2_Handler() in the Silicon Labs GPIO driver.
-   */
+  */
   lr1121_dio1_clear_interrupt();
-  dio1_direct_vector_count++;
+  LR1121_ISR_STAT_INC(dio1_direct_vector_count);
   lr1121_dio1_invoke_callback();
 }
 
