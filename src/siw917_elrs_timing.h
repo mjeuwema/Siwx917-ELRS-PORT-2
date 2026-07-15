@@ -172,6 +172,15 @@
 #endif
 
 /*
+ * Keep the proven two-stage DIO architecture, but avoid C wrapper calls for
+ * the pin-level read and NVIC mask/unmask operations inside its stage IRQ.
+ * This is the safe LR1121 RX optimization, not the direct GPIO ISR experiment.
+ */
+#ifndef SIW917_ELRS_DIRECT_DIO_HAL_IO
+#define SIW917_ELRS_DIRECT_DIO_HAL_IO SIW917_ELRS_TIMING_LEAN
+#endif
+
+/*
  * LR1121/GSPI hot-path trims from the RX port. These keep command ordering the
  * same, but remove repeated register address calculation, avoid a micros()
  * read when BUSY is already low, skip response-buffer prefill, and stream hot

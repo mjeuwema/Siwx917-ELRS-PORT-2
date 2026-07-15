@@ -76,6 +76,35 @@ static inline void dio1UpdateMax(volatile uint32_t &maxValue,
 #define SIW917_DIO_STAT_INC(var_) do { } while (0)
 #endif
 
+#if SIW917_ELRS_DIRECT_DIO_HAL_IO
+#define SIW917_HAL_EGPIO_BASE 0x46130000UL
+#define SIW917_HAL_EGPIO_BIT_LOAD_REG(pin_)                                  \
+  (*(volatile uint32_t *)(SIW917_HAL_EGPIO_BASE + 0x004UL +                  \
+                          (0x10UL * (uint32_t)(pin_))))
+#define SIW917_HAL_DIO1_INT_CHANNEL 2U
+#define SIW917_HAL_DIO1_IRQN                                                  \
+  ((IRQn_Type)(EGPIO_PIN_0_IRQn + SIW917_HAL_DIO1_INT_CHANNEL))
+
+static_assert(LR1121_PIN_IRQ == 12U,
+              "TX board LR1121 DIO must remain on GPIO_12");
+
+static inline int siw917HalDio1Read() {
+  return (int)(SIW917_HAL_EGPIO_BIT_LOAD_REG(LR1121_PIN_IRQ) & 1U);
+}
+
+static inline void siw917HalDio1Pause() {
+  NVIC_DisableIRQ(SIW917_HAL_DIO1_IRQN);
+}
+
+static inline void siw917HalDio1Resume() {
+  NVIC_EnableIRQ(SIW917_HAL_DIO1_IRQN);
+}
+
+#define lr1121_dio1_read siw917HalDio1Read
+#define lr1121_dio1_pause_isr siw917HalDio1Pause
+#define lr1121_dio1_resume_isr siw917HalDio1Resume
+#endif
+
 extern LR1121Driver Radio;
 extern RXtimerState_e RXtimerState;
 
@@ -430,6 +459,31 @@ void LR1121Hal::ReadCommand(uint8_t *buffer, uint8_t size,
     const uint16_t inline_opcode =
         ((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1];
     if (inline_opcode == LR11XX_SYSTEM_CLEAR_IRQ_OC) {
+#if SIW917_ELRS_FAST_CLEAR_IRQ
+      if (size == 6U) {
+        const uint32_t clear_mask =
+            ((uint32_t)buffer[2] << 24) | ((uint32_t)buffer[3] << 16) |
+            ((uint32_t)buffer[4] << 8) | (uint32_t)buffer[5];
+        uint32_t irq_status = 0U;
+        if (lr1121_clear_irq_status_fast(clear_mask, &irq_status)) {
+          buffer[0] = 0U;
+          buffer[1] = 0U;
+          buffer[2] = (uint8_t)(irq_status >> 24);
+          buffer[3] = (uint8_t)(irq_status >> 16);
+          buffer[4] = (uint8_t)(irq_status >> 8);
+          buffer[5] = (uint8_t)irq_status;
+          last_command_opcode = inline_opcode;
+          return;
+        }
+#if SIW917_ELRS_STRICT_BARE_METAL_HOTPATH
+        if (connectionState != disconnected) {
+          memset(buffer, 0, size);
+          last_command_opcode = inline_opcode;
+          return;
+        }
+#endif
+      }
+#endif
       uint8_t tx_buffer[32];
       if (size > sizeof(tx_buffer)) {
         DBGLN("ReadCommand inline opcode too large (opcode=0x%04X size=%u)",
