@@ -12,6 +12,9 @@
 #include "crsf_serial.h"
 #include "Driver_USART.h"
 #include "RTE_Device_917.h"
+#if defined(SIW917_ELRS_TARGET_TX)
+#include "UDMA.h"
+#endif
 #include "rsi_egpio.h"
 #include "rsi_debug.h"
 #include "rsi_rom_egpio.h"
@@ -36,8 +39,6 @@ static uint32_t g_tx_count = 0;
 #if CRSF_SERIAL_DIAG_LOGS
 static uint32_t g_tx_diag_count = 0;
 #endif
-static uint32_t g_tx_stuck_recover_count = 0;
-static uint8_t g_tx_busy_skip_count = 0;
 static volatile bool g_tx_in_progress = false;
 static ARM_DRIVER_USART *g_usart = NULL;
 
@@ -51,7 +52,17 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 
 #define CRSF_SERIAL_RX_RING_SIZE 4096U
 #define CRSF_SERIAL_RX_RING_MASK (CRSF_SERIAL_RX_RING_SIZE - 1U)
+#if defined(SIW917_ELRS_TARGET_TX) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+/*
+ * Keep the direct EdgeTX handset path responsive even if a platform revision
+ * does not expose useful live descriptor progress. A 32-byte block is large
+ * enough to keep completion IRQ load low and small enough to cover the normal
+ * 26-byte handset RC frame plus a short query without 64-byte batching delay.
+ */
+#define CRSF_SERIAL_RX_DMA_CHUNK_SIZE 32U
+#else
 #define CRSF_SERIAL_RX_DMA_CHUNK_SIZE 64U
+#endif
 #define CRSF_SERIAL_RX_DMA_CHUNK_COUNT 2U
 #define CRSF_SERIAL_TX_STUCK_SKIP_LIMIT 8U
 
@@ -148,6 +159,44 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_DMA_MODE_NAME "IRQ"
 #endif
 
+/*
+ * The custom EdgeTX transport is a real two-wire UART, so its TX side can
+ * remain DMA-driven after transmit_frame() returns. Adapter builds still need
+ * the blocking TEMT/TX_OE_N turnaround path below.
+ */
+#if defined(SIW917_ELRS_TARGET_TX) && \
+    defined(SIW917_ELRS_CRSF_BENCH_2WIRE) && CRSF_SERIAL_DMA_ENABLED
+#define CRSF_SERIAL_ASYNC_TX_QUEUE 1
+#else
+#define CRSF_SERIAL_ASYNC_TX_QUEUE 0
+#endif
+
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE
+static uint32_t g_tx_stuck_recover_count = 0U;
+static uint8_t g_tx_busy_skip_count = 0U;
+#endif
+
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+#define CRSF_SERIAL_TX_QUEUE_DEPTH 8U
+static uint8_t g_tx_queue[CRSF_SERIAL_TX_QUEUE_DEPTH]
+                         [CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
+static uint8_t g_tx_queue_len[CRSF_SERIAL_TX_QUEUE_DEPTH];
+static volatile uint8_t g_tx_queue_head = 0U;
+static volatile uint8_t g_tx_queue_tail = 0U;
+static volatile uint8_t g_tx_queue_count = 0U;
+static volatile bool g_tx_queue_active = false;
+static volatile bool g_tx_queue_completion_pending = false;
+static volatile uint32_t g_tx_queue_full_count = 0U;
+static volatile uint32_t g_tx_queue_error_count = 0U;
+#endif
+
+#ifndef SIW917_ELRS_EVENT_COUNTERS
+#define SIW917_ELRS_EVENT_COUNTERS 0
+#endif
+
+#define CRSF_SERIAL_RX_DIAG_ENABLED \
+    (CRSF_SERIAL_DMA_ENABLED && SIW917_ELRS_EVENT_COUNTERS)
+
 #if defined(SIW917_ELRS_TARGET_TX) && !defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
 #define CRSF_SERIAL_SUPPRESS_TX_ECHO 1
 #else
@@ -166,6 +215,25 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_RX_FRAME_AWARE_DMA 1
 #else
 #define CRSF_SERIAL_RX_FRAME_AWARE_DMA 0
+#endif
+
+/*
+ * The direct two-wire handset path keeps a large DMA descriptor for low ISR
+ * overhead, but exposes the descriptor's completed prefix from task context.
+ * This mirrors the byte availability of ESP32 HardwareSerial without creating
+ * a DMA completion interrupt for every CRSF frame.
+ */
+#if defined(SIW917_ELRS_TARGET_TX) && \
+    defined(SIW917_ELRS_CRSF_BENCH_2WIRE) && \
+    CRSF_SERIAL_DMA_ENABLED && !CRSF_SERIAL_RX_FRAME_AWARE_DMA
+#define CRSF_SERIAL_RX_LIVE_DMA_CURSOR 1
+#else
+#define CRSF_SERIAL_RX_LIVE_DMA_CURSOR 0
+#endif
+
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+_Static_assert(CRSF_SERIAL_RX_DMA_CH < UDMA_NUMBER_OF_CHANNELS,
+               "UART1 RX DMA channel is outside the UDMA0 primary descriptor table");
 #endif
 
 #define CRSF_SERIAL_TX_OE_SETUP_US       5U
@@ -188,7 +256,7 @@ static volatile uint32_t g_rx_overrun_count = 0;
 static volatile uint32_t g_rx_echo_pause_count = 0;
 static volatile uint32_t g_tx_temt_timeout_count = 0;
 
-#if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_RX_DIAG_ENABLED
 static volatile uint32_t g_rx_dma_arm_count = 0;
 static volatile uint32_t g_rx_dma_complete_count = 0;
 static volatile uint32_t g_rx_dma_bytes_published = 0;
@@ -232,6 +300,13 @@ static volatile uint8_t g_rx_dma_active_index = 0;
 static volatile uint8_t g_rx_dma_next_index = 0;
 static volatile uint32_t g_rx_dma_active_len = 0;
 static volatile uint32_t g_rx_dma_pushed_len = 0;
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+extern RSI_UDMA_DESC_T UDMA0_Table[CONTROL_STRUCT0];
+static volatile bool g_rx_live_cursor_seen = false;
+static volatile uint32_t g_rx_live_cursor_first_prefix = 0;
+static volatile uint32_t g_rx_live_cursor_first_remaining = 0;
+static bool g_rx_live_cursor_reported = false;
+#endif
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
 typedef enum {
     CRSF_RX_DMA_SEEK_SYNC = 0,
@@ -438,10 +513,12 @@ static void crsf_serial_configure_rx_idle_bias(void)
 #endif
 }
 
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE
 static bool crsf_serial_uart_temt(void)
 {
     return (CRSF_SERIAL_UART_REGS->LSR_b.TEMT != 0U);
 }
+#endif
 
 #if CRSF_SERIAL_HAS_TX_OE_N
 static void crsf_serial_tx_oe_n_write(bool high)
@@ -608,6 +685,12 @@ static void rx_dma_state_reset(void)
     g_rx_dma_pushed_len = 0;
     g_rx_dma_active_index = 0;
     g_rx_dma_next_index = 0;
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+    g_rx_live_cursor_seen = false;
+    g_rx_live_cursor_first_prefix = 0;
+    g_rx_live_cursor_first_remaining = 0;
+    g_rx_live_cursor_reported = false;
+#endif
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
     g_rx_dma_frame_state = CRSF_RX_DMA_SEEK_SYNC;
     g_rx_dma_request_len = 1U;
@@ -625,18 +708,77 @@ static void rx_ring_push_block_from_isr(const volatile uint8_t *data, uint32_t l
 
 static void rx_dma_harvest_to_ring_unlocked(void)
 {
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+    if (!g_rx_enabled || !g_rx_armed || g_rx_dma_active_len == 0U) {
+        return;
+    }
+
+    const uint32_t active_len = g_rx_dma_active_len;
+    const uint32_t pushed_len = g_rx_dma_pushed_len;
+    if (pushed_len >= active_len) {
+        return;
+    }
+
     /*
-     * Do not peek at an active Si91x UDMA descriptor as if it were a stable
-     * byte-stream cursor. On UART1 this produced phantom progress and pushed
-     * zeros/stale bytes into the CRSF parser. Completed chunks are published
-     * only from the DMA completion callback below.
+     * Silicon Labs' USART GetRxCount() stays at zero until UDMA completes.
+     * UDMA's primary descriptor is the supported live transfer cursor: its
+     * count is the number of transfers remaining minus one. Sample it twice
+     * and use the older (larger) remaining count so a concurrent DMA beat can
+     * only delay publication, never expose an unwritten byte.
      */
+    const volatile RSI_UDMA_DESC_T *const descriptor =
+        &UDMA0_Table[CRSF_SERIAL_RX_DMA_CH];
+    __DMB();
+    const uint32_t mode_a = descriptor->vsUDMAChaConfigData1.transferType;
+    const uint32_t count_a = descriptor->vsUDMAChaConfigData1.totalNumOfDMATrans;
+    __DMB();
+    const uint32_t mode_b = descriptor->vsUDMAChaConfigData1.transferType;
+    const uint32_t count_b = descriptor->vsUDMAChaConfigData1.totalNumOfDMATrans;
+    __DMB();
+
+    const uint32_t remaining_a =
+        mode_a == UDMA_MODE_STOP ? 0U : count_a + 1U;
+    const uint32_t remaining_b =
+        mode_b == UDMA_MODE_STOP ? 0U : count_b + 1U;
+    const uint32_t remaining =
+        remaining_a > remaining_b ? remaining_a : remaining_b;
+    if (remaining > active_len) {
+        return;
+    }
+
+    const uint32_t completed_len = active_len - remaining;
+    if (completed_len <= pushed_len || completed_len > active_len) {
+        return;
+    }
+
+    const uint8_t index = g_rx_dma_active_index;
+    rx_ring_push_block_from_isr(&g_rx_dma_buffer[index][pushed_len],
+                                completed_len - pushed_len);
+    g_rx_dma_pushed_len = completed_len;
+    if (remaining != 0U && !g_rx_live_cursor_seen) {
+        g_rx_live_cursor_first_prefix = completed_len;
+        g_rx_live_cursor_first_remaining = remaining;
+        __DMB();
+        g_rx_live_cursor_seen = true;
+    }
+#else
     (void)0;
+#endif
 }
 
 static void rx_dma_harvest_to_ring(void)
 {
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     rx_dma_harvest_to_ring_unlocked();
+    __DMB();
+    if (primask == 0U) {
+        __enable_irq();
+    }
+#else
+    rx_dma_harvest_to_ring_unlocked();
+#endif
 }
 #endif
 
@@ -661,7 +803,9 @@ static void rx_arm_receive_from_isr(void)
     const int32_t rc = g_usart->Receive((void *)g_rx_dma_buffer[next],
                                         request_len);
     if (rc == ARM_DRIVER_OK) {
+#if CRSF_SERIAL_RX_DIAG_ENABLED
         g_rx_dma_arm_count++;
+#endif
         g_rx_dma_active_index = next;
         g_rx_dma_next_index = (uint8_t)((next + 1U) % CRSF_SERIAL_RX_DMA_CHUNK_COUNT);
         g_rx_dma_active_len = request_len;
@@ -677,11 +821,13 @@ static void rx_arm_receive_from_isr(void)
      */
     ARM_USART_STATUS status = g_usart->GetStatus();
     g_rx_armed = status.rx_busy ? true : false;
+#if CRSF_SERIAL_RX_DIAG_ENABLED
     if (g_rx_armed) {
         g_rx_dma_rearm_busy_count++;
     } else {
         g_rx_dma_rearm_fail_count++;
     }
+#endif
     if (!g_rx_armed) {
         g_rx_dma_active_len = 0;
         g_rx_dma_pushed_len = 0;
@@ -730,6 +876,7 @@ static void rx_dma_advance_frame_state(const volatile uint8_t *data, uint32_t le
 }
 #endif
 
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE
 #if defined(SIW917_ELRS_TARGET_TX)
 static uint32_t crsf_serial_cycles_to_us(uint32_t cycles)
 {
@@ -818,6 +965,74 @@ static void rx_probe_tx_echo_and_resume(const uint8_t *frame, uint32_t frame_len
 
     rx_resume_after_tx_echo_suppression_from_isr();
 }
+#endif
+
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+static void tx_queue_reset(void)
+{
+    g_tx_queue_head = 0U;
+    g_tx_queue_tail = 0U;
+    g_tx_queue_count = 0U;
+    g_tx_queue_active = false;
+    g_tx_queue_completion_pending = false;
+    g_tx_in_progress = false;
+}
+
+static void tx_queue_service(void)
+{
+    if (g_tx_queue_completion_pending) {
+        g_tx_queue_completion_pending = false;
+        if (g_tx_queue_active && g_tx_queue_count != 0U) {
+            g_tx_queue_tail =
+                (uint8_t)((g_tx_queue_tail + 1U) % CRSF_SERIAL_TX_QUEUE_DEPTH);
+            g_tx_queue_count--;
+        }
+        g_tx_queue_active = false;
+    }
+
+    if (g_usart == NULL || g_tx_in_progress || g_tx_queue_active ||
+        g_tx_queue_count == 0U) {
+        return;
+    }
+
+    const uint8_t tail = g_tx_queue_tail;
+    const uint32_t frame_len = g_tx_queue_len[tail];
+    g_tx_queue_active = true;
+    g_tx_in_progress = true;
+
+    const int32_t status = g_usart->Send(g_tx_queue[tail], frame_len);
+    if (status == ARM_DRIVER_OK) {
+        return;
+    }
+
+    g_tx_queue_active = false;
+    g_tx_in_progress = false;
+    if (status != ARM_DRIVER_ERROR_BUSY) {
+        g_tx_queue_tail =
+            (uint8_t)((g_tx_queue_tail + 1U) % CRSF_SERIAL_TX_QUEUE_DEPTH);
+        g_tx_queue_count--;
+        g_tx_queue_error_count++;
+    }
+}
+
+static int tx_queue_enqueue(const uint8_t *frame, uint32_t frame_len)
+{
+    tx_queue_service();
+    if (g_tx_queue_count >= CRSF_SERIAL_TX_QUEUE_DEPTH) {
+        g_tx_queue_full_count++;
+        return -1;
+    }
+
+    const uint8_t head = g_tx_queue_head;
+    memcpy(g_tx_queue[head], frame, frame_len);
+    g_tx_queue_len[head] = (uint8_t)frame_len;
+    g_tx_queue_head =
+        (uint8_t)((g_tx_queue_head + 1U) % CRSF_SERIAL_TX_QUEUE_DEPTH);
+    g_tx_queue_count++;
+    tx_queue_service();
+    return 0;
+}
+#endif
 
 /*******************************************************************************
  * USART Callback (required by driver)
@@ -825,12 +1040,22 @@ static void rx_probe_tx_echo_and_resume(const uint8_t *frame, uint32_t frame_len
 
 static void usart_callback(uint32_t event)
 {
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    if (event & ARM_USART_EVENT_SEND_COMPLETE) {
+        if (g_tx_queue_active) {
+            g_tx_in_progress = false;
+            g_tx_queue_completion_pending = true;
+            elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_UART);
+        }
+    }
+#else
     if (event & (ARM_USART_EVENT_SEND_COMPLETE | ARM_USART_EVENT_TX_COMPLETE)) {
         g_tx_in_progress = false;
 #if !defined(SIW917_ELRS_TARGET_TX)
         rx_resume_after_tx_echo_suppression_from_isr();
 #endif
     }
+#endif
 
     /*
      * In IRQ 1-byte RX mode the Si91x driver calls cb_event(RECEIVE_COMPLETE),
@@ -853,7 +1078,9 @@ static void usart_callback(uint32_t event)
 #endif
         {
 #if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_RX_DIAG_ENABLED
             g_rx_dma_complete_count++;
+#endif
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
             bool completed_frame = false;
 #endif
@@ -867,8 +1094,16 @@ static void usart_callback(uint32_t event)
                     g_last_ping_rx_sequence++;
                 }
 #endif
-                rx_ring_push_block_from_isr(g_rx_dma_buffer[index], g_rx_dma_active_len);
-                g_rx_dma_bytes_published += g_rx_dma_active_len;
+                uint32_t pushed_len = g_rx_dma_pushed_len;
+                if (pushed_len > g_rx_dma_active_len) {
+                    pushed_len = 0U;
+                }
+                rx_ring_push_block_from_isr(
+                    &g_rx_dma_buffer[index][pushed_len],
+                    g_rx_dma_active_len - pushed_len);
+#if CRSF_SERIAL_RX_DIAG_ENABLED
+                g_rx_dma_bytes_published += g_rx_dma_active_len - pushed_len;
+#endif
                 g_rx_dma_pushed_len = g_rx_dma_active_len;
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
                 rx_dma_advance_frame_state(g_rx_dma_buffer[index], g_rx_dma_active_len);
@@ -904,7 +1139,9 @@ static void usart_callback(uint32_t event)
 
 #if CRSF_SERIAL_DMA_ENABLED
     if (rx_timeout) {
+#if CRSF_SERIAL_RX_DIAG_ENABLED
         g_rx_dma_timeout_count++;
+#endif
         /*
          * The DMA transfer is still owned by the driver on timeout. Publishing
          * a partial active buffer here corrupts CRSF frame alignment, so wait
@@ -916,6 +1153,7 @@ static void usart_callback(uint32_t event)
 #endif
 }
 
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE
 static int wait_for_tx_idle(void)
 {
     ARM_USART_STATUS status = g_usart->GetStatus();
@@ -1023,12 +1261,17 @@ static int wait_for_tx_complete_and_temt(uint32_t frame_len)
     }
     return -1;
 }
+#endif
 
 static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
 {
     if ((frame == NULL) || (frame_len == 0) || (frame_len > sizeof(g_tx_buffer))) {
         return -1;
     }
+
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    return tx_queue_enqueue(frame, frame_len);
+#else
 
     if (wait_for_tx_idle() != 0) {
         return -2;
@@ -1157,6 +1400,7 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
 #endif
 
     return 0;
+#endif
 }
 
 static int configure_usart(uint32_t baud_rate, crsf_serial_format_t format)
@@ -1211,6 +1455,9 @@ static int reconfigure_usart(uint32_t baud_rate, crsf_serial_format_t format)
     (void)g_usart->Control(ARM_USART_ABORT_SEND, 0);
 
     g_tx_in_progress = false;
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    tx_queue_reset();
+#endif
     crsf_serial_tx_oe_n_write(true);
     rx_dma_state_reset();
     rx_ring_reset();
@@ -1275,9 +1522,16 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
 #endif
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
     CRSF_DBG("Handset RX frame-aware DMA enabled (sync 1 + length 1 + exact body + task wake)\n");
+#elif CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+    CRSF_DBG("Handset RX streaming DMA enabled (%u-byte blocks + live producer cursor)\n",
+             (unsigned)CRSF_SERIAL_RX_DMA_CHUNK_SIZE);
 #elif CRSF_SERIAL_DMA_ENABLED
     CRSF_DBG("Handset RX streaming DMA enabled (%u-byte blocks + task wake)\n",
              (unsigned)CRSF_SERIAL_RX_DMA_CHUNK_SIZE);
+#endif
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    CRSF_DBG("Handset TX queued DMA enabled (%u frames, nonblocking)\n",
+             (unsigned)CRSF_SERIAL_TX_QUEUE_DEPTH);
 #endif
 #else
     CRSF_DBG("Init %s on TX GPIO_%lu, RX GPIO_%lu\n",
@@ -1312,6 +1566,11 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
      * FC telemetry passthrough; MAVLink uses it for byte-stream OTA transport.
      */
     g_tx_in_progress = false;
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    tx_queue_reset();
+    g_tx_queue_full_count = 0U;
+    g_tx_queue_error_count = 0U;
+#endif
     g_rx_enabled = false;
     g_rx_armed = false;
     rx_dma_state_reset();
@@ -1358,6 +1617,9 @@ void crsf_serial_deinit(void)
     g_initialized = false;
     g_baud_rate = 0;
     g_tx_in_progress = false;
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    tx_queue_reset();
+#endif
     g_rx_enabled = false;
     g_rx_armed = false;
     rx_dma_state_reset();
@@ -1596,6 +1858,9 @@ int crsf_serial_set_rx_enabled(bool enable)
 
 uint32_t crsf_serial_rx_available(void)
 {
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    tx_queue_service();
+#endif
 #if CRSF_SERIAL_DMA_ENABLED
     rx_dma_harvest_to_ring();
 #endif
@@ -1610,6 +1875,9 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
         return 0;
     }
 
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    tx_queue_service();
+#endif
 #if CRSF_SERIAL_DMA_ENABLED
     rx_dma_harvest_to_ring();
 #endif
@@ -1618,6 +1886,15 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
         out[copied++] = g_rx_ring[g_rx_tail];
         g_rx_tail = (uint16_t)((g_rx_tail + 1U) & CRSF_SERIAL_RX_RING_MASK);
     }
+
+#if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
+    if (copied != 0U && g_rx_live_cursor_seen && !g_rx_live_cursor_reported) {
+        g_rx_live_cursor_reported = true;
+        CRSF_DBG("Handset RX live cursor verified: first prefix=%lu remaining=%lu\n",
+                 (unsigned long)g_rx_live_cursor_first_prefix,
+                 (unsigned long)g_rx_live_cursor_first_remaining);
+    }
+#endif
 
     return copied;
 }
@@ -1638,7 +1915,7 @@ void crsf_serial_get_rx_diag(crsf_serial_rx_diag_t *diag)
     diag->rx_enabled = g_rx_enabled;
     diag->rx_armed = g_rx_armed;
     diag->rx_overrun_count = g_rx_overrun_count;
-#if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_RX_DIAG_ENABLED
     diag->dma_arm_count = g_rx_dma_arm_count;
     diag->dma_complete_count = g_rx_dma_complete_count;
     diag->dma_bytes_published = g_rx_dma_bytes_published;

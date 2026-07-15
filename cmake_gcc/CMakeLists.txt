@@ -30,7 +30,7 @@ option(SIW917_CRSF_RADIO_RETURN_DIAG
 )
 option(SIW917_ELRS_EVENT_COUNTERS
     "Collect low-overhead RF counters for event-only TX diagnostics"
-    ON
+    OFF
 )
 set(SIW917_ELRS_UPSTREAM_DIR "" CACHE PATH
     "Path to an official ExpressLRS src directory containing src/tx_main.cpp"
@@ -275,6 +275,7 @@ if(SIW917_ELRS_TARGET_TX)
     endif()
     if(SIW917_ELRS_EVENT_COUNTERS)
         target_compile_definitions(slc PUBLIC
+            SIW917_ELRS_EVENT_COUNTERS=1
             SIW917_ELRS_ISR_STATS_DIAG=1
             SIW917_ELRS_RAW_GSPI_STATS_DIAG=1
         )
@@ -388,6 +389,7 @@ if(SIW917_ELRS_TARGET_TX)
     endif()
     if(SIW917_ELRS_EVENT_COUNTERS)
         target_compile_definitions(wifi_gspi_merged PUBLIC
+            SIW917_ELRS_EVENT_COUNTERS=1
             SIW917_ELRS_TX_RF_STATS_DIAG=1
             SIW917_ELRS_DIO_STATS_DIAG=1
             SIW917_ELRS_ISR_STATS_DIAG=1

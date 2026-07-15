@@ -11,6 +11,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef SIW917_ELRS_EVENT_COUNTERS
+#define SIW917_ELRS_EVENT_COUNTERS 0
+#endif
+
 extern "C" {
 #include "crsf_serial.h"
 #include "elrs_config.h"
@@ -102,6 +106,7 @@ static const char *connection_state_name(connectionState_e state)
     }
 }
 
+#if SIW917_ELRS_EVENT_COUNTERS
 static void print_rf_counter_snapshot(const char *event)
 {
     crsf_serial_rx_diag_t crsf_diag = {};
@@ -171,6 +176,7 @@ static void print_rf_counter_snapshot(const char *event)
            (unsigned long)crsf_diag.dma_timeout_count,
            (unsigned long)crsf_diag.rx_overrun_count);
 }
+#endif
 
 static void report_rf_mode_if_changed(bool force)
 {
@@ -197,43 +203,31 @@ static void report_rf_mode_if_changed(bool force)
     const char *const modulation =
         RadioBandMod::isGFSK(mod->radio_type) ? "GFSK" : "LoRa";
 
-    printf("[RF_MODE] index=%u name=\"%s\" enum=%u band=%s mod=%s "
-           "interval=%luus toa=%luus margin=%luus bw=%u sf=%u cr=%u "
-           "preamble=%u payload=%u sends=%u hop=%u tlm_default=1/%u "
-           "tlm_current=1/%u\n",
-           (unsigned)mod->index, rf_rate_name(mod->index),
-           (unsigned)mod->enum_rate, band, modulation,
+    printf("[RF_MODE] %u \"%s\" %s/%s interval=%luus toa=%luus "
+           "margin=%luus tlm=1/%u\n",
+           (unsigned)mod->index, rf_rate_name(mod->index), band, modulation,
            (unsigned long)interval, (unsigned long)toa,
-           (unsigned long)margin, (unsigned)mod->bw, (unsigned)mod->sf,
-           (unsigned)mod->cr, (unsigned)mod->PreambleLen,
-           (unsigned)mod->PayloadLength, (unsigned)mod->numOfSends,
-           (unsigned)mod->FHSShopInterval,
-           (unsigned)TLMratioEnumToValue(mod->TLMinterval),
-           (unsigned)ExpressLRS_currTlmDenom);
+           (unsigned long)margin, (unsigned)ExpressLRS_currTlmDenom);
+#if SIW917_ELRS_EVENT_COUNTERS
     print_rf_counter_snapshot("rate-change");
     lr1121_hal_reset_stage_delay_stats();
     lr1121_reset_rx_arm_stats();
+#endif
 }
 
 static void report_link_events(void)
 {
     if (last_reported_connection_state != (int16_t)connectionState)
     {
-        printf("[RF_LINK] state=%s(%u) rate=%u name=\"%s\" lq=%u "
-               "rssi=%u/%u snr=%d\n",
+        printf("[RF_LINK] %s rate=%u lq=%u\n",
                connection_state_name(connectionState),
-               (unsigned)connectionState,
                ExpressLRS_currAirRate_Modparams != nullptr
                    ? (unsigned)ExpressLRS_currAirRate_Modparams->index
                    : 255U,
-               ExpressLRS_currAirRate_Modparams != nullptr
-                   ? rf_rate_name(ExpressLRS_currAirRate_Modparams->index)
-                   : "none",
-               (unsigned)linkStats.uplink_Link_quality,
-               (unsigned)linkStats.uplink_RSSI_1,
-               (unsigned)linkStats.uplink_RSSI_2,
-               (int)linkStats.uplink_SNR);
+               (unsigned)linkStats.uplink_Link_quality);
+#if SIW917_ELRS_EVENT_COUNTERS
         print_rf_counter_snapshot("link-state");
+#endif
         last_reported_connection_state = (int16_t)connectionState;
         link_quality_state_initialized = false;
     }
@@ -252,17 +246,16 @@ static void report_link_events(void)
     {
         if (link_quality_state_initialized)
         {
-            printf("[RF_LINK] telemetry-%s rate=%u lq=%u rssi=%u/%u snr=%d\n",
+            printf("[RF_LINK] telemetry-%s rate=%u lq=%u\n",
                    degraded ? "degraded" : "recovered",
                    ExpressLRS_currAirRate_Modparams != nullptr
                        ? (unsigned)ExpressLRS_currAirRate_Modparams->index
                        : 255U,
-                   (unsigned)linkStats.uplink_Link_quality,
-                   (unsigned)linkStats.uplink_RSSI_1,
-                   (unsigned)linkStats.uplink_RSSI_2,
-                   (int)linkStats.uplink_SNR);
+                   (unsigned)linkStats.uplink_Link_quality);
+#if SIW917_ELRS_EVENT_COUNTERS
             print_rf_counter_snapshot(degraded ? "telemetry-degraded"
                                                : "telemetry-recovered");
+#endif
         }
         link_quality_degraded = degraded;
         link_quality_state_initialized = true;

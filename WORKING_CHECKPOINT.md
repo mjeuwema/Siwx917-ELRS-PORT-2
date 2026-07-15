@@ -1,6 +1,6 @@
 # Working TX Checkpoint
 
-Date: 2026-07-14
+Date: 2026-07-15
 
 This checkpoint records the first confirmed working RadioMaster TX16S Mark 3
 connection using the custom EdgeTX two-wire external-module transport.
@@ -27,11 +27,11 @@ SIW917_ELRS_USE_UPSTREAM_TX_MAIN=ON
 SIW917_CRSF_RADIO_RETURN_DIAG=OFF
 ```
 
-Known-good artifact:
+Current timing-stable artifact:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS_TX_AI_Handoff_Build\tx_module_2wire\base\SiW917_ELRS_TX_TwoWire_400k.rps
-SHA256: 8662FAE6E8C2CA50C8855591F166C0F66D38023E14E05C3AC7C165505ED77607
+C:\Users\mjeuw\OneDrive\Documents\ELRS_TX_AI_Handoff_Build\tx_module_2wire\base\SiW917_ELRS_TX_TwoWire_Stable_81B714C4.rps
+SHA256: 81B714C45A98ED55770A7B376F106C66F65154F4A4E0DA8A0449C65765F1AD31
 ```
 
 ## Radio wiring
@@ -66,5 +66,8 @@ lib/tx-crsf/TXModuleParameters.cpp
 
 - EdgeTX detects the SiW917 TX module over direct two-wire UART.
 - The ExpressLRS Lua interface loads on the radio.
+- Lua parameter loading is responsive after repeated module reboots.
+- RF band selection persists when switching between FCC 915 MHz and 2.4 GHz.
+- The TX connects to the RX and maintains telemetry at the tested packet rates.
 - No inverter, line combiner, S.Port connection, or TX output-enable signal is
   required with the custom EdgeTX firmware.

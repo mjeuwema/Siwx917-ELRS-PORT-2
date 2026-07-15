@@ -118,7 +118,9 @@ extern "C" void siw917_lr1121_set_rate_configuration_active(bool active) {
   if (active) {
     rate_configuration_extended_waits = 0;
     rate_configuration_busy_timeouts = 0;
-  } else if (rate_configuration_active) {
+  } else if (rate_configuration_active &&
+             (rate_configuration_extended_waits != 0U ||
+              rate_configuration_busy_timeouts != 0U)) {
     printf("[LR1121_CFG] rate transaction complete extended_waits=%lu "
            "timeouts=%lu\n",
            (unsigned long)rate_configuration_extended_waits,
@@ -663,9 +665,6 @@ static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
   uint32_t actual = 0U;
   if (lr1121_read_regmem32(kSf6Register, &actual) &&
       (actual & mask) == expected) {
-    printf("[LR1121_CFG] SF6 compatibility verified value=0x%08lX "
-           "mask=0x%08lX\n",
-           (unsigned long)actual, (unsigned long)mask);
     return;
   }
 
