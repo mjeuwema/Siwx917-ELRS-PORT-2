@@ -357,6 +357,12 @@ if(SIW917_ELRS_TARGET_TX)
             PLATFORM_SIW917=1
             RADIO_LR1121=1
             Regulatory_Domain_FCC_915=1
+            # Linked TX telemetry needs the shortest TX_DONE/RX_DONE path.
+            # Counters are event-reported only; they do not print in an ISR.
+            SIW917_ELRS_DIRECT_GPIO_DIO_WHEN_LINKED=1
+            SIW917_ELRS_DIO_STATS_DIAG=1
+            SIW917_ELRS_DIO_EDGE_TIMESTAMPS=1
+            SIW917_ELRS_TX_RF_STATS_DIAG=1
             IRAM_ATTR=
         )
     endif()
