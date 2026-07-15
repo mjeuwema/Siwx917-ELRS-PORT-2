@@ -104,6 +104,7 @@ static const char *connection_state_name(connectionState_e state)
 
 static void print_rf_counter_snapshot(const char *event)
 {
+    crsf_serial_rx_diag_t crsf_diag = {};
     uint32_t send_attempts = 0;
     uint32_t send_sync = 0;
     uint32_t send_rc = 0;
@@ -125,12 +126,15 @@ static void print_rf_counter_snapshot(const char *event)
                      &lbt_none, &tx_done, &tx_ignored, &rx_windows,
                      &rx_expected, &rx_missed, &rx_done, &rx_ignored,
                      &rx_accepted, &rx_rejected, &nonce, &tlm_phase, &busy);
+    crsf_serial_get_rx_diag(&crsf_diag);
 
     printf("[RF_EVENT] %s busy_timeout=%lu busy_fast_fail=%lu "
            "gspi_fail=%lu dio=%lu reentrant=%lu requeue=%lu "
            "turnaround{dio_max=%luus arm_max=%luus arm=%lu fail=%lu} "
            "tx=%lu/%lu ignored=%lu tlm{win=%lu expect=%lu miss=%lu "
-           "irq=%lu ok=%lu reject=%lu ignored=%lu} nonce=%u phase=%u busy=%u\n",
+           "irq=%lu ok=%lu reject=%lu ignored=%lu} nonce=%u phase=%u busy=%u "
+           "crsf{baud=%lu rx=%u/%u avail=%lu dma=%lu/%lu bytes=%lu "
+           "busy=%lu fail=%lu timeout=%lu overrun=%lu}\n",
            event,
            (unsigned long)busy_timeout_count,
            (unsigned long)lr1121_get_busy_fast_fail_count(),
@@ -154,7 +158,18 @@ static void print_rf_counter_snapshot(const char *event)
            (unsigned long)rx_ignored,
            (unsigned)nonce,
            (unsigned)tlm_phase,
-           (unsigned)busy);
+           (unsigned)busy,
+           (unsigned long)crsf_diag.baud_rate,
+           crsf_diag.rx_enabled ? 1U : 0U,
+           crsf_diag.rx_armed ? 1U : 0U,
+           (unsigned long)crsf_diag.available,
+           (unsigned long)crsf_diag.dma_complete_count,
+           (unsigned long)crsf_diag.dma_arm_count,
+           (unsigned long)crsf_diag.dma_bytes_published,
+           (unsigned long)crsf_diag.dma_rearm_busy_count,
+           (unsigned long)crsf_diag.dma_rearm_fail_count,
+           (unsigned long)crsf_diag.dma_timeout_count,
+           (unsigned long)crsf_diag.rx_overrun_count);
 }
 
 static void report_rf_mode_if_changed(bool force)

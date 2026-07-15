@@ -76,6 +76,20 @@ typedef enum {
  * Data Structures
  ******************************************************************************/
 
+typedef struct {
+    uint32_t baud_rate;
+    uint32_t available;
+    uint32_t dma_arm_count;
+    uint32_t dma_complete_count;
+    uint32_t dma_bytes_published;
+    uint32_t dma_rearm_busy_count;
+    uint32_t dma_rearm_fail_count;
+    uint32_t dma_timeout_count;
+    uint32_t rx_overrun_count;
+    bool rx_enabled;
+    bool rx_armed;
+} crsf_serial_rx_diag_t;
+
 /**
  * @brief Link statistics for CRSF output
  */
@@ -198,6 +212,11 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len);
  * @brief RX bytes dropped because the software ring was full
  */
 uint32_t crsf_serial_get_rx_overrun_count(void);
+
+/**
+ * @brief Snapshot low-overhead handset RX/DMA diagnostics
+ */
+void crsf_serial_get_rx_diag(crsf_serial_rx_diag_t *diag);
 
 /**
  * @brief Print raw UART RX/TX diagnostic state without consuming buffered bytes

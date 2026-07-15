@@ -28,6 +28,10 @@ option(SIW917_CRSF_RADIO_RETURN_DIAG
     "Sweep device-info reply turnaround timing while diagnosing an EdgeTX return path"
     OFF
 )
+option(SIW917_ELRS_EVENT_COUNTERS
+    "Collect low-overhead RF counters for event-only TX diagnostics"
+    ON
+)
 set(SIW917_ELRS_UPSTREAM_DIR "" CACHE PATH
     "Path to an official ExpressLRS src directory containing src/tx_main.cpp"
 )
@@ -269,6 +273,12 @@ if(SIW917_ELRS_TARGET_TX)
             SIW917_CRSF_RADIO_RETURN_DIAG=1
         )
     endif()
+    if(SIW917_ELRS_EVENT_COUNTERS)
+        target_compile_definitions(slc PUBLIC
+            SIW917_ELRS_ISR_STATS_DIAG=1
+            SIW917_ELRS_RAW_GSPI_STATS_DIAG=1
+        )
+    endif()
 endif()
 
 target_include_directories(wifi_gspi_merged PUBLIC
@@ -374,6 +384,14 @@ if(SIW917_ELRS_TARGET_TX)
     if(SIW917_CRSF_RADIO_RETURN_DIAG)
         target_compile_definitions(wifi_gspi_merged PUBLIC
             SIW917_CRSF_RADIO_RETURN_DIAG=1
+        )
+    endif()
+    if(SIW917_ELRS_EVENT_COUNTERS)
+        target_compile_definitions(wifi_gspi_merged PUBLIC
+            SIW917_ELRS_TX_RF_STATS_DIAG=1
+            SIW917_ELRS_DIO_STATS_DIAG=1
+            SIW917_ELRS_ISR_STATS_DIAG=1
+            SIW917_ELRS_RAW_GSPI_STATS_DIAG=1
         )
     endif()
 endif()

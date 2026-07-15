@@ -161,7 +161,8 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_TX_ECHO_PROBE 0
 #endif
 
-#if defined(SIW917_ELRS_TARGET_TX) && CRSF_SERIAL_DMA_ENABLED
+#if defined(SIW917_ELRS_TARGET_TX) && CRSF_SERIAL_DMA_ENABLED && \
+    !defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
 #define CRSF_SERIAL_RX_FRAME_AWARE_DMA 1
 #else
 #define CRSF_SERIAL_RX_FRAME_AWARE_DMA 0
@@ -187,6 +188,15 @@ static volatile uint32_t g_rx_overrun_count = 0;
 static volatile uint32_t g_rx_echo_pause_count = 0;
 static volatile uint32_t g_tx_temt_timeout_count = 0;
 
+#if CRSF_SERIAL_DMA_ENABLED
+static volatile uint32_t g_rx_dma_arm_count = 0;
+static volatile uint32_t g_rx_dma_complete_count = 0;
+static volatile uint32_t g_rx_dma_bytes_published = 0;
+static volatile uint32_t g_rx_dma_rearm_busy_count = 0;
+static volatile uint32_t g_rx_dma_rearm_fail_count = 0;
+static volatile uint32_t g_rx_dma_timeout_count = 0;
+#endif
+
 #if CRSF_SERIAL_TX_ECHO_PROBE
 static volatile uint32_t g_tx_echo_probe_count = 0;
 static volatile uint32_t g_tx_echo_match_count = 0;
@@ -204,7 +214,7 @@ static volatile uint32_t g_device_info_total_last_us = 0;
 static volatile uint32_t g_device_info_total_max_us = 0;
 #endif
 
-#if CRSF_SERIAL_RX_FRAME_AWARE_DMA
+#if defined(SIW917_ELRS_TARGET_TX)
 static volatile uint32_t g_last_ping_rx_cycles = 0;
 static volatile uint32_t g_last_ping_rx_sequence = 0;
 #endif
@@ -651,6 +661,7 @@ static void rx_arm_receive_from_isr(void)
     const int32_t rc = g_usart->Receive((void *)g_rx_dma_buffer[next],
                                         request_len);
     if (rc == ARM_DRIVER_OK) {
+        g_rx_dma_arm_count++;
         g_rx_dma_active_index = next;
         g_rx_dma_next_index = (uint8_t)((next + 1U) % CRSF_SERIAL_RX_DMA_CHUNK_COUNT);
         g_rx_dma_active_len = request_len;
@@ -666,6 +677,11 @@ static void rx_arm_receive_from_isr(void)
      */
     ARM_USART_STATUS status = g_usart->GetStatus();
     g_rx_armed = status.rx_busy ? true : false;
+    if (g_rx_armed) {
+        g_rx_dma_rearm_busy_count++;
+    } else {
+        g_rx_dma_rearm_fail_count++;
+    }
     if (!g_rx_armed) {
         g_rx_dma_active_len = 0;
         g_rx_dma_pushed_len = 0;
@@ -837,6 +853,7 @@ static void usart_callback(uint32_t event)
 #endif
         {
 #if CRSF_SERIAL_DMA_ENABLED
+            g_rx_dma_complete_count++;
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
             bool completed_frame = false;
 #endif
@@ -851,6 +868,7 @@ static void usart_callback(uint32_t event)
                 }
 #endif
                 rx_ring_push_block_from_isr(g_rx_dma_buffer[index], g_rx_dma_active_len);
+                g_rx_dma_bytes_published += g_rx_dma_active_len;
                 g_rx_dma_pushed_len = g_rx_dma_active_len;
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
                 rx_dma_advance_frame_state(g_rx_dma_buffer[index], g_rx_dma_active_len);
@@ -861,8 +879,11 @@ static void usart_callback(uint32_t event)
 #endif
             g_rx_armed = false;
             rx_arm_receive_from_isr();
-#if CRSF_SERIAL_RX_FRAME_AWARE_DMA && defined(SIW917_ELRS_TARGET_TX)
-            if (completed_frame) {
+#if defined(SIW917_ELRS_TARGET_TX) && CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_RX_FRAME_AWARE_DMA
+            if (completed_frame)
+#endif
+            {
                 elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_UART);
             }
 #endif
@@ -883,6 +904,7 @@ static void usart_callback(uint32_t event)
 
 #if CRSF_SERIAL_DMA_ENABLED
     if (rx_timeout) {
+        g_rx_dma_timeout_count++;
         /*
          * The DMA transfer is still owned by the driver on timeout. Publishing
          * a partial active buffer here corrupts CRSF frame alignment, so wait
@@ -1253,6 +1275,9 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
 #endif
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
     CRSF_DBG("Handset RX frame-aware DMA enabled (sync 1 + length 1 + exact body + task wake)\n");
+#elif CRSF_SERIAL_DMA_ENABLED
+    CRSF_DBG("Handset RX streaming DMA enabled (%u-byte blocks + task wake)\n",
+             (unsigned)CRSF_SERIAL_RX_DMA_CHUNK_SIZE);
 #endif
 #else
     CRSF_DBG("Init %s on TX GPIO_%lu, RX GPIO_%lu\n",
@@ -1600,6 +1625,34 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
 uint32_t crsf_serial_get_rx_overrun_count(void)
 {
     return g_rx_overrun_count;
+}
+
+void crsf_serial_get_rx_diag(crsf_serial_rx_diag_t *diag)
+{
+    if (diag == NULL) {
+        return;
+    }
+
+    diag->baud_rate = g_baud_rate;
+    diag->available = crsf_serial_rx_available();
+    diag->rx_enabled = g_rx_enabled;
+    diag->rx_armed = g_rx_armed;
+    diag->rx_overrun_count = g_rx_overrun_count;
+#if CRSF_SERIAL_DMA_ENABLED
+    diag->dma_arm_count = g_rx_dma_arm_count;
+    diag->dma_complete_count = g_rx_dma_complete_count;
+    diag->dma_bytes_published = g_rx_dma_bytes_published;
+    diag->dma_rearm_busy_count = g_rx_dma_rearm_busy_count;
+    diag->dma_rearm_fail_count = g_rx_dma_rearm_fail_count;
+    diag->dma_timeout_count = g_rx_dma_timeout_count;
+#else
+    diag->dma_arm_count = 0U;
+    diag->dma_complete_count = 0U;
+    diag->dma_bytes_published = 0U;
+    diag->dma_rearm_busy_count = 0U;
+    diag->dma_rearm_fail_count = 0U;
+    diag->dma_timeout_count = 0U;
+#endif
 }
 
 void crsf_serial_debug_dump(void)
