@@ -15,6 +15,20 @@
         "cacheVariables": {
           "CMAKE_CONFIGURATION_TYPES": "base"
         }
+      },
+      {
+        "name": "tx-clean-port",
+        "displayName": "Configure SiW917 ELRS TX clean upstream port",
+        "inherits": "project",
+        "binaryDir": "${sourceDir}/build-tx-clean-port",
+        "cacheVariables": {
+          "CMAKE_CONFIGURATION_TYPES": "base",
+          "SIW917_ELRS_TARGET_TX": "ON",
+          "SIW917_ELRS_CRSF_BENCH_2WIRE": "ON",
+          "SIW917_ELRS_TX_PC_BENCH": "OFF",
+          "SIW917_ELRS_USE_UPSTREAM_TX_MAIN": "ON",
+          "SIW917_ELRS_UPSTREAM_DIR": "$env{ELRS_UPSTREAM_DIR}"
+        }
       }
     ],
     "buildPresets": [
@@ -22,6 +36,13 @@
         "name": "default_config",
         "displayName": "Build wifi_gspi_merged",
         "configurePreset": "project",
+        "configuration": "base",
+        "targets": ["wifi_gspi_merged"]
+      },
+      {
+        "name": "tx-clean-port",
+        "displayName": "Build SiW917 ELRS TX clean upstream port",
+        "configurePreset": "tx-clean-port",
         "configuration": "base",
         "targets": ["wifi_gspi_merged"]
       }
@@ -32,6 +53,13 @@
         "steps": [
           {"type": "configure", "name": "project"},
           {"type": "build", "name": "default_config"}
+        ]
+      },
+      {
+        "name": "tx-clean-port",
+        "steps": [
+          {"type": "configure", "name": "tx-clean-port"},
+          {"type": "build", "name": "tx-clean-port"}
         ]
       }
     ]

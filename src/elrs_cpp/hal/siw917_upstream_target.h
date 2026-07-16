@@ -92,21 +92,21 @@ static const uint8_t siw917_lr1121_rfsw_ctrl[] = {0};
 #define SKY85321_PDET_INTERCEPT 0.0f
 #define SKY85321_PDET_SLOPE 0.0f
 #define LBT_RSSI_THRESHOLD_OFFSET_DB 0
-#define MinPower PWR_100mW
+#define MinPower PWR_10mW
 #define MaxPower PWR_100mW
 #define DefaultPower PWR_100mW
 #define POWER_OUTPUT_DACWRITE false
-static const int16_t siw917_power_values_array[] = {20};
-static const int16_t siw917_power_values_dual_array[] = {13};
+static const int16_t siw917_power_values_array[] = {10, 14, 17, 20};
+static const int16_t siw917_power_values_dual_array[] = {10, 13, 13, 13};
 static const int16_t *siw917_power_values = siw917_power_values_array;
 static const int16_t *siw917_power_values2 = nullptr;
 static const int16_t *siw917_power_values_dual = siw917_power_values_dual_array;
 #define POWER_OUTPUT_VALUES siw917_power_values
-#define POWER_OUTPUT_VALUES_COUNT 1
+#define POWER_OUTPUT_VALUES_COUNT 4
 #define POWER_OUTPUT_VALUES2 siw917_power_values2
 #define POWER_OUTPUT_VALUES2_COUNT 0
 #define POWER_OUTPUT_VALUES_DUAL siw917_power_values_dual
-#define POWER_OUTPUT_VALUES_DUAL_COUNT 1
+#define POWER_OUTPUT_VALUES_DUAL_COUNT 4
 
 // Buttons
 #define GPIO_PIN_BUTTON 49

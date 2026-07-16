@@ -1,5 +1,6 @@
 # Build artifacts
 cmake_gcc/build/
+cmake_gcc/build-*/
 cmake_gcc/CMakeCache.txt
 cmake_gcc/CMakeFiles/
 cmake_iar/build/

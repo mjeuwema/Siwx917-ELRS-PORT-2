@@ -2,9 +2,17 @@
 # Automatically-generated file. Do not edit!                       #
 ####################################################################
 
-set(SDK_PATH "C:/Users/mjeuw/.silabs/slt/installs/conan/p/simpleb526998f4a4d/p")
+if(DEFINED ENV{SILABS_SDK_PATH})
+    file(TO_CMAKE_PATH "$ENV{SILABS_SDK_PATH}" SDK_PATH)
+else()
+    set(SDK_PATH "C:/Users/mjeuw/.silabs/slt/installs/conan/p/simpleb526998f4a4d/p")
+endif()
 set(COPIED_SDK_PATH "simplicity_sdk_2025.6.2")
-set(PKG_PATH "C:/Users/mjeuw/.silabs/slt/installs")
+if(DEFINED ENV{SILABS_PKG_PATH})
+    file(TO_CMAKE_PATH "$ENV{SILABS_PKG_PATH}" PKG_PATH)
+else()
+    set(PKG_PATH "C:/Users/mjeuw/.silabs/slt/installs")
+endif()
 
 add_library(slc OBJECT
     "${SDK_PATH}/../../wisece6a05cd369ee2/p/components/board/silabs/src/rsi_board.c"
@@ -316,7 +324,7 @@ target_link_options(slc INTERFACE
     -mfloat-abi=softfp
     -T${CMAKE_CURRENT_LIST_DIR}/../autogen/linkerfile_SoC.ld
     --specs=nano.specs
-    "SHELL:-Xlinker -Map=$<TARGET_FILE_DIR:wifi_gspi_merged>/wifi_gspi_merged.map"
+    "LINKER:-Map,$<TARGET_FILE_DIR:wifi_gspi_merged>/wifi_gspi_merged.map"
     "SHELL:-u _printf_float"
     -Wl,--wrap=main
     -fno-lto

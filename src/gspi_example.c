@@ -22,6 +22,9 @@
 #include "sl_si91x_gspi_common_config.h"
 
 #include "elrs_cpp/hal/elrs_task_wakeup.h"
+#if defined(SIW917_ELRS_TARGET_TX)
+#include "crsf_serial.h"
+#endif
 
 #include "rsi_rom_clks.h"
 
@@ -1065,7 +1068,14 @@ void elrs_cpp_task(void *argument) {
 
   /* Main loop - standard ELRS RX loop */
   while (1) {
-    if ((lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event()) &&
+    const bool handset_uart_pending =
+#if defined(SIW917_ELRS_TARGET_TX)
+      crsf_serial_rx_available() != 0U;
+#else
+      false;
+#endif
+    if ((lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event() ||
+         handset_uart_pending) &&
         elrs_hot_drain_budget < 16U) {
       elrs_hot_drain_budget++;
       elrs_role_loop();
@@ -1126,7 +1136,11 @@ void elrs_cpp_task(void *argument) {
      * the ELRS loop can drain the radio IRQ. Otherwise sleep normally so
      * buttons, LEDs, and WiFi housekeeping still get CPU time.
      */
-    if (lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event()) {
+    if (lr1121_hal_has_pending_dio1() || elrs_hw_timer_has_pending_event()
+#if defined(SIW917_ELRS_TARGET_TX)
+        || crsf_serial_rx_available() != 0U
+#endif
+    ) {
       continue;
     }
 
