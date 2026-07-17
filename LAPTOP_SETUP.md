@@ -17,16 +17,15 @@ Install Simplicity Studio and use Package Manager to install the two SDKs,
 the Arm GNU toolchain, and Simplicity Commander. The build script discovers
 their per-user Conan paths automatically.
 
-## Restore the two repositories
+## Restore the repositories
 
-From the handoff package directory:
+Use the complete handoff package's restore script:
 
 ```powershell
-git clone .\bundles\wifi_gspi_tx_clean.gitbundle .\workspace\wifi_gspi_tx_clean
-git clone .\bundles\ExpressLRS-a9d4a9c.gitbundle .\workspace\ExpressLRS
+.\restore_workspaces.ps1
 ```
 
-The ExpressLRS bundle is pinned to official commit
+The included ExpressLRS source snapshot is pinned to official commit
 `a9d4a9cb5b5687c4c9d7e9e7fbdf44ad93651da6`.
 
 ## Build the radio-connected TX firmware
