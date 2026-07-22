@@ -155,6 +155,7 @@ static const int16_t *siw917_power_values_dual = siw917_power_values_dual_array;
 
 // Backpack/debug serial
 #define OPT_USE_TX_BACKPACK false
+#define OPT_USE_SIW917_INTERNAL_BACKPACK true
 #define BACKPACK_LOGGING_BAUD 0
 #define GPIO_PIN_DEBUG_RX UNDEF_PIN
 #define GPIO_PIN_DEBUG_TX UNDEF_PIN

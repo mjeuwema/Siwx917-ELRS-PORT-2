@@ -463,15 +463,6 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
  */
 bool lr1121_read_response(uint8_t *response, uint16_t response_len);
 
-/**
- * @brief Read one aligned 32-bit LR1121 register/memory word.
- *
- * This is used by the SiW917 TX port to verify configuration writes that are
- * required for SF6 interoperability. It is intentionally kept out of the RF
- * hot path.
- */
-bool lr1121_read_regmem32(uint32_t address, uint32_t *value);
-
 /** TX-side RX-arm timing counters for rate-change/link event diagnostics. */
 uint32_t lr1121_get_rx_arm_max_us(void);
 uint32_t lr1121_get_rx_arm_count(void);

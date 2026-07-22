@@ -35,6 +35,10 @@ option(SIW917_ELRS_EVENT_COUNTERS
 set(SIW917_ELRS_UPSTREAM_DIR "" CACHE PATH
     "Path to an official ExpressLRS src directory containing src/tx_main.cpp"
 )
+set(SIW917_ELRS_MAVLINK_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mavlink_c_library_v2"
+    CACHE PATH "Path to the MAVLink c_library_v2 root used by upstream ELRS"
+)
 
 # Include the definition of the slc_wifi_gspi_merged target,
 # which contains the content of the SLC project
@@ -55,6 +59,14 @@ if(SIW917_ELRS_UPSTREAM_DIR)
     set(ELRS_UPSTREAM_DIR "${SIW917_ELRS_UPSTREAM_DIR}")
 else()
     set(ELRS_UPSTREAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ExpressLRS/src")
+endif()
+
+if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN AND
+   NOT EXISTS "${SIW917_ELRS_MAVLINK_DIR}/common/mavlink.h")
+    message(FATAL_ERROR
+        "Missing upstream MAVLink headers at ${SIW917_ELRS_MAVLINK_DIR}. "
+        "Use c_library_v2 commit e54a8d2e8cf7985e689ad1c8c8f37dc0800ea87b."
+    )
 endif()
 
 set(ELRS_UPSTREAM_INCLUDE_DIRS
@@ -93,6 +105,7 @@ set(ELRS_UPSTREAM_INCLUDE_DIRS
     "${ELRS_UPSTREAM_DIR}/lib/VTX"
     "${ELRS_UPSTREAM_DIR}/lib/WIFI"
     "${ELRS_UPSTREAM_DIR}/lib/MAVLink"
+    "${SIW917_ELRS_MAVLINK_DIR}"
     "${ELRS_UPSTREAM_DIR}/lib/tx-crsf"
 )
 
@@ -217,6 +230,132 @@ function(siw917_generate_two_wire_handset_source input_file output_var)
     set(${output_var} "${output_file}" PARENT_SCOPE)
 endfunction()
 
+# Upstream keeps the backpack hooks as local no-op functions on non-ESP
+# targets. Generate a build-only copy that declares SiW917's internal WiFi
+# backpack hooks instead, leaving the vendored upstream source unchanged.
+function(siw917_generate_mavlink_backpack_source input_file output_var)
+    set(old_block
+"#if defined(PLATFORM_ESP32)
+#include \"devScreen.h\"
+#include \"devBLE.h\"
+#include \"devGsensor.h\"
+#include \"devThermal.h\"
+#include \"devPDET.h\"
+#include \"devBackpack.h\"
+#else
+// Fake functions for 8285
+void checkBackpackUpdate() {}
+void sendCRSFTelemetryToBackpack(uint8_t *) {}
+void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
+#endif")
+    set(new_block
+"#if defined(PLATFORM_ESP32)
+#include \"devScreen.h\"
+#include \"devBLE.h\"
+#include \"devGsensor.h\"
+#include \"devThermal.h\"
+#include \"devPDET.h\"
+#include \"devBackpack.h\"
+#elif defined(PLATFORM_SIW917)
+void checkBackpackUpdate();
+void sendCRSFTelemetryToBackpack(uint8_t *);
+void sendMAVLinkTelemetryToBackpack(uint8_t *);
+#else
+// Fake functions for 8285
+void checkBackpackUpdate() {}
+void sendCRSFTelemetryToBackpack(uint8_t *) {}
+void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
+#endif")
+
+    file(READ "${input_file}" source_text)
+    string(FIND "${source_text}" "${old_block}" block_offset)
+    if(block_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 MAVLink backpack hook patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_block}" "${new_block}" source_text "${source_text}")
+
+    set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
+    set(output_file "${output_dir}/tx_main.cpp")
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(WRITE "${output_file}" "${source_text}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_file}")
+    set(${output_var} "${output_file}" PARENT_SCOPE)
+endfunction()
+
+# Upstream gates the Backpack controls together with every feature of an
+# external ESP backpack. Generate a build-only parameter source that exposes a
+# dedicated runtime Off/On control for SiW917's internal WiFi transport.
+function(siw917_generate_internal_backpack_parameters_source input_file output_var)
+    set(old_parameter
+"static commandParameter luaTxBackpackUpdate = {
+    {\"Enable Backpack WiFi\", CRSF_COMMAND},
+    lcsIdle, // step
+    STR_EMPTYSPACE
+};")
+    set(new_parameter
+"${old_parameter}
+
+static selectionParameter luaSiW917MavlinkWifi = {
+    {\"MAVLink WiFi\", CRSF_TEXT_SELECTION},
+    0, // value
+    luastrOffOn,
+    STR_EMPTYSPACE};")
+    set(old_declarations
+"extern bool BackpackTelemReadyToSend;")
+    set(new_declarations
+"extern \"C\" void siw917_mavlink_backpack_set_lua_enabled(bool enabled);
+extern \"C\" bool siw917_mavlink_backpack_get_lua_enabled(void);
+
+extern bool BackpackTelemReadyToSend;")
+    set(old_registration
+"    if (OPT_USE_TX_BACKPACK) {
+      registerParameter(&luaTxBackpackUpdate, sendCallback, luaWiFiFolder.common.id);")
+    set(new_registration
+"    if (OPT_USE_SIW917_INTERNAL_BACKPACK) {
+      registerParameter(
+          &luaSiW917MavlinkWifi, [](propertiesCommon *item, uint8_t arg) {
+              const bool enabled = arg != 0;
+              siw917_mavlink_backpack_set_lua_enabled(enabled);
+              setTextSelectionValue((selectionParameter *)item, enabled ? 1 : 0);
+          }, luaWiFiFolder.common.id);
+    }
+
+    if (OPT_USE_TX_BACKPACK) {
+      registerParameter(&luaTxBackpackUpdate, sendCallback, luaWiFiFolder.common.id);")
+    set(old_state_update
+"  if (OPT_USE_TX_BACKPACK)
+  {")
+    set(new_state_update
+"  if (OPT_USE_SIW917_INTERNAL_BACKPACK)
+  {
+    setTextSelectionValue(&luaSiW917MavlinkWifi,
+                          siw917_mavlink_backpack_get_lua_enabled() ? 1 : 0);
+  }
+  if (OPT_USE_TX_BACKPACK)
+  {")
+
+    file(READ "${input_file}" source_text)
+    foreach(patch_name IN ITEMS parameter declarations registration state_update)
+        set(old_text "${old_${patch_name}}")
+        string(FIND "${source_text}" "${old_text}" patch_offset)
+        if(patch_offset EQUAL -1)
+            message(FATAL_ERROR
+                "SiW917 internal backpack ${patch_name} patch no longer matches ${input_file}"
+            )
+        endif()
+        string(REPLACE "${old_text}" "${new_${patch_name}}" source_text "${source_text}")
+    endforeach()
+
+    set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
+    set(output_file "${output_dir}/TXModuleParameters.cpp")
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(WRITE "${output_file}" "${source_text}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_file}")
+    set(${output_var} "${output_file}" PARENT_SCOPE)
+endfunction()
+
 # SiW917 platform abstraction files (Arduino compatibility layer)
 # Prefer the SiW917 adapter until the upstream tx_main canary compiles cleanly.
 if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
@@ -228,10 +367,20 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
         )
     endif()
     set(ELRS_MAIN_SOURCE "${ELRS_UPSTREAM_DIR}/src/tx_main.cpp")
+    siw917_generate_mavlink_backpack_source(
+        "${ELRS_MAIN_SOURCE}"
+        ELRS_MAIN_SOURCE
+    )
     set(ELRS_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/common.cpp")
     set(ELRS_RXTX_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/rxtx_common.cpp")
     set(ELRS_LR1121_SOURCE "${ELRS_UPSTREAM_DIR}/lib/LR1121Driver/LR1121.cpp")
     set(ELRS_HANDSET_SOURCE "${ELRS_UPSTREAM_DIR}/lib/Handset/CRSFHandset.cpp")
+    set(ELRS_TX_MODULE_PARAMETERS_SOURCE
+        "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXModuleParameters.cpp")
+    siw917_generate_internal_backpack_parameters_source(
+        "${ELRS_TX_MODULE_PARAMETERS_SOURCE}"
+        ELRS_TX_MODULE_PARAMETERS_SOURCE
+    )
     if(SIW917_ELRS_CRSF_BENCH_2WIRE)
         siw917_generate_two_wire_handset_source(
             "${ELRS_HANDSET_SOURCE}"
@@ -245,16 +394,19 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
         "${ELRS_UPSTREAM_DIR}/lib/BUTTON/devButton.cpp"
         ${ELRS_HANDSET_SOURCE}
         "${ELRS_UPSTREAM_DIR}/lib/LED/devLED.cpp"
+        "${ELRS_UPSTREAM_DIR}/lib/MAVLink/MAVLink.cpp"
+        "${ELRS_UPSTREAM_DIR}/lib/MAVLink/ardupilot_custom_telemetry.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/MSP/msp.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/POWERMGNT/POWERMGNT.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/devTXLUA.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXModuleEndpoint.cpp"
-        "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXModuleParameters.cpp"
+        ${ELRS_TX_MODULE_PARAMETERS_SOURCE}
         "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXOTAConnector.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXUSBConnector.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/VTX/devVTX.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/elrs_eeprom/elrs_eeprom.cpp"
         "../src/elrs_cpp/hal/siw917_upstream_devices.cpp"
+        "../src/elrs_cpp/hal/siw917_mavlink_backpack.cpp"
         "../src/elrs_cpp/hal/siw917_upstream_tx_wrapper.cpp"
     )
     if(SIW917_ELRS_TX_PC_BENCH)
@@ -284,6 +436,7 @@ set(ELRS_PLATFORM_SOURCES
     "../src/elrs_cpp/hal/hwTimer.cpp"
     "../src/elrs_cpp/hal/LR1121_hal.cpp"
     "../src/elrs_cpp/hal/elrs_task_wakeup.cpp"
+    "../src/siw917_mavlink_wifi.c"
     ${ELRS_MAIN_SOURCE}
     ${ELRS_RXTX_COMMON_SOURCE}
     ${ELRS_COMMON_SOURCE}
@@ -461,6 +614,13 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
         ${ELRS_TX_UPSTREAM_EXTRA_SOURCES}
         ${ELRS_CPP_SOURCES}
         APPEND PROPERTY COMPILE_OPTIONS ${ELRS_UPSTREAM_SOURCE_INCLUDE_OPTIONS}
+    )
+    set_property(SOURCE
+        "${ELRS_UPSTREAM_DIR}/lib/MAVLink/MAVLink.cpp"
+        "${ELRS_UPSTREAM_DIR}/lib/MAVLink/ardupilot_custom_telemetry.cpp"
+        APPEND PROPERTY COMPILE_OPTIONS
+            -include ctime
+            -Wno-error=address-of-packed-member
     )
 endif()
 

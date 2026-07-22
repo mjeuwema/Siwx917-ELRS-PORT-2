@@ -13,6 +13,8 @@ extern "C" {
 #include "elrs_config.h"
 void elrs_cpp_request_wifi_mode(void);
 void siw917_lr1121_handle_deferred_isr(void);
+void siw917_mavlink_backpack_init(void);
+void siw917_mavlink_backpack_service(void);
 }
 
 void setup();
@@ -26,6 +28,7 @@ RXtimerState_e RXtimerState = tim_disconnected;
 static bool siw917_upstream_tx_initialized = false;
 static bool siw917_upstream_tx_running = false;
 static connectionState_e siw917_last_reported_link_state = hardwareUndefined;
+static uint8_t siw917_last_reported_rate_index = 0xFFU;
 
 static const char *siw917_link_state_name(connectionState_e state)
 {
@@ -48,13 +51,16 @@ static const char *siw917_link_state_name(connectionState_e state)
 
 static void siw917_report_link_transition()
 {
-    if (connectionState == siw917_last_reported_link_state)
+    const expresslrs_mod_settings_s *rate = ExpressLRS_currAirRate_Modparams;
+    const uint8_t rateIndex = rate != nullptr ? rate->index : 0xFFU;
+    if (connectionState == siw917_last_reported_link_state &&
+        rateIndex == siw917_last_reported_rate_index)
     {
         return;
     }
 
     siw917_last_reported_link_state = connectionState;
-    const expresslrs_mod_settings_s *rate = ExpressLRS_currAirRate_Modparams;
+    siw917_last_reported_rate_index = rateIndex;
     printf("[TXLINK] state=%s rate_index=%u rf_mode=%u interval_us=%lu "
            "tlm_denom=%u lq=%u\n",
            siw917_link_state_name(connectionState),
@@ -84,6 +90,7 @@ extern "C" bool elrs_tx_init(void)
     // Upstream owns RF rate, Lua parameters, handset processing, and model
     // persistence. The platform wrapper only enters the upstream lifecycle.
     setup();
+    siw917_mavlink_backpack_init();
     RXtimerState = tim_disconnected;
     siw917_upstream_tx_initialized =
         connectionState != radioFailed && connectionState != hardwareUndefined;
@@ -114,6 +121,7 @@ extern "C" void elrs_tx_loop(void)
 
     siw917_lr1121_handle_deferred_isr();
     loop();
+    siw917_mavlink_backpack_service();
     siw917_lr1121_handle_deferred_isr();
     siw917_report_link_transition();
 }
@@ -203,18 +211,4 @@ extern "C" void elrs_exit_binding_mode(void)
 void setWifiUpdateMode()
 {
     elrs_cpp_request_wifi_mode();
-}
-
-bool isThisAMavPacket(uint8_t *buffer, uint16_t bufferSize)
-{
-    (void)buffer;
-    (void)bufferSize;
-    return false;
-}
-
-void convert_mavlink_to_crsf_telem(crsf_addr_e destination, uint8_t *buffer, uint8_t count)
-{
-    (void)destination;
-    (void)buffer;
-    (void)count;
 }

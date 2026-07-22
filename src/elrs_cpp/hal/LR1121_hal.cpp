@@ -112,7 +112,6 @@ static bool dio1StageInit();
 static bool waitOnBusyForCommand(LR1121Hal *hal,
                                  SX12XX_Radio_Number_t radioNumber,
                                  uint16_t opcode);
-static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size);
 
 extern "C" void siw917_lr1121_set_rate_configuration_active(bool active) {
   if (active) {
@@ -437,8 +436,6 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
   }
   if (!command_ok) {
     DBGLN("WriteCommand failed (opcode=0x%04X size=%u)", opcode, size);
-  } else if (opcode == LR11XX_REGMEM_WRITE_REGMEM32_MASK_OC) {
-    verifySf6CompatibilityWrite(tx_buffer, size);
   }
 
 #if SIW917_ELRS_FUSED_RX_RETUNE
@@ -660,39 +657,6 @@ static bool waitOnBusyForCommand(LR1121Hal *hal,
     printf("[LR1121_CFG] BUSY timeout opcode=0x%04X\n", opcode);
   }
   return ready;
-}
-
-static uint32_t readBigEndianU32(const uint8_t *bytes) {
-  return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
-         ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
-}
-
-static void verifySf6CompatibilityWrite(const uint8_t *buffer, uint8_t size) {
-  constexpr uint32_t kSf6Register = 0x00F20414U;
-  if (buffer == nullptr || size != 12U ||
-      readBigEndianU32(buffer) != kSf6Register) {
-    return;
-  }
-
-  const uint32_t mask = readBigEndianU32(buffer + 4);
-  const uint32_t expected = readBigEndianU32(buffer + 8) & mask;
-  uint32_t actual = 0U;
-  if (lr1121_read_regmem32(kSf6Register, &actual) &&
-      (actual & mask) == expected) {
-    return;
-  }
-
-  const bool retrySent = lr1121_wait_busy_timeout(100) &&
-                         lr1121_send_command(
-                             LR11XX_REGMEM_WRITE_REGMEM32_MASK_OC, buffer,
-                             size);
-  const bool retryVerified = retrySent &&
-                             lr1121_read_regmem32(kSf6Register, &actual) &&
-                             (actual & mask) == expected;
-  printf("[LR1121_CFG] SF6 compatibility retry %s value=0x%08lX "
-         "expected=0x%08lX mask=0x%08lX\n",
-         retryVerified ? "verified" : "FAILED", (unsigned long)actual,
-         (unsigned long)expected, (unsigned long)mask);
 }
 
 static inline bool dio1GpioDirectPathAllowed() {

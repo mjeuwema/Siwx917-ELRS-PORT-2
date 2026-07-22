@@ -3038,34 +3038,6 @@ bool lr1121_read_response(uint8_t *response, uint16_t response_len) {
   return result;
 }
 
-bool lr1121_read_regmem32(uint32_t address, uint32_t *value) {
-  if (value == NULL) {
-    return false;
-  }
-
-  const uint8_t params[5] = {
-      (uint8_t)(address >> 24),
-      (uint8_t)(address >> 16),
-      (uint8_t)(address >> 8),
-      (uint8_t)address,
-      1U,
-  };
-  uint8_t response[5] = {0};
-
-  if (!lr1121_wait_busy_timeout(100) ||
-      !lr1121_send_command(0x0106U, params, sizeof(params)) ||
-      !lr1121_wait_busy_timeout(100) ||
-      !lr1121_read_response(response, sizeof(response))) {
-    return false;
-  }
-
-  *value = ((uint32_t)response[1] << 24) |
-           ((uint32_t)response[2] << 16) |
-           ((uint32_t)response[3] << 8) |
-           (uint32_t)response[4];
-  return true;
-}
-
 uint32_t lr1121_get_rx_arm_max_us(void) { return lr1121_rx_arm_max_us; }
 
 uint32_t lr1121_get_rx_arm_count(void) { return lr1121_rx_arm_count; }
