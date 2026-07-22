@@ -98,6 +98,125 @@ set(ELRS_UPSTREAM_INCLUDE_DIRS
 
 set(ELRS_UPSTREAM_SOURCE_INCLUDE_DIRS ${ELRS_UPSTREAM_INCLUDE_DIRS})
 
+# Keep target-specific transport handling out of the vendored ELRS source.
+# The custom EdgeTX firmware exposes independent module-bay RX/TX wires, but
+# CRSF replies still need upstream's half-duplex period budgeting. Generate a
+# build-only source that keeps electrical full-duplex for startup/autobaud,
+# applies the period budget independently, and never flushes the live RX wire
+# after a response.
+function(siw917_generate_two_wire_handset_source input_file output_var)
+    set(old_duplex_block
+"#if defined(PLATFORM_SIW917)
+    // The SiW917 pins are still split before the external inverter/combiner,
+    // but the RadioMaster module bay side is a single half-duplex CRSF bus.
+    // Use upstream's half-duplex pacing so Lua/device replies fit the handset
+    // receive windows instead of colliding with the radio's RC stream.
+    halfDuplex = true;
+    DBGLN(\"[CRSFHandset] SiW917 radio adapter: forcing half-duplex handset pacing\");
+#endif")
+    set(new_duplex_block
+"#if defined(PLATFORM_SIW917) && !defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+    // Adapter builds expose a shared half-duplex module-bay bus.
+    halfDuplex = true;
+    DBGLN(\"[CRSFHandset] SiW917 radio adapter: forcing half-duplex handset pacing\");
+#endif")
+
+    set(old_pacing_block
+"        uint8_t periodBytesRemaining = HANDSET_TELEMETRY_FIFO_SIZE;
+        if (halfDuplex)
+        {")
+    set(new_pacing_block
+"        uint8_t periodBytesRemaining = HANDSET_TELEMETRY_FIFO_SIZE;
+#if defined(PLATFORM_SIW917) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+        const bool paceHandsetReplies = true;
+#else
+        const bool paceHandsetReplies = halfDuplex;
+#endif
+        if (paceHandsetReplies)
+        {")
+
+    set(old_block
+"    if (transmitting)
+    {
+        // if currently transmitting in half-duplex mode then check if the TX buffers are empty.
+        // If there is still data in the transmit buffers then exit, and we'll check next go round.
+#if defined(PLATFORM_ESP32)
+        if (!uart_ll_is_tx_idle(UART_LL_GET_HW(0)))
+        {
+            return;
+        }
+#elif defined(PLATFORM_ESP8266)
+        if (((USS(0) >> USTXC) & 0xff) > 0)
+        {
+            return;
+        }
+#endif
+        // All done transmitting; go back to receive mode
+        transmitting = false;
+        duplex_set_RX();
+        flush_port_input();
+    }")
+    set(new_block
+"    if (transmitting)
+    {
+#if defined(PLATFORM_SIW917) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+        // EdgeTX uses independent RX/TX wires on this target. Keep logical
+        // half-duplex reply pacing, but never block or discard live RX bytes.
+        transmitting = false;
+#else
+        // if currently transmitting in half-duplex mode then check if the TX buffers are empty.
+        // If there is still data in the transmit buffers then exit, and we'll check next go round.
+#if defined(PLATFORM_ESP32)
+        if (!uart_ll_is_tx_idle(UART_LL_GET_HW(0)))
+        {
+            return;
+        }
+#elif defined(PLATFORM_ESP8266)
+        if (((USS(0) >> USTXC) & 0xff) > 0)
+        {
+            return;
+        }
+#endif
+        // All done transmitting; go back to receive mode
+        transmitting = false;
+        duplex_set_RX();
+        flush_port_input();
+#endif
+    }")
+
+    file(READ "${input_file}" source_text)
+    string(FIND "${source_text}" "${old_duplex_block}" duplex_offset)
+    if(duplex_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 handset duplex patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_duplex_block}" "${new_duplex_block}" source_text "${source_text}")
+
+    string(FIND "${source_text}" "${old_pacing_block}" pacing_offset)
+    if(pacing_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 handset pacing patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_pacing_block}" "${new_pacing_block}" source_text "${source_text}")
+
+    string(FIND "${source_text}" "${old_block}" block_offset)
+    if(block_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 handset transport patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_block}" "${new_block}" source_text "${source_text}")
+
+    set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
+    set(output_file "${output_dir}/CRSFHandset.cpp")
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(WRITE "${output_file}" "${source_text}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_file}")
+    set(${output_var} "${output_file}" PARENT_SCOPE)
+endfunction()
+
 # SiW917 platform abstraction files (Arduino compatibility layer)
 # Prefer the SiW917 adapter until the upstream tx_main canary compiles cleanly.
 if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
@@ -112,12 +231,19 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
     set(ELRS_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/common.cpp")
     set(ELRS_RXTX_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/rxtx_common.cpp")
     set(ELRS_LR1121_SOURCE "${ELRS_UPSTREAM_DIR}/lib/LR1121Driver/LR1121.cpp")
+    set(ELRS_HANDSET_SOURCE "${ELRS_UPSTREAM_DIR}/lib/Handset/CRSFHandset.cpp")
+    if(SIW917_ELRS_CRSF_BENCH_2WIRE)
+        siw917_generate_two_wire_handset_source(
+            "${ELRS_HANDSET_SOURCE}"
+            ELRS_HANDSET_SOURCE
+        )
+    endif()
     set(ELRS_DEVICE_SOURCE "${ELRS_UPSTREAM_DIR}/lib/DEVICE/device.cpp")
     set(ELRS_TX_UPSTREAM_EXTRA_SOURCES
         "${ELRS_UPSTREAM_DIR}/src/dynpower.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/ADC/devADC.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/BUTTON/devButton.cpp"
-        "${ELRS_UPSTREAM_DIR}/lib/Handset/CRSFHandset.cpp"
+        ${ELRS_HANDSET_SOURCE}
         "${ELRS_UPSTREAM_DIR}/lib/LED/devLED.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/MSP/msp.cpp"
         "${ELRS_UPSTREAM_DIR}/lib/POWERMGNT/POWERMGNT.cpp"

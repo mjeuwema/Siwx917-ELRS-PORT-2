@@ -11,9 +11,14 @@
 
 #include "crsf_serial.h"
 #include "Driver_USART.h"
+#include "USART.h"
 #include "RTE_Device_917.h"
 #if defined(SIW917_ELRS_TARGET_TX)
 #include "UDMA.h"
+#include "clock_update.h"
+#include "rsi_rom_udma_wrapper.h"
+#include "siw917_elrs_timing.h"
+#include "system_si91x.h"
 #endif
 #include "rsi_egpio.h"
 #include "rsi_debug.h"
@@ -53,6 +58,15 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_RX_RING_SIZE 4096U
 #define CRSF_SERIAL_RX_RING_MASK (CRSF_SERIAL_RX_RING_SIZE - 1U)
 #if defined(SIW917_ELRS_TARGET_TX) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+#define CRSF_SERIAL_UART1_PINGPONG_DMA 1
+#define CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE 1024U
+#define CRSF_SERIAL_RX_DMA_PINGPONG_SPAN \
+    (2U * CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE)
+#else
+#define CRSF_SERIAL_UART1_PINGPONG_DMA 0
+#endif
+
+#if defined(SIW917_ELRS_TARGET_TX) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
 /*
  * Keep the direct EdgeTX handset path responsive even if a platform revision
  * does not expose useful live descriptor progress. A 32-byte block is large
@@ -73,6 +87,19 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
  * use an external inverter/tri-state stage and active-low output enable.
  */
 #define CRSF_SERIAL_USE_ULP_UART 0
+
+/*
+ * The custom EdgeTX firmware exposes a normal two-wire UART. CMSIS still owns
+ * clocks, pin mux and baud setup. The default two-wire transport uses UART1
+ * UDMA ping-pong RX plus queued DMA TX so upstream HardwareSerial remains
+ * nonblocking without interrupting the M4 for each FIFO burst.
+ */
+#if defined(SIW917_ELRS_TARGET_TX) && defined(SIW917_ELRS_CRSF_BENCH_2WIRE) && \
+    !CRSF_SERIAL_UART1_PINGPONG_DMA
+#define CRSF_SERIAL_DIRECT_UART1 1
+#else
+#define CRSF_SERIAL_DIRECT_UART1 0
+#endif
 
 #if defined(SIW917_ELRS_TARGET_TX)
 #define CRSF_SERIAL_DRIVER_NAME "UART1"
@@ -104,7 +131,11 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_HAS_TX_OE_N 1
 #endif
 #define CRSF_SERIAL_UART_REGS UART1
-#if defined(RTE_UART1_DMA_MODE1_EN) && (RTE_UART1_DMA_MODE1_EN == 1)
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+#define CRSF_SERIAL_DMA_ENABLED 1
+#elif CRSF_SERIAL_DIRECT_UART1
+#define CRSF_SERIAL_DMA_ENABLED 0
+#elif defined(RTE_UART1_DMA_MODE1_EN) && (RTE_UART1_DMA_MODE1_EN == 1)
 #define CRSF_SERIAL_DMA_ENABLED 1
 #else
 #define CRSF_SERIAL_DMA_ENABLED 0
@@ -171,23 +202,34 @@ static uint8_t g_tx_buffer[CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 #define CRSF_SERIAL_ASYNC_TX_QUEUE 0
 #endif
 
-#if !CRSF_SERIAL_ASYNC_TX_QUEUE
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE && !CRSF_SERIAL_DIRECT_UART1
 static uint32_t g_tx_stuck_recover_count = 0U;
 static uint8_t g_tx_busy_skip_count = 0U;
 #endif
 
 #if CRSF_SERIAL_ASYNC_TX_QUEUE
-#define CRSF_SERIAL_TX_QUEUE_DEPTH 8U
+/*
+ * Upstream CRSFHandset owns a 256-byte output FIFO and assumes that
+ * HardwareSerial::write() accepts every requested byte. Use enough slots for
+ * the smallest paced writes as well as full CRSF frames, then apply yielding
+ * backpressure rather than reporting success after silently dropping data.
+ */
+#define CRSF_SERIAL_TX_QUEUE_DEPTH 32U
 static uint8_t g_tx_queue[CRSF_SERIAL_TX_QUEUE_DEPTH]
                          [CRSF_SERIAL_MAX_FRAME_SIZE] CRSF_SERIAL_DMA_ALIGN;
 static uint8_t g_tx_queue_len[CRSF_SERIAL_TX_QUEUE_DEPTH];
 static volatile uint8_t g_tx_queue_head = 0U;
 static volatile uint8_t g_tx_queue_tail = 0U;
 static volatile uint8_t g_tx_queue_count = 0U;
+static volatile uint8_t g_tx_queue_high_water = 0U;
 static volatile bool g_tx_queue_active = false;
 static volatile bool g_tx_queue_completion_pending = false;
 static volatile uint32_t g_tx_queue_full_count = 0U;
 static volatile uint32_t g_tx_queue_error_count = 0U;
+static volatile int32_t g_tx_queue_last_error = ARM_DRIVER_OK;
+static bool g_tx_queue_full_reported = false;
+static bool g_tx_queue_error_reported = false;
+static bool g_tx_queue_send_error_active = false;
 #endif
 
 #ifndef SIW917_ELRS_EVENT_COUNTERS
@@ -225,7 +267,8 @@ static volatile uint32_t g_tx_queue_error_count = 0U;
  */
 #if defined(SIW917_ELRS_TARGET_TX) && \
     defined(SIW917_ELRS_CRSF_BENCH_2WIRE) && \
-    CRSF_SERIAL_DMA_ENABLED && !CRSF_SERIAL_RX_FRAME_AWARE_DMA
+    CRSF_SERIAL_DMA_ENABLED && !CRSF_SERIAL_RX_FRAME_AWARE_DMA && \
+    !CRSF_SERIAL_UART1_PINGPONG_DMA
 #define CRSF_SERIAL_RX_LIVE_DMA_CURSOR 1
 #else
 #define CRSF_SERIAL_RX_LIVE_DMA_CURSOR 0
@@ -240,13 +283,17 @@ _Static_assert(CRSF_SERIAL_RX_DMA_CH < UDMA_NUMBER_OF_CHANNELS,
 #define CRSF_SERIAL_TX_ECHO_SETTLE_US    5U
 #define CRSF_SERIAL_DEVICE_INFO_TYPE     0x29U
 
+#ifndef CRSF_SERIAL_DIRECT_DIAG
+#define CRSF_SERIAL_DIRECT_DIAG 0
+#endif
+
 #if defined(SIW917_CRSF_RADIO_RETURN_DIAG)
 static volatile uint32_t g_return_diag_reply_count = 0;
 static bool g_return_diag_frame_dumped = false;
 #define CRSF_RETURN_DIAG_DETAIL_LIMIT 4U
 #endif
 
-static uint8_t g_rx_ring[CRSF_SERIAL_RX_RING_SIZE];
+static uint8_t g_rx_ring[CRSF_SERIAL_RX_RING_SIZE] CRSF_SERIAL_DMA_ALIGN;
 static volatile uint16_t g_rx_head = 0;
 static volatile uint16_t g_rx_tail = 0;
 static volatile bool g_rx_enabled = false;
@@ -255,6 +302,73 @@ static volatile bool g_rx_paused_for_tx = false;
 static volatile uint32_t g_rx_overrun_count = 0;
 static volatile uint32_t g_rx_echo_pause_count = 0;
 static volatile uint32_t g_tx_temt_timeout_count = 0;
+
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+#define CRSF_SERIAL_UDMA_IRQ_PRIORITY 7U
+
+_Static_assert(CRSF_SERIAL_RX_DMA_PINGPONG_SPAN <= CRSF_SERIAL_RX_RING_SIZE,
+               "UART1 ping-pong DMA span exceeds the RX ring");
+_Static_assert((CRSF_SERIAL_RX_DMA_PINGPONG_SPAN &
+                (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U)) == 0U,
+               "UART1 ping-pong DMA span must be a power of two");
+_Static_assert(CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE <= 1024U,
+               "SiWx917 UDMA descriptors support at most 1024 byte transfers");
+
+extern RSI_UDMA_DESC_T UDMA0_Table[CONTROL_STRUCT0];
+extern UDMA_RESOURCES UDMA0_Resources;
+extern UDMA_Channel_Info udma0_chnl_info[UDMA_NUMBER_OF_CHANNELS];
+extern RSI_UDMA_HANDLE_T udmaHandle0;
+extern uint32_t dma_rom_buff0[30];
+
+static volatile bool g_rx_dma_pingpong_running = false;
+static volatile bool g_rx_dma_pingpong_fault = false;
+static volatile uint8_t g_rx_dma_pingpong_active = 0U;
+static volatile uint32_t g_rx_dma_pingpong_block_base = 0U;
+static volatile uint32_t g_rx_dma_produced = 0U;
+static volatile uint32_t g_rx_dma_consumed = 0U;
+static volatile uint32_t g_rx_dma_pingpong_complete_count = 0U;
+static volatile uint32_t g_rx_dma_pingpong_error_count = 0U;
+static uint32_t g_rx_dma_pingpong_recovery_count = 0U;
+static uint32_t g_rx_dma_pingpong_last_recovery_tick = 0U;
+#endif
+
+#if CRSF_SERIAL_DIRECT_UART1
+#define CRSF_SERIAL_TX_RING_SIZE 4096U
+#define CRSF_SERIAL_TX_RING_MASK (CRSF_SERIAL_TX_RING_SIZE - 1U)
+#define CRSF_SERIAL_UART_FIFO_DEPTH 16U
+#define CRSF_SERIAL_UART_IRQ_PRIORITY 7U
+#define CRSF_SERIAL_HANDSET_ADDRESS 0xEEU
+#define CRSF_SERIAL_VECTOR_RESERVED_ENTRIES 16U
+#define CRSF_SERIAL_UART1_VECTOR_INDEX \
+    (CRSF_SERIAL_VECTOR_RESERVED_ENTRIES + (uint32_t)UART1_IRQn)
+
+typedef void (*crsf_serial_irq_handler_t)(void);
+static uint8_t g_tx_ring[CRSF_SERIAL_TX_RING_SIZE];
+static volatile uint16_t g_tx_ring_head = 0U;
+static volatile uint16_t g_tx_ring_tail = 0U;
+static volatile uint16_t g_tx_ring_high_water = 0U;
+static volatile uint32_t g_uart_irq_count = 0U;
+static volatile uint32_t g_uart_rx_byte_count = 0U;
+static volatile uint32_t g_uart_tx_byte_count = 0U;
+static volatile uint32_t g_uart_line_error_count = 0U;
+static volatile uint32_t g_uart_tx_backpressure_count = 0U;
+static volatile uint32_t g_uart_rx_data_irq_count = 0U;
+static volatile uint32_t g_uart_rx_timeout_irq_count = 0U;
+static volatile uint32_t g_uart_tx_empty_irq_count = 0U;
+static volatile uint32_t g_uart_busy_irq_count = 0U;
+static volatile uint32_t g_uart_unknown_irq_count = 0U;
+static volatile uint32_t g_uart_last_irq_cause = USART_NO_INTR_PENDING;
+static volatile uint32_t g_uart_last_line_status = 0U;
+static uint8_t g_uart_rx_frame_state = 0U;
+static uint8_t g_uart_rx_frame_remaining = 0U;
+static uint8_t g_uart_rx_frame_type = 0xFFU;
+static uint32_t g_uart_diag_last_ms = 0U;
+static uint32_t g_uart_diag_last_irq_count = 0U;
+static uint32_t g_uart_diag_last_rx_byte_count = 0U;
+static uint32_t g_crsf_uart_ram_vector_table[SI91X_VECTOR_TABLE_ENTRIES]
+    __attribute__((aligned(512)));
+static bool g_crsf_uart_vector_installed = false;
+#endif
 
 #if CRSF_SERIAL_RX_DIAG_ENABLED
 static volatile uint32_t g_rx_dma_arm_count = 0;
@@ -316,7 +430,7 @@ typedef enum {
 static volatile crsf_rx_dma_state_t g_rx_dma_frame_state = CRSF_RX_DMA_SEEK_SYNC;
 static volatile uint32_t g_rx_dma_request_len = 1U;
 #endif
-#else
+#elif !CRSF_SERIAL_DIRECT_UART1
 static uint8_t g_rx_byte = 0;
 #endif
 
@@ -513,7 +627,7 @@ static void crsf_serial_configure_rx_idle_bias(void)
 #endif
 }
 
-#if !CRSF_SERIAL_ASYNC_TX_QUEUE
+#if !CRSF_SERIAL_DIRECT_UART1
 static bool crsf_serial_uart_temt(void)
 {
     return (CRSF_SERIAL_UART_REGS->LSR_b.TEMT != 0U);
@@ -663,6 +777,12 @@ static void rx_ring_reset(void)
     g_rx_head = 0;
     g_rx_tail = 0;
     g_rx_overrun_count = 0;
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    g_rx_dma_produced = 0U;
+    g_rx_dma_consumed = 0U;
+    g_rx_dma_pingpong_block_base = 0U;
+    g_rx_dma_pingpong_active = 0U;
+#endif
 }
 
 static void rx_ring_push_from_isr(uint8_t byte)
@@ -677,6 +797,653 @@ static void rx_ring_push_from_isr(uint8_t byte)
     g_rx_ring[g_rx_head] = byte;
     g_rx_head = next;
 }
+
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+static bool rx_dma_pingpong_irq_suspend(void)
+{
+    const uint32_t mask = 1UL << ((uint32_t)UDMA0_IRQn & 0x1FU);
+    const uint32_t index = (uint32_t)UDMA0_IRQn >> 5U;
+    const bool enabled = (NVIC->ISER[index] & mask) != 0U;
+    NVIC_DisableIRQ(UDMA0_IRQn);
+    __DSB();
+    __ISB();
+    return enabled;
+}
+
+static void rx_dma_pingpong_irq_resume(bool enabled)
+{
+    if (enabled) {
+        NVIC_EnableIRQ(UDMA0_IRQn);
+    }
+}
+
+static RSI_UDMA_CHA_CONFIG_DATA_T rx_dma_pingpong_control(void)
+{
+    RSI_UDMA_CHA_CONFIG_DATA_T control = {0};
+    control.transferType = UDMA_MODE_PINGPONG;
+    control.nextBurst = 0U;
+    control.totalNumOfDMATrans =
+        CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE - 1U;
+    control.rPower = ARBSIZE_1;
+    control.srcProtCtrl = 0U;
+    control.dstProtCtrl = 0U;
+    control.srcSize = SRC_SIZE_8;
+    control.srcInc = SRC_INC_NONE;
+    control.dstSize = DST_SIZE_8;
+    control.dstInc = DST_INC_8;
+    return control;
+}
+
+static RSI_UDMA_CHA_CFG_T rx_dma_pingpong_config(uint8_t index)
+{
+    RSI_UDMA_CHA_CFG_T config = {0};
+    config.altStruct = index == 0U ? 0U : 1U;
+    config.burstReq = 1U;
+    /* RF DIO/timer IRQs and radio SPI work must win over handset traffic. */
+    config.channelPrioHigh = 0U;
+    config.periAck = UART1_ACK;
+    config.periphReq = 1U;
+    config.reqMask = 0U;
+    config.dmaCh = CRSF_SERIAL_RX_DMA_CH;
+    return config;
+}
+
+static void rx_dma_pingpong_event(uint32_t event, uint32_t channel);
+
+static void rx_dma_pingpong_publish(uint32_t produced)
+{
+    const uint32_t previous = g_rx_dma_produced;
+    const uint32_t advance = produced - previous;
+    if (advance == 0U || advance > 0x7FFFFFFFU) {
+        return;
+    }
+
+    const uint32_t available = produced - g_rx_dma_consumed;
+    if (available >= CRSF_SERIAL_RX_DMA_PINGPONG_SPAN) {
+        g_rx_dma_consumed =
+            produced - (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U);
+        g_rx_overrun_count++;
+    }
+
+    __DMB();
+    g_rx_dma_produced = produced;
+    g_rx_head = (uint16_t)(produced &
+        (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U));
+    g_rx_tail = (uint16_t)(g_rx_dma_consumed &
+        (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U));
+}
+
+static int rx_dma_pingpong_rearm(uint8_t index)
+{
+    RSI_UDMA_CHA_CONFIG_DATA_T control = rx_dma_pingpong_control();
+    const uint32_t offset =
+        (uint32_t)index * CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE;
+    const uint32_t descriptor_index = CRSF_SERIAL_RX_DMA_CH +
+        (index != 0U ? UDMA_ALT_SELECT : 0U);
+    volatile RSI_UDMA_DESC_T *descriptor =
+        &UDMA0_Table[descriptor_index];
+
+    /*
+     * This descriptor is inactive while its partner receives. Do not call
+     * UDMAx_ChannelConfigure() here: its SetupChannel step writes
+     * CHNL_PRI_ALT_SET for an alternate descriptor and can switch hardware
+     * onto the descriptor while it is being rearmed. Program addresses first
+     * and publish PINGPONG mode last, as in Silicon Labs' ping-pong examples.
+     */
+    descriptor->pSrcEndAddr = (volatile void *)&UART1->RBR;
+    descriptor->pDstEndAddr =
+        (volatile void *)&g_rx_ring[
+            offset + CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE - 1U];
+    __DMB();
+    descriptor->vsUDMAChaConfigData1 = control;
+    __DMB();
+    return 0;
+}
+
+static int rx_dma_pingpong_ensure_controller(void)
+{
+    if (udmaHandle0 != NULL) {
+        NVIC_SetPriority(UDMA0_IRQn, CRSF_SERIAL_UDMA_IRQ_PRIORITY);
+        return 0;
+    }
+
+    /*
+     * Driver_UART1 may already own an initialized UART resource and return
+     * success without running its UDMA setup again. Acquire the same shared
+     * UDMA0 handle with the SDK wrapper before configuring our RX channel.
+     */
+    udmaHandle0 = UDMAx_Initialize(&UDMA0_Resources,
+                                   UDMA0_Table,
+                                   udmaHandle0,
+                                   dma_rom_buff0);
+    if (udmaHandle0 == NULL) {
+        CRSF_DBG("UART1 RX ping-pong UDMA0 initialization failed\n");
+        return -1;
+    }
+
+    NVIC_SetPriority(UDMA0_IRQn, CRSF_SERIAL_UDMA_IRQ_PRIORITY);
+    CRSF_DBG("UART1 RX ping-pong UDMA0 handle acquired: 0x%08lX "
+             "irq_priority=%u\n",
+             (unsigned long)(uintptr_t)udmaHandle0,
+             (unsigned)CRSF_SERIAL_UDMA_IRQ_PRIORITY);
+    return 0;
+}
+
+static void rx_dma_pingpong_event(uint32_t event, uint32_t channel)
+{
+    if (channel != CRSF_SERIAL_RX_DMA_CH || !g_rx_dma_pingpong_running) {
+        return;
+    }
+
+    if (event == UDMA_EVENT_ERROR) {
+        g_rx_dma_pingpong_error_count++;
+        g_rx_dma_pingpong_fault = true;
+        g_rx_dma_pingpong_running = false;
+        g_rx_armed = false;
+        return;
+    }
+    if (event != UDMA_EVENT_XFER_DONE) {
+        return;
+    }
+
+    const uint32_t primary_mode =
+        UDMA0_Table[CRSF_SERIAL_RX_DMA_CH]
+            .vsUDMAChaConfigData1.transferType;
+    const uint32_t alternate_mode =
+        UDMA0_Table[CRSF_SERIAL_RX_DMA_CH + UDMA_ALT_SELECT]
+            .vsUDMAChaConfigData1.transferType;
+
+    uint8_t completed;
+    if (primary_mode == UDMA_MODE_STOP &&
+        alternate_mode == UDMA_MODE_PINGPONG) {
+        completed = 0U;
+    } else if (alternate_mode == UDMA_MODE_STOP &&
+               primary_mode == UDMA_MODE_PINGPONG) {
+        completed = 1U;
+    } else {
+        g_rx_dma_pingpong_error_count++;
+        g_rx_dma_pingpong_fault = true;
+        g_rx_dma_pingpong_running = false;
+        g_rx_armed = false;
+        return;
+    }
+
+    if (completed != g_rx_dma_pingpong_active) {
+        g_rx_dma_pingpong_error_count++;
+        g_rx_dma_pingpong_fault = true;
+        g_rx_dma_pingpong_running = false;
+        g_rx_armed = false;
+        return;
+    }
+
+    rx_dma_pingpong_publish(g_rx_dma_pingpong_block_base +
+                            CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE);
+    g_rx_dma_pingpong_block_base +=
+        CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE;
+    g_rx_dma_pingpong_active = (uint8_t)(completed ^ 1U);
+    g_rx_dma_pingpong_complete_count++;
+
+    if (rx_dma_pingpong_rearm(completed) != 0) {
+        g_rx_dma_pingpong_error_count++;
+        g_rx_dma_pingpong_fault = true;
+        g_rx_dma_pingpong_running = false;
+        g_rx_armed = false;
+        return;
+    }
+    UDMA0->CHNL_ENABLE_SET = 1UL << CRSF_SERIAL_RX_DMA_CH;
+}
+
+static int rx_dma_pingpong_start(void)
+{
+    if (rx_dma_pingpong_ensure_controller() != 0) {
+        return -1;
+    }
+
+    const bool irq_enabled = rx_dma_pingpong_irq_suspend();
+    (void)UDMAx_ChannelDisable(CRSF_SERIAL_RX_DMA_CH,
+                               &UDMA0_Resources, udmaHandle0);
+    UDMA0->UDMA_DONE_STATUS_REG = 1UL << CRSF_SERIAL_RX_DMA_CH;
+
+    RSI_UDMA_CHA_CONFIG_DATA_T control = rx_dma_pingpong_control();
+    RSI_UDMA_CHA_CFG_T primary = rx_dma_pingpong_config(0U);
+    RSI_UDMA_CHA_CFG_T alternate = rx_dma_pingpong_config(1U);
+
+    uint32_t stage = 1U;
+    int32_t status = UDMAx_ChannelConfigure(
+        &UDMA0_Resources,
+        CRSF_SERIAL_RX_DMA_CH,
+        (uint32_t)(uintptr_t)&UART1->RBR,
+        (uint32_t)(uintptr_t)&g_rx_ring[0],
+        CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE,
+        control,
+        &primary,
+        rx_dma_pingpong_event,
+        udma0_chnl_info,
+        udmaHandle0);
+    if (status == RSI_OK) {
+        stage = 2U;
+        status = UDMAx_ChannelConfigure(
+            &UDMA0_Resources,
+            CRSF_SERIAL_RX_DMA_CH,
+            (uint32_t)(uintptr_t)&UART1->RBR,
+            (uint32_t)(uintptr_t)
+                &g_rx_ring[CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE],
+            CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE,
+            control,
+            &alternate,
+            rx_dma_pingpong_event,
+            udma0_chnl_info,
+            udmaHandle0);
+    }
+
+    if (status != RSI_OK) {
+        CRSF_DBG("UART1 RX ping-pong DMA setup failed stage=%lu status=%ld handle=0x%08lX\n",
+                 (unsigned long)stage,
+                 (long)status,
+                 (unsigned long)(uintptr_t)udmaHandle0);
+        rx_dma_pingpong_irq_resume(irq_enabled);
+        return -2;
+    }
+
+    UDMA0->CHNL_PRI_ALT_CLR = 1UL << CRSF_SERIAL_RX_DMA_CH;
+    g_rx_dma_pingpong_active = 0U;
+    g_rx_dma_pingpong_block_base = 0U;
+    g_rx_dma_produced = 0U;
+    g_rx_dma_consumed = 0U;
+    g_rx_dma_pingpong_fault = false;
+    g_rx_dma_pingpong_running = true;
+    g_rx_armed = true;
+    __DMB();
+
+    (void)UDMAx_ChannelEnable(CRSF_SERIAL_RX_DMA_CH,
+                              &UDMA0_Resources, udmaHandle0);
+    (void)UDMAx_DMAEnable(&UDMA0_Resources, udmaHandle0);
+    rx_dma_pingpong_irq_resume(irq_enabled);
+    return 0;
+}
+
+static void rx_dma_pingpong_stop(void)
+{
+    if (udmaHandle0 == NULL) {
+        g_rx_dma_pingpong_running = false;
+        g_rx_armed = false;
+        return;
+    }
+
+    const bool irq_enabled = rx_dma_pingpong_irq_suspend();
+    g_rx_dma_pingpong_running = false;
+    g_rx_armed = false;
+    __DMB();
+    (void)UDMAx_ChannelDisable(CRSF_SERIAL_RX_DMA_CH,
+                               &UDMA0_Resources, udmaHandle0);
+    UDMA0->UDMA_DONE_STATUS_REG = 1UL << CRSF_SERIAL_RX_DMA_CH;
+    UDMA0_Table[CRSF_SERIAL_RX_DMA_CH]
+        .vsUDMAChaConfigData1.transferType = UDMA_MODE_STOP;
+    UDMA0_Table[CRSF_SERIAL_RX_DMA_CH + UDMA_ALT_SELECT]
+        .vsUDMAChaConfigData1.transferType = UDMA_MODE_STOP;
+    udma0_chnl_info[CRSF_SERIAL_RX_DMA_CH].cb_event = NULL;
+    udma0_chnl_info[CRSF_SERIAL_RX_DMA_CH].Size = 0U;
+    udma0_chnl_info[CRSF_SERIAL_RX_DMA_CH].Cnt = 0U;
+    rx_dma_pingpong_irq_resume(irq_enabled);
+}
+
+static void rx_dma_pingpong_harvest(void)
+{
+    if (!g_rx_dma_pingpong_running || !g_rx_enabled) {
+        return;
+    }
+
+    const bool irq_enabled = rx_dma_pingpong_irq_suspend();
+    const uint32_t channel_mask = 1UL << CRSF_SERIAL_RX_DMA_CH;
+    const uint8_t selected_a =
+        (UDMA0->CHNL_PRI_ALT_SET & channel_mask) != 0U ? 1U : 0U;
+    const uint32_t descriptor_index = CRSF_SERIAL_RX_DMA_CH +
+        (selected_a != 0U ? UDMA_ALT_SELECT : 0U);
+    const volatile RSI_UDMA_DESC_T *descriptor =
+        &UDMA0_Table[descriptor_index];
+    __DMB();
+    const uint32_t mode_a =
+        descriptor->vsUDMAChaConfigData1.transferType;
+    const uint32_t count_a =
+        descriptor->vsUDMAChaConfigData1.totalNumOfDMATrans;
+    __DMB();
+    const uint32_t count_b =
+        descriptor->vsUDMAChaConfigData1.totalNumOfDMATrans;
+    const uint32_t mode_b =
+        descriptor->vsUDMAChaConfigData1.transferType;
+    const uint8_t selected_b =
+        (UDMA0->CHNL_PRI_ALT_SET & channel_mask) != 0U ? 1U : 0U;
+
+    if (selected_a == selected_b &&
+        selected_a == g_rx_dma_pingpong_active &&
+        mode_a == UDMA_MODE_PINGPONG && mode_b == UDMA_MODE_PINGPONG) {
+        const uint32_t remaining_a = count_a + 1U;
+        const uint32_t remaining_b = count_b + 1U;
+        const uint32_t remaining = remaining_a > remaining_b
+                                       ? remaining_a
+                                       : remaining_b;
+        if (remaining <= CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE) {
+            rx_dma_pingpong_publish(
+                g_rx_dma_pingpong_block_base +
+                CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE - remaining);
+        }
+    }
+    rx_dma_pingpong_irq_resume(irq_enabled);
+}
+#endif
+
+#if CRSF_SERIAL_DIRECT_UART1
+static bool crsf_uart1_irq_suspend(void)
+{
+    const uint32_t mask = 1UL << ((uint32_t)UART1_IRQn & 0x1FU);
+    const uint32_t index = (uint32_t)UART1_IRQn >> 5U;
+    const bool enabled = (NVIC->ISER[index] & mask) != 0U;
+    NVIC_DisableIRQ(UART1_IRQn);
+    __DSB();
+    __ISB();
+    return enabled;
+}
+
+static void crsf_uart1_irq_resume(bool enabled)
+{
+    if (enabled) {
+        NVIC_EnableIRQ(UART1_IRQn);
+    }
+}
+
+static uint16_t crsf_uart1_tx_ring_count(void)
+{
+    return (uint16_t)((g_tx_ring_head - g_tx_ring_tail) &
+                      CRSF_SERIAL_TX_RING_MASK);
+}
+
+static void crsf_uart1_tx_ring_reset(void)
+{
+    g_tx_ring_head = 0U;
+    g_tx_ring_tail = 0U;
+    g_tx_in_progress = false;
+}
+
+static void crsf_uart1_rx_frame_tracker_reset(void)
+{
+    g_uart_rx_frame_state = 0U;
+    g_uart_rx_frame_remaining = 0U;
+    g_uart_rx_frame_type = 0xFFU;
+}
+
+static bool SIW917_ELRS_RAMFUNC_ATTR
+crsf_uart1_track_rx_frame(uint8_t byte)
+{
+    switch (g_uart_rx_frame_state) {
+    case 0U:
+        if (byte == CRSF_SERIAL_HANDSET_ADDRESS || byte == CRSF_SYNC_BYTE) {
+            g_uart_rx_frame_state = 1U;
+        }
+        break;
+
+    case 1U:
+        if (byte >= 2U && byte <= (CRSF_SERIAL_MAX_FRAME_SIZE - 2U)) {
+            g_uart_rx_frame_remaining = byte;
+            g_uart_rx_frame_type = 0xFFU;
+            g_uart_rx_frame_state = 2U;
+        } else {
+            g_uart_rx_frame_state = 0U;
+        }
+        break;
+
+    default:
+        if (g_uart_rx_frame_type == 0xFFU) {
+            g_uart_rx_frame_type = byte;
+        }
+        if (--g_uart_rx_frame_remaining == 0U) {
+            const bool wake = g_uart_rx_frame_type != CRSF_FRAMETYPE_RC;
+            g_uart_rx_frame_state = 0U;
+            return wake;
+        }
+        break;
+    }
+
+    return false;
+}
+
+static void SIW917_ELRS_RAMFUNC_ATTR crsf_uart1_fill_tx_fifo(void)
+{
+    uint32_t fifo_used = UART1->TFL & 0x1FU;
+    if (fifo_used > CRSF_SERIAL_UART_FIFO_DEPTH) {
+        fifo_used = CRSF_SERIAL_UART_FIFO_DEPTH;
+    }
+
+    uint32_t available = CRSF_SERIAL_UART_FIFO_DEPTH - fifo_used;
+    while (available-- != 0U && g_tx_ring_tail != g_tx_ring_head) {
+        UART1->THR = g_tx_ring[g_tx_ring_tail];
+        g_tx_ring_tail =
+            (uint16_t)((g_tx_ring_tail + 1U) & CRSF_SERIAL_TX_RING_MASK);
+        g_uart_tx_byte_count++;
+    }
+
+    if (g_tx_ring_tail == g_tx_ring_head) {
+        UART1->IER &= ~USART_INTR_THRE;
+    } else {
+        UART1->IER |= USART_INTR_THRE;
+    }
+}
+
+static bool SIW917_ELRS_RAMFUNC_ATTR crsf_uart1_drain_rx_fifo(void)
+{
+    bool wake_task = false;
+    while (UART1->LSR_b.DR != 0U) {
+        const uint8_t byte = (uint8_t)UART1->RBR;
+        if (g_rx_enabled) {
+            rx_ring_push_from_isr(byte);
+            g_uart_rx_byte_count++;
+            wake_task |= crsf_uart1_track_rx_frame(byte);
+        }
+    }
+    return wake_task;
+}
+
+static void SIW917_ELRS_RAMFUNC_ATTR crsf_uart1_direct_irq(void)
+{
+    bool wake_task = false;
+    g_uart_irq_count++;
+
+    for (uint32_t pass = 0U; pass < 32U; pass++) {
+        const uint32_t cause = UART1->IIR & 0x0FU;
+        g_uart_last_irq_cause = cause;
+        if (cause == USART_NO_INTR_PENDING) {
+            break;
+        }
+
+        if (cause == USART_RX_LINE_STATUS) {
+            const uint32_t line_status = UART1->LSR;
+            g_uart_last_line_status = line_status;
+            g_uart_line_error_count++;
+            if ((line_status & (USART_OVERRUN_ERR | USART_PARITY_ERR |
+                                USART_FRAMING_ERR | USART_BREAK_ERR |
+                                USART_RECV_FIFO_ERR)) != 0U) {
+                g_rx_overrun_count +=
+                    (line_status & USART_OVERRUN_ERR) != 0U ? 1U : 0U;
+            }
+        }
+
+        /* 0x0C is the DesignWare RX FIFO character-timeout interrupt. */
+        if (cause == USART_RX_DATA_AVAILABLE) {
+            g_uart_rx_data_irq_count++;
+        } else if (cause == 0x0CU) {
+            g_uart_rx_timeout_irq_count++;
+        }
+        if (cause == USART_RX_DATA_AVAILABLE || cause == 0x0CU ||
+            UART1->LSR_b.DR != 0U) {
+            wake_task |= crsf_uart1_drain_rx_fifo();
+        }
+
+        if (cause == USART_THR_EMPTY) {
+            g_uart_tx_empty_irq_count++;
+            crsf_uart1_fill_tx_fifo();
+        } else if (cause == USART_MODEM_STATUS_INTR) {
+            (void)UART1->MSR;
+        } else if (cause == USART_BUSY_DETECT) {
+            /* Reading USR clears the DesignWare busy-detect interrupt. */
+            (void)UART1->USR;
+            g_uart_busy_irq_count++;
+        } else if (cause != USART_RX_DATA_AVAILABLE && cause != 0x0CU &&
+                   cause != USART_RX_LINE_STATUS) {
+            g_uart_unknown_irq_count++;
+        }
+    }
+
+    if (wake_task) {
+        /* Wake Lua/device traffic once per frame; RC remains timer-polled. */
+        elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_UART);
+    }
+}
+
+static bool crsf_uart1_install_direct_vector(void)
+{
+    const uint32_t new_vtor =
+        (uint32_t)(uintptr_t)&g_crsf_uart_ram_vector_table[0];
+    if (g_crsf_uart_vector_installed && SCB->VTOR == new_vtor &&
+        g_crsf_uart_ram_vector_table[CRSF_SERIAL_UART1_VECTOR_INDEX] ==
+            (uint32_t)(uintptr_t)crsf_uart1_direct_irq) {
+        return true;
+    }
+    if (CRSF_SERIAL_UART1_VECTOR_INDEX >= SI91X_VECTOR_TABLE_ENTRIES) {
+        return false;
+    }
+
+    const uint32_t old_vtor = SCB->VTOR;
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    if (old_vtor != new_vtor) {
+        memcpy(g_crsf_uart_ram_vector_table,
+               (const void *)(uintptr_t)old_vtor,
+               sizeof(g_crsf_uart_ram_vector_table));
+    }
+    g_crsf_uart_ram_vector_table[CRSF_SERIAL_UART1_VECTOR_INDEX] =
+        (uint32_t)(uintptr_t)crsf_uart1_direct_irq;
+
+    __DSB();
+    __ISB();
+    SCB->VTOR = new_vtor;
+    __DSB();
+    __ISB();
+    __set_PRIMASK(primask);
+    g_crsf_uart_vector_installed = true;
+    return true;
+}
+
+static int crsf_uart1_direct_configure(void)
+{
+    if (!crsf_uart1_install_direct_vector()) {
+        return -1;
+    }
+
+    NVIC_DisableIRQ(UART1_IRQn);
+    UART1->IER = 0U;
+    UART1->FCR = USART_FIFO_ENABLE | USART_FIFO_RX_RESET |
+                 USART_FIFO_TX_RESET | USART_FIFO_TX_HALF_FULL |
+                 USART_FIFO_RX_QUARTER_FULL;
+    (void)UART1->LSR;
+    while (UART1->LSR_b.DR != 0U) {
+        (void)UART1->RBR;
+    }
+    (void)UART1->IIR;
+
+    crsf_uart1_tx_ring_reset();
+    crsf_uart1_rx_frame_tracker_reset();
+    if (g_rx_enabled) {
+        UART1->IER = USART_INTR_RX_DATA | USART_INTR_RXRDY;
+        g_rx_armed = true;
+    } else {
+        g_rx_armed = false;
+    }
+
+    NVIC_SetPriority(UART1_IRQn, CRSF_SERIAL_UART_IRQ_PRIORITY);
+    NVIC_ClearPendingIRQ(UART1_IRQn);
+    NVIC_EnableIRQ(UART1_IRQn);
+    return 0;
+}
+
+static void crsf_uart1_direct_set_rx_enabled(bool enable)
+{
+    const bool irq_enabled = crsf_uart1_irq_suspend();
+    UART1->IER &= ~(USART_INTR_RX_DATA | USART_INTR_RXRDY);
+    while (UART1->LSR_b.DR != 0U) {
+        (void)UART1->RBR;
+    }
+    crsf_uart1_rx_frame_tracker_reset();
+    g_rx_enabled = enable;
+    g_rx_armed = enable;
+    if (enable) {
+        UART1->IER |= USART_INTR_RX_DATA | USART_INTR_RXRDY;
+    }
+    crsf_uart1_irq_resume(irq_enabled);
+}
+
+static int crsf_uart1_direct_write(const uint8_t *data, uint32_t length)
+{
+    uint32_t copied = 0U;
+    const uint32_t start_cycles = DWT->CYCCNT;
+    const uint32_t timeout_cycles = SystemCoreClock / 10U;
+
+    while (copied < length) {
+        const bool irq_enabled = crsf_uart1_irq_suspend();
+        const uint16_t used = crsf_uart1_tx_ring_count();
+        uint32_t free_bytes = CRSF_SERIAL_TX_RING_SIZE - 1U - used;
+        uint32_t chunk = length - copied;
+        if (chunk > free_bytes) {
+            chunk = free_bytes;
+        }
+
+        for (uint32_t i = 0U; i < chunk; i++) {
+            g_tx_ring[g_tx_ring_head] = data[copied + i];
+            g_tx_ring_head =
+                (uint16_t)((g_tx_ring_head + 1U) & CRSF_SERIAL_TX_RING_MASK);
+        }
+        copied += chunk;
+
+        const uint16_t pending = crsf_uart1_tx_ring_count();
+        if (pending > g_tx_ring_high_water) {
+            g_tx_ring_high_water = pending;
+        }
+        if (pending != 0U) {
+            g_tx_in_progress = true;
+            crsf_uart1_fill_tx_fifo();
+        }
+        crsf_uart1_irq_resume(irq_enabled);
+
+        if (copied == length) {
+            return 0;
+        }
+
+        g_uart_tx_backpressure_count++;
+        if ((uint32_t)(DWT->CYCCNT - start_cycles) > timeout_cycles) {
+            return -1;
+        }
+        __NOP();
+    }
+
+    return 0;
+}
+
+static int crsf_uart1_direct_flush(void)
+{
+    const uint32_t start_cycles = DWT->CYCCNT;
+    const uint32_t timeout_cycles = SystemCoreClock / 5U;
+
+    while (crsf_uart1_tx_ring_count() != 0U || UART1->LSR_b.TEMT == 0U) {
+        if ((uint32_t)(DWT->CYCCNT - start_cycles) > timeout_cycles) {
+            g_tx_temt_timeout_count++;
+            return -1;
+        }
+        __NOP();
+    }
+
+    g_tx_in_progress = false;
+    return 0;
+}
+#endif
 
 static void rx_dma_state_reset(void)
 {
@@ -782,6 +1549,7 @@ static void rx_dma_harvest_to_ring(void)
 }
 #endif
 
+#if !CRSF_SERIAL_DIRECT_UART1
 static void rx_arm_receive_from_isr(void)
 {
     if (!g_rx_enabled || g_usart == NULL) {
@@ -789,7 +1557,9 @@ static void rx_arm_receive_from_isr(void)
         return;
     }
 
-#if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    g_rx_armed = rx_dma_pingpong_start() == 0;
+#elif CRSF_SERIAL_DMA_ENABLED
     const uint8_t next = g_rx_dma_next_index;
     uint32_t request_len = CRSF_SERIAL_RX_DMA_CHUNK_SIZE;
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
@@ -836,6 +1606,7 @@ static void rx_arm_receive_from_isr(void)
     g_rx_armed = (g_usart->Receive(&g_rx_byte, 1) == ARM_DRIVER_OK);
 #endif
 }
+#endif
 
 #if CRSF_SERIAL_RX_FRAME_AWARE_DMA
 static void rx_dma_advance_frame_state(const volatile uint8_t *data, uint32_t len)
@@ -876,7 +1647,7 @@ static void rx_dma_advance_frame_state(const volatile uint8_t *data, uint32_t le
 }
 #endif
 
-#if !CRSF_SERIAL_ASYNC_TX_QUEUE
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE && !CRSF_SERIAL_DIRECT_UART1
 #if defined(SIW917_ELRS_TARGET_TX)
 static uint32_t crsf_serial_cycles_to_us(uint32_t cycles)
 {
@@ -975,6 +1746,7 @@ static void tx_queue_reset(void)
     g_tx_queue_count = 0U;
     g_tx_queue_active = false;
     g_tx_queue_completion_pending = false;
+    g_tx_queue_send_error_active = false;
     g_tx_in_progress = false;
 }
 
@@ -1002,25 +1774,46 @@ static void tx_queue_service(void)
 
     const int32_t status = g_usart->Send(g_tx_queue[tail], frame_len);
     if (status == ARM_DRIVER_OK) {
+        g_tx_queue_send_error_active = false;
         return;
     }
 
     g_tx_queue_active = false;
     g_tx_in_progress = false;
     if (status != ARM_DRIVER_ERROR_BUSY) {
-        g_tx_queue_tail =
-            (uint8_t)((g_tx_queue_tail + 1U) % CRSF_SERIAL_TX_QUEUE_DEPTH);
-        g_tx_queue_count--;
-        g_tx_queue_error_count++;
+        g_tx_queue_last_error = status;
+        if (!g_tx_queue_send_error_active) {
+            g_tx_queue_error_count++;
+            g_tx_queue_send_error_active = true;
+        }
+        if (!g_tx_queue_error_reported) {
+            g_tx_queue_error_reported = true;
+            CRSF_DBG("TX queue driver error=%ld; retaining frame for retry\n",
+                     (long)status);
+        }
     }
 }
 
 static int tx_queue_enqueue(const uint8_t *frame, uint32_t frame_len)
 {
     tx_queue_service();
-    if (g_tx_queue_count >= CRSF_SERIAL_TX_QUEUE_DEPTH) {
-        g_tx_queue_full_count++;
-        return -1;
+    bool waited_for_space = false;
+    while (g_tx_queue_count >= CRSF_SERIAL_TX_QUEUE_DEPTH) {
+        if (!waited_for_space) {
+            waited_for_space = true;
+            g_tx_queue_full_count++;
+            if (!g_tx_queue_full_reported) {
+                g_tx_queue_full_reported = true;
+                CRSF_DBG("TX queue backpressure at depth=%u; waiting without dropping CRSF data\n",
+                         (unsigned)CRSF_SERIAL_TX_QUEUE_DEPTH);
+            }
+        }
+
+        tx_queue_service();
+        if (g_tx_queue_count >= CRSF_SERIAL_TX_QUEUE_DEPTH) {
+            /* RF timer/DIO IRQs remain enabled and preempt this task. */
+            (void)osThreadYield();
+        }
     }
 
     const uint8_t head = g_tx_queue_head;
@@ -1029,6 +1822,9 @@ static int tx_queue_enqueue(const uint8_t *frame, uint32_t frame_len)
     g_tx_queue_head =
         (uint8_t)((g_tx_queue_head + 1U) % CRSF_SERIAL_TX_QUEUE_DEPTH);
     g_tx_queue_count++;
+    if (g_tx_queue_count > g_tx_queue_high_water) {
+        g_tx_queue_high_water = g_tx_queue_count;
+    }
     tx_queue_service();
     return 0;
 }
@@ -1040,12 +1836,18 @@ static int tx_queue_enqueue(const uint8_t *frame, uint32_t frame_len)
 
 static void usart_callback(uint32_t event)
 {
+#if CRSF_SERIAL_DIRECT_UART1
+    /* UART1 uses the installed direct vector; CMSIS still requires a callback. */
+    (void)event;
+#else
 #if CRSF_SERIAL_ASYNC_TX_QUEUE
     if (event & ARM_USART_EVENT_SEND_COMPLETE) {
         if (g_tx_queue_active) {
             g_tx_in_progress = false;
             g_tx_queue_completion_pending = true;
+#if !CRSF_SERIAL_UART1_PINGPONG_DMA
             elrs_task_wakeup_from_isr(ELRS_TASK_WAKE_UART);
+#endif
         }
     }
 #else
@@ -1151,9 +1953,10 @@ static void usart_callback(uint32_t event)
 #else
     (void)rx_timeout;
 #endif
+#endif
 }
 
-#if !CRSF_SERIAL_ASYNC_TX_QUEUE
+#if !CRSF_SERIAL_ASYNC_TX_QUEUE && !CRSF_SERIAL_DIRECT_UART1
 static int wait_for_tx_idle(void)
 {
     ARM_USART_STATUS status = g_usart->GetStatus();
@@ -1269,7 +2072,9 @@ static int transmit_frame(const uint8_t *frame, uint32_t frame_len)
         return -1;
     }
 
-#if CRSF_SERIAL_ASYNC_TX_QUEUE
+#if CRSF_SERIAL_DIRECT_UART1
+    return crsf_uart1_direct_write(frame, frame_len);
+#elif CRSF_SERIAL_ASYNC_TX_QUEUE
     return tx_queue_enqueue(frame, frame_len);
 #else
 
@@ -1437,10 +2242,70 @@ static int configure_usart(uint32_t baud_rate, crsf_serial_format_t format)
      */
     crsf_serial_configure_rx_idle_bias();
 
+#if CRSF_SERIAL_DIRECT_UART1
+    if (crsf_uart1_direct_configure() != 0) {
+        CRSF_DBG("UART1 direct FIFO transport setup failed\n");
+        return -3;
+    }
+#endif
+
     g_baud_rate = baud_rate;
     g_serial_format = format;
     return 0;
 }
+
+#if defined(SIW917_ELRS_TARGET_TX)
+static int crsf_serial_configure_uart1_tx_clock(void)
+{
+    if (system_clocks.intf_pll_clock == 0U) {
+        CRSF_DBG("UART1 INTFPLL clock is unavailable\n");
+        return -1;
+    }
+
+    const rsi_error_t status = RSI_CLK_UsartClkConfig(
+        M4CLK,
+        ENABLE_STATIC_CLK,
+        (boolean_t)0,
+        USART2,
+        USART_INTFPLLCLK,
+        1U);
+    const uint32_t base_clock = RSI_CLK_GetBaseClock(M4_UART1);
+    if (status != RSI_OK || base_clock == 0U) {
+        CRSF_DBG("UART1 INTFPLL clock setup failed status=%ld base=%lu\n",
+                 (long)status,
+                 (unsigned long)base_clock);
+        return -2;
+    }
+
+    CRSF_DBG("UART1 handset clock=INTFPLL base=%lu Hz\n",
+             (unsigned long)base_clock);
+    return 0;
+}
+
+static void crsf_serial_log_uart1_baud(uint32_t requested_baud)
+{
+    const uint32_t base_clock = RSI_CLK_GetBaseClock(M4_UART1);
+    const uint64_t scaled_clock = (uint64_t)base_clock * 4ULL;
+    const uint32_t divisor64 = requested_baud != 0U
+                                   ? (uint32_t)(scaled_clock / requested_baud)
+                                   : 0U;
+    const uint32_t actual_baud = divisor64 != 0U
+                                     ? (uint32_t)(scaled_clock / divisor64)
+                                     : 0U;
+    const int32_t error_ppm = requested_baud != 0U
+                                  ? (int32_t)((((int64_t)actual_baud -
+                                                (int64_t)requested_baud) *
+                                               1000000LL) /
+                                              (int64_t)requested_baud)
+                                  : 0;
+
+    CRSF_DBG("UART1 baud requested=%lu actual=%lu error=%ld ppm div64=%lu\n",
+             (unsigned long)requested_baud,
+             (unsigned long)actual_baud,
+             (long)error_ppm,
+             (unsigned long)divisor64);
+}
+#endif
 
 static int reconfigure_usart(uint32_t baud_rate, crsf_serial_format_t format)
 {
@@ -1448,6 +2313,21 @@ static int reconfigure_usart(uint32_t baud_rate, crsf_serial_format_t format)
         return -1;
     }
 
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    if (g_baud_rate == 1870000U) {
+        rx_dma_pingpong_harvest();
+        CRSF_DBG("UART1 1870000 probe rx=%lu read=%lu avail=%lu blocks=%lu "
+                 "faults=%lu overrun=%lu lsr=0x%02lX\n",
+                 (unsigned long)g_rx_dma_produced,
+                 (unsigned long)g_rx_dma_consumed,
+                 (unsigned long)(g_rx_dma_produced - g_rx_dma_consumed),
+                 (unsigned long)g_rx_dma_pingpong_complete_count,
+                 (unsigned long)g_rx_dma_pingpong_error_count,
+                 (unsigned long)g_rx_overrun_count,
+                 (unsigned long)(UART1->LSR & 0xFFU));
+    }
+    rx_dma_pingpong_stop();
+#endif
     g_rx_enabled = false;
     g_rx_armed = false;
     (void)g_usart->Control(ARM_USART_ABORT_RECEIVE, 0);
@@ -1465,6 +2345,10 @@ static int reconfigure_usart(uint32_t baud_rate, crsf_serial_format_t format)
     if (configure_usart(baud_rate, format) != 0) {
         return -2;
     }
+
+#if defined(SIW917_ELRS_TARGET_TX)
+    crsf_serial_log_uart1_baud(baud_rate);
+#endif
 
     CRSF_DBG("Reconfigured %s to %lu baud (%s)\n",
              CRSF_SERIAL_DRIVER_NAME,
@@ -1493,7 +2377,31 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
         if (g_baud_rate == baud_rate && g_serial_format == format) {
             return 0;
         }
+
+#if defined(SIW917_ELRS_TARGET_TX)
+        /*
+         * HardwareSerial::updateBaudRate() is a live-port operation upstream.
+         * Keep that contract here: a successful baud change must return with
+         * handset RX DMA armed, rather than relying on a later begin()/RX call
+         * to finish the transition.
+         */
+        const bool rx_was_enabled = g_rx_enabled;
+        const int reconfigure_result = reconfigure_usart(baud_rate, format);
+        if (reconfigure_result != 0) {
+            return reconfigure_result;
+        }
+        if (rx_was_enabled) {
+            const int rx_result = crsf_serial_set_rx_enabled(true);
+            if (rx_result != 0) {
+                CRSF_DBG("UART1 baud reconfigure RX rearm failed rc=%d\n",
+                         rx_result);
+                return -5;
+            }
+        }
+        return 0;
+#else
         return reconfigure_usart(baud_rate, format);
+#endif
     }
     
     /* Initialize CRC table */
@@ -1520,7 +2428,14 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
              (unsigned)CRSF_SERIAL_TX_OE_SETUP_US,
              (unsigned)CRSF_SERIAL_TX_ECHO_SETTLE_US);
 #endif
-#if CRSF_SERIAL_RX_FRAME_AWARE_DMA
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    CRSF_DBG("Handset UART1 zero-copy ping-pong DMA enabled "
+             "(%u-byte halves, live hardware cursor)\n",
+             (unsigned)CRSF_SERIAL_RX_DMA_PINGPONG_BLOCK_SIZE);
+#elif CRSF_SERIAL_DIRECT_UART1
+    CRSF_DBG("Handset UART1 direct FIFO IRQ transport enabled "
+             "(RX/TX byte rings, selective frame wake)\n");
+#elif CRSF_SERIAL_RX_FRAME_AWARE_DMA
     CRSF_DBG("Handset RX frame-aware DMA enabled (sync 1 + length 1 + exact body + task wake)\n");
 #elif CRSF_SERIAL_RX_LIVE_DMA_CURSOR
     CRSF_DBG("Handset RX streaming DMA enabled (%u-byte blocks + live producer cursor)\n",
@@ -1530,7 +2445,7 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
              (unsigned)CRSF_SERIAL_RX_DMA_CHUNK_SIZE);
 #endif
 #if CRSF_SERIAL_ASYNC_TX_QUEUE
-    CRSF_DBG("Handset TX queued DMA enabled (%u frames, nonblocking)\n",
+    CRSF_DBG("Handset TX queued DMA enabled (%u frames, lossless backpressure)\n",
              (unsigned)CRSF_SERIAL_TX_QUEUE_DEPTH);
 #endif
 #else
@@ -1554,12 +2469,25 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
         return -2;
     }
 
-    if (configure_usart(baud_rate, format) != 0) {
+#if defined(SIW917_ELRS_TARGET_TX)
+    if (crsf_serial_configure_uart1_tx_clock() != 0) {
         g_usart->PowerControl(ARM_POWER_OFF);
         g_usart->Uninitialize();
         g_usart = NULL;
         return -3;
     }
+#endif
+
+    if (configure_usart(baud_rate, format) != 0) {
+        g_usart->PowerControl(ARM_POWER_OFF);
+        g_usart->Uninitialize();
+        g_usart = NULL;
+        return -4;
+    }
+
+#if defined(SIW917_ELRS_TARGET_TX)
+    crsf_serial_log_uart1_baud(baud_rate);
+#endif
 
     /*
      * RX is enabled later by the active serial protocol. CRSF uses it for
@@ -1568,14 +2496,55 @@ int crsf_serial_init_ex(uint32_t baud_rate, crsf_serial_format_t format)
     g_tx_in_progress = false;
 #if CRSF_SERIAL_ASYNC_TX_QUEUE
     tx_queue_reset();
+    g_tx_queue_high_water = 0U;
     g_tx_queue_full_count = 0U;
     g_tx_queue_error_count = 0U;
+    g_tx_queue_last_error = ARM_DRIVER_OK;
+    g_tx_queue_full_reported = false;
+    g_tx_queue_error_reported = false;
+    g_tx_queue_send_error_active = false;
 #endif
     g_rx_enabled = false;
     g_rx_armed = false;
     rx_dma_state_reset();
     rx_ring_reset();
-#if CRSF_SERIAL_DMA_ENABLED
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    g_rx_dma_pingpong_running = false;
+    g_rx_dma_pingpong_fault = false;
+    g_rx_dma_pingpong_complete_count = 0U;
+    g_rx_dma_pingpong_error_count = 0U;
+    g_rx_dma_pingpong_recovery_count = 0U;
+    g_rx_dma_pingpong_last_recovery_tick = 0U;
+    CRSF_DBG("Initialized at %lu baud %s (%s UDMA ping-pong RX ch %u, "
+             "queued TX ch %u)\n",
+             (unsigned long)baud_rate,
+             format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned)CRSF_SERIAL_RX_DMA_CH,
+             (unsigned)CRSF_SERIAL_TX_DMA_CH);
+#elif CRSF_SERIAL_DIRECT_UART1
+    g_uart_irq_count = 0U;
+    g_uart_rx_byte_count = 0U;
+    g_uart_tx_byte_count = 0U;
+    g_uart_line_error_count = 0U;
+    g_uart_tx_backpressure_count = 0U;
+    g_uart_rx_data_irq_count = 0U;
+    g_uart_rx_timeout_irq_count = 0U;
+    g_uart_tx_empty_irq_count = 0U;
+    g_uart_busy_irq_count = 0U;
+    g_uart_unknown_irq_count = 0U;
+    g_uart_last_irq_cause = USART_NO_INTR_PENDING;
+    g_uart_last_line_status = 0U;
+    g_uart_diag_last_ms = osKernelGetTickCount();
+    g_uart_diag_last_irq_count = 0U;
+    g_uart_diag_last_rx_byte_count = 0U;
+    g_tx_ring_high_water = 0U;
+    CRSF_DBG("Initialized at %lu baud %s (%s direct FIFO IRQ, priority %lu)\n",
+             (unsigned long)baud_rate,
+             format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1",
+             CRSF_SERIAL_DRIVER_NAME,
+             (unsigned long)NVIC_GetPriority(UART1_IRQn));
+#elif CRSF_SERIAL_DMA_ENABLED
     CRSF_DBG("Initialized at %lu baud %s (%s %s TX ch %u RX ch %u)\n",
              (unsigned long)baud_rate,
              format == CRSF_SERIAL_FORMAT_8E2 ? "8E2" : "8N1",
@@ -1604,6 +2573,14 @@ void crsf_serial_deinit(void)
 
     if (g_usart != NULL) {
         crsf_serial_tx_oe_n_write(true);
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+        rx_dma_pingpong_stop();
+#endif
+#if CRSF_SERIAL_DIRECT_UART1
+        NVIC_DisableIRQ(UART1_IRQn);
+        UART1->IER = 0U;
+        crsf_uart1_tx_ring_reset();
+#endif
         g_rx_enabled = false;
         g_rx_armed = false;
         (void)g_usart->Control(ARM_USART_ABORT_SEND, 0);
@@ -1758,6 +2735,36 @@ int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len)
     return 0;
 }
 
+int crsf_serial_flush(void)
+{
+    if (!g_initialized || g_usart == NULL) {
+        return -1;
+    }
+
+#if CRSF_SERIAL_DIRECT_UART1
+    return crsf_uart1_direct_flush();
+#elif CRSF_SERIAL_ASYNC_TX_QUEUE
+    const uint32_t start_tick = osKernelGetTickCount();
+    while (g_tx_queue_count != 0U || g_tx_queue_active || g_tx_in_progress) {
+        tx_queue_service();
+        if ((uint32_t)(osKernelGetTickCount() - start_tick) >
+            CRSF_SERIAL_TX_TEMT_TIMEOUT_MS) {
+            return -2;
+        }
+    }
+    while (!crsf_serial_uart_temt()) {
+        if ((uint32_t)(osKernelGetTickCount() - start_tick) >
+            CRSF_SERIAL_TX_TEMT_TIMEOUT_MS) {
+            g_tx_temt_timeout_count++;
+            return -3;
+        }
+    }
+    return 0;
+#else
+    return wait_for_tx_complete_and_temt(0U);
+#endif
+}
+
 int crsf_serial_send_sbus_channels(const uint32_t *channels,
                                    bool failsafe_active,
                                    bool frame_lost)
@@ -1823,6 +2830,17 @@ int crsf_serial_set_rx_enabled(bool enable)
     }
 
     if (!enable) {
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+        g_rx_enabled = false;
+        rx_dma_pingpong_stop();
+        (void)g_usart->Control(ARM_USART_CONTROL_RX, 0);
+        rx_ring_reset();
+        return 0;
+#elif CRSF_SERIAL_DIRECT_UART1
+        crsf_uart1_direct_set_rx_enabled(false);
+        rx_ring_reset();
+        return 0;
+#else
         g_rx_enabled = false;
         g_rx_armed = false;
         (void)g_usart->Control(ARM_USART_ABORT_RECEIVE, 0);
@@ -1830,6 +2848,7 @@ int crsf_serial_set_rx_enabled(bool enable)
         rx_dma_state_reset();
         rx_ring_reset();
         return 0;
+#endif
     }
 
     if (g_rx_enabled) {
@@ -1842,6 +2861,9 @@ int crsf_serial_set_rx_enabled(bool enable)
         return -2;
     }
 
+#if CRSF_SERIAL_DIRECT_UART1
+    crsf_uart1_direct_set_rx_enabled(true);
+#else
     g_rx_enabled = true;
     rx_arm_receive_from_isr();
     if (!g_rx_armed) {
@@ -1850,23 +2872,128 @@ int crsf_serial_set_rx_enabled(bool enable)
         (void)g_usart->Control(ARM_USART_CONTROL_RX, 0);
         return -3;
     }
+#endif
 
     CRSF_DBG("RX enabled\n");
     crsf_serial_log_status("After RX enable");
     return 0;
 }
 
-uint32_t crsf_serial_rx_available(void)
+void crsf_serial_service(void)
 {
+    if (!g_initialized || g_usart == NULL) {
+        return;
+    }
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    if (g_rx_dma_pingpong_fault && g_rx_enabled) {
+        const uint32_t now = osKernelGetTickCount();
+        if (g_rx_dma_pingpong_recovery_count == 0U ||
+            (uint32_t)(now - g_rx_dma_pingpong_last_recovery_tick) >= 1000U) {
+            g_rx_dma_pingpong_last_recovery_tick = now;
+            g_rx_dma_pingpong_recovery_count++;
+            rx_dma_pingpong_stop();
+            if (rx_dma_pingpong_start() == 0) {
+                CRSF_DBG("UART1 RX ping-pong DMA recovered (faults=%lu, recoveries=%lu)\n",
+                         (unsigned long)g_rx_dma_pingpong_error_count,
+                         (unsigned long)g_rx_dma_pingpong_recovery_count);
+            } else {
+                g_rx_dma_pingpong_fault = true;
+                if (g_rx_dma_pingpong_recovery_count <= 3U) {
+                    CRSF_DBG("UART1 RX ping-pong DMA recovery failed\n");
+                }
+            }
+        }
+    } else {
+        rx_dma_pingpong_harvest();
+    }
+#elif CRSF_SERIAL_DIRECT_UART1
+    const uint32_t vector_base =
+        (uint32_t)(uintptr_t)&g_crsf_uart_ram_vector_table[0];
+    bool vector_ok =
+        SCB->VTOR == vector_base &&
+        g_crsf_uart_ram_vector_table[CRSF_SERIAL_UART1_VECTOR_INDEX] ==
+            (uint32_t)(uintptr_t)crsf_uart1_direct_irq;
+    if (!vector_ok && crsf_uart1_install_direct_vector()) {
+        NVIC_ClearPendingIRQ(UART1_IRQn);
+        NVIC_EnableIRQ(UART1_IRQn);
+        vector_ok = true;
+    }
+
+    if (g_tx_in_progress && crsf_uart1_tx_ring_count() == 0U &&
+        UART1->LSR_b.TEMT != 0U) {
+        g_tx_in_progress = false;
+    }
+
+#if CRSF_SERIAL_DIRECT_DIAG
+    const uint32_t now = osKernelGetTickCount();
+    if ((uint32_t)(now - g_uart_diag_last_ms) >= 5000U) {
+        const uint32_t irq_delta = g_uart_irq_count - g_uart_diag_last_irq_count;
+        const uint32_t rx_delta =
+            g_uart_rx_byte_count - g_uart_diag_last_rx_byte_count;
+        g_uart_diag_last_ms = now;
+        g_uart_diag_last_irq_count = g_uart_irq_count;
+        g_uart_diag_last_rx_byte_count = g_uart_rx_byte_count;
+        CRSF_DBG("DIRECT irq=%lu(+%lu) rx=%lu(+%lu) tx=%lu "
+                 "cause=0x%02lX rda=%lu timeout=%lu line=%lu/0x%02lX "
+                 "busy=%lu unknown=%lu ring=%lu ier=0x%02lX rfl=%lu vector=%u\n",
+                 (unsigned long)g_uart_irq_count,
+                 (unsigned long)irq_delta,
+                 (unsigned long)g_uart_rx_byte_count,
+                 (unsigned long)rx_delta,
+                 (unsigned long)g_uart_tx_byte_count,
+                 (unsigned long)g_uart_last_irq_cause,
+                 (unsigned long)g_uart_rx_data_irq_count,
+                 (unsigned long)g_uart_rx_timeout_irq_count,
+                 (unsigned long)g_uart_line_error_count,
+                 (unsigned long)g_uart_last_line_status,
+                 (unsigned long)g_uart_busy_irq_count,
+                 (unsigned long)g_uart_unknown_irq_count,
+                 (unsigned long)((g_rx_head - g_rx_tail) &
+                                 CRSF_SERIAL_RX_RING_MASK),
+                 (unsigned long)UART1->IER,
+                 (unsigned long)(UART1->RFL & 0x1FU),
+                 vector_ok ? 1U : 0U);
+    }
+#else
+    (void)vector_ok;
+#endif
+#elif CRSF_SERIAL_DMA_ENABLED
+    rx_dma_harvest_to_ring();
+#endif
 #if CRSF_SERIAL_ASYNC_TX_QUEUE
     tx_queue_service();
 #endif
-#if CRSF_SERIAL_DMA_ENABLED
-    rx_dma_harvest_to_ring();
+}
+
+void crsf_serial_discard_rx(void)
+{
+    if (!g_initialized || g_usart == NULL) {
+        return;
+    }
+
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    rx_dma_pingpong_harvest();
+    const bool irq_enabled = rx_dma_pingpong_irq_suspend();
+    g_rx_dma_consumed = g_rx_dma_produced;
+    g_rx_tail = (uint16_t)(g_rx_dma_consumed &
+        (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U));
+    __DMB();
+    rx_dma_pingpong_irq_resume(irq_enabled);
+#else
+    g_rx_tail = g_rx_head;
 #endif
+}
+
+uint32_t crsf_serial_rx_available(void)
+{
+    crsf_serial_service();
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    return g_rx_dma_produced - g_rx_dma_consumed;
+#else
     const uint16_t head = g_rx_head;
     const uint16_t tail = g_rx_tail;
     return (uint32_t)((head - tail) & CRSF_SERIAL_RX_RING_MASK);
+#endif
 }
 
 uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
@@ -1875,17 +3002,25 @@ uint32_t crsf_serial_read(uint8_t *out, uint32_t max_len)
         return 0;
     }
 
-#if CRSF_SERIAL_ASYNC_TX_QUEUE
-    tx_queue_service();
-#endif
-#if CRSF_SERIAL_DMA_ENABLED
-    rx_dma_harvest_to_ring();
-#endif
+    crsf_serial_service();
     uint32_t copied = 0;
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    uint32_t consumed = g_rx_dma_consumed;
+    const uint32_t produced = g_rx_dma_produced;
+    while (copied < max_len && consumed != produced) {
+        out[copied++] = g_rx_ring[
+            consumed & (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U)];
+        consumed++;
+    }
+    g_rx_dma_consumed = consumed;
+    g_rx_tail = (uint16_t)(consumed &
+        (CRSF_SERIAL_RX_DMA_PINGPONG_SPAN - 1U));
+#else
     while (copied < max_len && g_rx_tail != g_rx_head) {
         out[copied++] = g_rx_ring[g_rx_tail];
         g_rx_tail = (uint16_t)((g_rx_tail + 1U) & CRSF_SERIAL_RX_RING_MASK);
     }
+#endif
 
 #if CRSF_SERIAL_RX_LIVE_DMA_CURSOR
     if (copied != 0U && g_rx_live_cursor_seen && !g_rx_live_cursor_reported) {
@@ -1915,7 +3050,15 @@ void crsf_serial_get_rx_diag(crsf_serial_rx_diag_t *diag)
     diag->rx_enabled = g_rx_enabled;
     diag->rx_armed = g_rx_armed;
     diag->rx_overrun_count = g_rx_overrun_count;
-#if CRSF_SERIAL_RX_DIAG_ENABLED
+#if CRSF_SERIAL_UART1_PINGPONG_DMA
+    diag->dma_arm_count = g_rx_dma_pingpong_complete_count +
+        (g_rx_dma_pingpong_running ? 2U : 0U);
+    diag->dma_complete_count = g_rx_dma_pingpong_complete_count;
+    diag->dma_bytes_published = g_rx_dma_produced;
+    diag->dma_rearm_busy_count = 0U;
+    diag->dma_rearm_fail_count = g_rx_dma_pingpong_error_count;
+    diag->dma_timeout_count = g_rx_dma_pingpong_recovery_count;
+#elif CRSF_SERIAL_RX_DIAG_ENABLED
     diag->dma_arm_count = g_rx_dma_arm_count;
     diag->dma_complete_count = g_rx_dma_complete_count;
     diag->dma_bytes_published = g_rx_dma_bytes_published;
@@ -2003,6 +3146,15 @@ void crsf_serial_debug_dump(void)
              ping_to_oe_max_us,
              wire_last_us,
              wire_max_us,
-             total_last_us,
-             total_max_us);
+              total_last_us,
+              total_max_us);
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    CRSF_DBG("BUS TX queue=%u/%u high=%u backpressure=%lu errors=%lu last=%ld\n",
+             (unsigned)g_tx_queue_count,
+             (unsigned)CRSF_SERIAL_TX_QUEUE_DEPTH,
+             (unsigned)g_tx_queue_high_water,
+             (unsigned long)g_tx_queue_full_count,
+             (unsigned long)g_tx_queue_error_count,
+             (long)g_tx_queue_last_error);
+#endif
 }

@@ -355,6 +355,13 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     handled_hot_command = command_ok;
   }
 #endif
+#if SIW917_ELRS_RAW_GSPI_SET_TX_PARAMS
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_TX_PARAMS_OC) {
+    attempted_fast_hot_command = true;
+    command_ok = lr1121_send_command_fast(opcode, tx_buffer, size);
+    handled_hot_command = command_ok;
+  }
+#endif
 #if SIW917_ELRS_RAW_GSPI_SET_FREQ
   if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC) {
     attempted_fast_hot_command = true;
@@ -396,6 +403,12 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
     handled_hot_command = true;
   }
 #endif
+#if SIW917_ELRS_RAW_GSPI_SET_TX_PARAMS
+  if (!handled_hot_command && opcode == LR11XX_RADIO_SET_TX_PARAMS_OC) {
+    command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
+    handled_hot_command = true;
+  }
+#endif
 #if SIW917_ELRS_RAW_GSPI_SET_FREQ
   if (!handled_hot_command && opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC) {
     command_ok = lr1121_send_command_raw_pub(opcode, tx_buffer, size);
@@ -412,6 +425,7 @@ void LR1121Hal::WriteCommand(uint16_t opcode, uint8_t *buffer, uint8_t size,
   if (!handled_hot_command &&
       (opcode == LR11XX_RADIO_WRITE_BUFFER8_SET_TX ||
        opcode == LR11XX_RADIO_SET_RX_OC ||
+       opcode == LR11XX_RADIO_SET_TX_PARAMS_OC ||
        opcode == LR11XX_RADIO_SET_RF_FREQUENCY_OC ||
        opcode == LR11XX_RADIO_SET_FREQ_SET_RX)) {
     command_ok = lr1121_send_command_polled_pub(opcode, tx_buffer, size);

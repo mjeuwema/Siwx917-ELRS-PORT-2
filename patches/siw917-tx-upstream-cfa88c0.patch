@@ -1,0 +1,1135 @@
+diff --git a/src/lib/Handset/CRSFHandset.cpp b/src/lib/Handset/CRSFHandset.cpp
+index c7237a9d1072e259c088f07f364c8ed1b8373a59..e2b6342920cb5eb673ce365130bbc749239c547b 100644
+--- a/src/lib/Handset/CRSFHandset.cpp
++++ b/src/lib/Handset/CRSFHandset.cpp
+@@ -40,11 +40,267 @@ static constexpr int32_t OpenTXsyncOffsetSafeMargin = 1000; // 100us
+ 
+ /// UART Handling ///
+ static const int32_t TxToHandsetBauds[] = {400000, 115200, 5250000, 3750000, 1870000, 921600, 2250000};
++#if defined(PLATFORM_SIW917)
++// Prefer the configured high-speed EdgeTX link, then retain the normal
++// upstream baud list as a fallback scanner for radios using another rate.
++uint8_t CRSFHandset::UARTcurrentBaudIdx = 4;
++uint32_t CRSFHandset::UARTrequestedBaud = 1870000;
++#else
+ uint8_t CRSFHandset::UARTcurrentBaudIdx = 6;   // only used for baud-cycling, initialized to the end so the next one we try is the first in the list
+ uint32_t CRSFHandset::UARTrequestedBaud = 5250000;
++#endif
+ 
+ // for the UART wdt, every 1000ms we change bauds when connect is lost
+ static constexpr int UARTwdtInterval = 1000;
++#if defined(PLATFORM_SIW917)
++// A 250 ms dwell could move away while UART1 DMA was settling after a rate
++// change. Half a second still scans quickly but gives a full CRSF lock window.
++static constexpr int UARTwdtScanInterval = 500;
++#endif
++
++#if defined(PLATFORM_SIW917)
++#ifndef SIW917_CRSF_HANDSET_TRACE
++#define SIW917_CRSF_HANDSET_TRACE 0
++#endif
++#ifndef SIW917_CRSF_PROTOCOL_DIAG
++#define SIW917_CRSF_PROTOCOL_DIAG 0
++#endif
++#if SIW917_CRSF_PROTOCOL_DIAG
++#ifndef SIW917_CRSF_STATS_INTERVAL_MS
++#define SIW917_CRSF_STATS_INTERVAL_MS 5000U
++#endif
++
++static uint32_t siw917RxRcCount = 0;
++static uint32_t siw917RxHeartbeatCount = 0;
++static uint32_t siw917RxPingCount = 0;
++static uint32_t siw917RxParamReadCount = 0;
++static uint32_t siw917RxParamWriteCount = 0;
++static uint32_t siw917RxCommandCount = 0;
++static uint32_t siw917RxOtherCount = 0;
++static uint32_t siw917TxLinkCount = 0;
++static uint32_t siw917TxHandsetCount = 0;
++static uint32_t siw917TxDeviceInfoCount = 0;
++static uint32_t siw917TxParamEntryCount = 0;
++static uint32_t siw917TxElrsStatusCount = 0;
++static uint32_t siw917TxOtherCount = 0;
++static uint32_t siw917TxFrameBytes = 0;
++static uint32_t siw917LastCrsfProtocolStatsMs = 0;
++static uint32_t siw917CrsfDiscoveryTraceCount = 0;
++static uint32_t siw917CrsfParamTraceCount = 0;
++static uint32_t siw917CrsfLuaWriteTraceCount = 0;
++
++static const char *siw917CrsfFrameName(const uint8_t type)
++{
++    switch (type)
++    {
++    case CRSF_FRAMETYPE_DEVICE_PING:
++        return "DEVICE_PING";
++    case CRSF_FRAMETYPE_DEVICE_INFO:
++        return "DEVICE_INFO";
++    case CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY:
++        return "PARAM_ENTRY";
++    case CRSF_FRAMETYPE_PARAMETER_READ:
++        return "PARAM_READ";
++    case CRSF_FRAMETYPE_PARAMETER_WRITE:
++        return "PARAM_WRITE";
++    case CRSF_FRAMETYPE_ELRS_STATUS:
++        return "ELRS_STATUS";
++    case CRSF_FRAMETYPE_LINK_STATISTICS:
++        return "LINK_STATS";
++    case CRSF_FRAMETYPE_HANDSET:
++        return "HANDSET";
++    default:
++        return "OTHER";
++    }
++}
++
++static const char *siw917CrsfAddressName(const uint8_t addr)
++{
++    switch (addr)
++    {
++    case CRSF_ADDRESS_BROADCAST:
++        return "BCAST";
++    case CRSF_ADDRESS_RADIO_TRANSMITTER:
++        return "RADIO";
++    case CRSF_ADDRESS_CRSF_RECEIVER:
++        return "CRSF_RX";
++    case CRSF_ADDRESS_CRSF_TRANSMITTER:
++        return "CRSF_TX";
++    case CRSF_ADDRESS_ELRS_LUA:
++        return "ELRS_LUA";
++    case CRSF_ADDRESS_FLIGHT_CONTROLLER:
++        return "FC";
++    default:
++        return "?";
++    }
++}
++
++static void siw917TraceCrsfLuaFrame(const char *dir, const uint8_t *frame, const uint8_t length)
++{
++    if (length < 4)
++    {
++        return;
++    }
++
++    const uint8_t type = frame[2];
++    const bool discoveryFrame =
++        type == CRSF_FRAMETYPE_DEVICE_PING ||
++        type == CRSF_FRAMETYPE_DEVICE_INFO;
++    const bool parameterFrame =
++        type == CRSF_FRAMETYPE_PARAMETER_READ ||
++        type == CRSF_FRAMETYPE_PARAMETER_WRITE ||
++        type == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY ||
++        type == CRSF_FRAMETYPE_ELRS_STATUS;
++
++    if (!discoveryFrame && !parameterFrame)
++    {
++        return;
++    }
++    if (discoveryFrame && siw917CrsfDiscoveryTraceCount >= 10)
++    {
++        return;
++    }
++    if (parameterFrame && siw917CrsfParamTraceCount >= 24)
++    {
++        return;
++    }
++
++    if (discoveryFrame)
++    {
++        siw917CrsfDiscoveryTraceCount++;
++    }
++    if (parameterFrame)
++    {
++        siw917CrsfParamTraceCount++;
++    }
++
++    printf("[CRSF_LUA] %s %s type=0x%02X total=%u len_byte=%u sync=0x%02X",
++           dir,
++           siw917CrsfFrameName(type),
++           type,
++           (unsigned)length,
++           (unsigned)frame[1],
++           frame[0]);
++    if (type >= CRSF_FRAMETYPE_DEVICE_PING && length >= 6)
++    {
++        printf(" dest=0x%02X(%s) orig=0x%02X(%s)",
++               frame[3],
++               siw917CrsfAddressName(frame[3]),
++               frame[4],
++               siw917CrsfAddressName(frame[4]));
++        if (length >= 7)
++        {
++            printf(" arg0=0x%02X", frame[5]);
++        }
++    }
++    printf(" crc=0x%02X bytes=", frame[length - 1]);
++
++    const uint8_t previewLength = std::min<uint8_t>(length, 32);
++    for (uint8_t i = 0; i < previewLength; ++i)
++    {
++        printf("%s%02X", i == 0 ? "" : " ", frame[i]);
++    }
++    if (previewLength < length)
++    {
++        printf(" ...");
++    }
++    printf("\n");
++}
++
++static void siw917CountRxFrame(const uint8_t type)
++{
++    switch (type)
++    {
++    case CRSF_FRAMETYPE_RC_CHANNELS_PACKED:
++        siw917RxRcCount++;
++        break;
++    case CRSF_FRAMETYPE_HEARTBEAT:
++        siw917RxHeartbeatCount++;
++        break;
++    case CRSF_FRAMETYPE_DEVICE_PING:
++        siw917RxPingCount++;
++        break;
++    case CRSF_FRAMETYPE_PARAMETER_READ:
++        siw917RxParamReadCount++;
++        break;
++    case CRSF_FRAMETYPE_PARAMETER_WRITE:
++        siw917RxParamWriteCount++;
++        break;
++    case CRSF_FRAMETYPE_COMMAND:
++        siw917RxCommandCount++;
++        break;
++    default:
++        siw917RxOtherCount++;
++        break;
++    }
++}
++
++static bool siw917IsLuaWriteTraceFrame(const uint8_t type)
++{
++    return type == CRSF_FRAMETYPE_DEVICE_INFO ||
++           type == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY ||
++           type == CRSF_FRAMETYPE_ELRS_STATUS;
++}
++
++static void siw917CountTxFrame(const uint8_t type, const uint8_t length)
++{
++    siw917TxFrameBytes += length;
++    switch (type)
++    {
++    case CRSF_FRAMETYPE_LINK_STATISTICS:
++        siw917TxLinkCount++;
++        break;
++    case CRSF_FRAMETYPE_HANDSET:
++        siw917TxHandsetCount++;
++        break;
++    case CRSF_FRAMETYPE_DEVICE_INFO:
++        siw917TxDeviceInfoCount++;
++        break;
++    case CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY:
++        siw917TxParamEntryCount++;
++        break;
++    case CRSF_FRAMETYPE_ELRS_STATUS:
++        siw917TxElrsStatusCount++;
++        break;
++    default:
++        siw917TxOtherCount++;
++        break;
++    }
++}
++
++static void siw917ResetCrsfProtocolCounters()
++{
++    siw917RxRcCount = 0;
++    siw917RxHeartbeatCount = 0;
++    siw917RxPingCount = 0;
++    siw917RxParamReadCount = 0;
++    siw917RxParamWriteCount = 0;
++    siw917RxCommandCount = 0;
++    siw917RxOtherCount = 0;
++    siw917TxLinkCount = 0;
++    siw917TxHandsetCount = 0;
++    siw917TxDeviceInfoCount = 0;
++    siw917TxParamEntryCount = 0;
++    siw917TxElrsStatusCount = 0;
++    siw917TxOtherCount = 0;
++    siw917TxFrameBytes = 0;
++}
++#endif
++
++static uint8_t siw917CrsfCrc8(const uint8_t *data, uint16_t len, uint8_t crc = 0)
++{
++    while (len--)
++    {
++        crc ^= *data++;
++        for (uint8_t i = 0; i < 8; ++i)
++        {
++            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ CRSF_CRC_POLY)
++                               : (uint8_t)(crc << 1);
++        }
++    }
++    return crc;
++}
++#endif
+ 
+ void CRSFHandset::Begin()
+ {
+@@ -54,9 +310,22 @@ void CRSFHandset::Begin()
+     addDevice(CRSF_ADDRESS_RADIO_TRANSMITTER);
+     crsfRouter.addConnector(this);
+ 
++#if defined(PLATFORM_SIW917)
++    // Avoid unsigned wrap in UARTwdt() during the SiW917 startup sequence.
++    UARTwdtLastChecked = millis();
++#else
+     UARTwdtLastChecked = millis() + UARTwdtInterval; // allows a delay before the first time the UARTwdt() function is called
++#endif
+ 
+     halfDuplex = (GPIO_PIN_RCSIGNAL_TX == GPIO_PIN_RCSIGNAL_RX);
++#if defined(PLATFORM_SIW917)
++    // The SiW917 pins are still split before the external inverter/combiner,
++    // but the RadioMaster module bay side is a single half-duplex CRSF bus.
++    // Use upstream's half-duplex pacing so Lua/device replies fit the handset
++    // receive windows instead of colliding with the radio's RC stream.
++    halfDuplex = true;
++    DBGLN("[CRSFHandset] SiW917 radio adapter: forcing half-duplex handset pacing");
++#endif
+ 
+ #if defined(PLATFORM_ESP32)
+     portDISABLE_INTERRUPTS();
+@@ -119,7 +388,8 @@ void CRSFHandset::forwardMessage(const crsf_header_t *message)
+         SerialOutFIFO.lock();
+         if (SerialOutFIFO.ensure(size + 1))
+         {
+-            auto data = (uint8_t *)message;
++            uint8_t data[CRSF_MAX_PACKET_LEN] = {};
++            memcpy(data, message, size);
+             // CRSF on a serial port _always_ has 0xC8 as a sync byte rather than the device_id.
+             // See https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#frame-details
+             data[0] = CRSF_SYNC_BYTE;
+@@ -233,8 +503,28 @@ void CRSFHandset::alignBufferToSync(uint8_t startIdx)
+ 
+ void CRSFHandset::handleInput()
+ {
++#if defined(PLATFORM_SIW917)
++    static uint32_t siw917HandleTraceCount = 0;
++    const bool siw917Trace =
++        (SIW917_CRSF_HANDSET_TRACE != 0) && (siw917HandleTraceCount < 8);
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] handleInput entry ptr=%u connected=%u transmitting=%u\n",
++               (unsigned)SerialInPacketPtr,
++               controllerConnected ? 1U : 0U,
++               transmitting ? 1U : 0U);
++    }
++#endif
++
+     if (UARTwdt())
+     {
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] UARTwdt consumed this pass\n");
++            siw917HandleTraceCount++;
++        }
++#endif
+         return;
+     }
+ 
+@@ -260,42 +550,176 @@ void CRSFHandset::handleInput()
+     }
+ 
+     // Add new data, and then discard bytes until we start with header byte
+-    auto toRead = std::min(Port.available(), CRSF_MAX_PACKET_LEN - SerialInPacketPtr);
+-    SerialInPacketPtr += Port.readBytes(&inBuffer[SerialInPacketPtr], toRead);
++    const int availableBeforeRead = Port.available();
++    auto toRead = std::min(availableBeforeRead, CRSF_MAX_PACKET_LEN - SerialInPacketPtr);
++#if defined(PLATFORM_SIW917)
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] before read avail=%d toRead=%u ptr=%u\n",
++               availableBeforeRead,
++               (unsigned)toRead,
++               (unsigned)SerialInPacketPtr);
++    }
++#endif
++    const size_t bytesRead = Port.readBytes(&inBuffer[SerialInPacketPtr], toRead);
++    SerialInPacketPtr += bytesRead;
++#if defined(PLATFORM_SIW917)
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] after read bytes=%u ptr=%u first=%02X %02X %02X %02X\n",
++               (unsigned)bytesRead,
++               (unsigned)SerialInPacketPtr,
++               inBuffer[0],
++               inBuffer[1],
++               inBuffer[2],
++               inBuffer[3]);
++    }
++#endif
+     alignBufferToSync(0);
++#if defined(PLATFORM_SIW917)
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] after align ptr=%u first=%02X %02X %02X %02X\n",
++               (unsigned)SerialInPacketPtr,
++               inBuffer[0],
++               inBuffer[1],
++               inBuffer[2],
++               inBuffer[3]);
++    }
++#endif
+ 
+     // Make sure we have at least a packet header and a length byte
+     if (SerialInPacketPtr < 3)
++    {
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] waiting for header ptr=%u\n",
++                   (unsigned)SerialInPacketPtr);
++            siw917HandleTraceCount++;
++        }
++#endif
+         return;
++    }
+ 
+     // Sanity check: A total packet must be at least [sync][len][type][crc] (if no payload) and at most CRSF_MAX_PACKET_LEN
+     const uint32_t totalLen = inBuffer[1] + 2;
++#if defined(PLATFORM_SIW917)
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] totalLen=%lu type=%02X ptr=%u\n",
++               (unsigned long)totalLen,
++               inBuffer[2],
++               (unsigned)SerialInPacketPtr);
++    }
++#endif
+     if (totalLen < 4 || totalLen > CRSF_MAX_PACKET_LEN)
+     {
+         // Start looking for another packet after this start byte
+         alignBufferToSync(1);
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] invalid len, realigned ptr=%u\n",
++                   (unsigned)SerialInPacketPtr);
++            siw917HandleTraceCount++;
++        }
++#endif
+         return;
+     }
+ 
+     // Only proceed one there are enough bytes in the buffer for the entire packet
+     if (SerialInPacketPtr < totalLen)
++    {
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] waiting full packet ptr=%u totalLen=%lu\n",
++                   (unsigned)SerialInPacketPtr,
++                   (unsigned long)totalLen);
++            siw917HandleTraceCount++;
++        }
++#endif
+         return;
++    }
+ 
+     uint8_t CalculatedCRC = crsfRouter.crsf_crc.calc(&inBuffer[2], totalLen - 3);
++#if defined(PLATFORM_SIW917)
++    const uint8_t RouterCRC = CalculatedCRC;
++    const uint8_t LocalCRC = siw917CrsfCrc8(&inBuffer[2], totalLen - 3);
++    if (CalculatedCRC != inBuffer[totalLen - 1] && LocalCRC == inBuffer[totalLen - 1])
++    {
++        CalculatedCRC = LocalCRC;
++    }
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] crc router=%02X local=%02X got=%02X%s\n",
++               RouterCRC,
++               LocalCRC,
++               inBuffer[totalLen - 1],
++               CalculatedCRC == inBuffer[totalLen - 1] ? " OK" : "");
++        if (CalculatedCRC != inBuffer[totalLen - 1])
++        {
++            printf("[CRSFHandset] frame");
++            for (uint32_t i = 0; i < totalLen; ++i)
++            {
++                printf(" %02X", inBuffer[i]);
++            }
++            printf("\n");
++        }
++    }
++#endif
+     if (CalculatedCRC == inBuffer[totalLen - 1])
+     {
+         GoodPktsCount++;
++#if defined(PLATFORM_SIW917) && SIW917_CRSF_PROTOCOL_DIAG
++        siw917CountRxFrame(inBuffer[2]);
++        siw917TraceCrsfLuaFrame("RX", inBuffer, (uint8_t)totalLen);
++#endif
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] CRC OK, ProcessPacket next\n");
++        }
++#endif
+         ProcessPacket();
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] ProcessPacket returned, handleOutput next\n");
++        }
++#endif
+         handleOutput(totalLen);
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            printf("[CRSFHandset] handleOutput returned\n");
++        }
++#endif
+     }
+     else
+     {
++#if defined(PLATFORM_SIW917)
++        if (siw917Trace)
++        {
++            DBGLN("UART CRC failure");
++        }
++#else
+         DBGLN("UART CRC failure");
++#endif
+         BadPktsCount++;
+     }
+ 
+     SerialInPacketPtr -= totalLen;
+     memmove(inBuffer, &inBuffer[totalLen], SerialInPacketPtr);
++#if defined(PLATFORM_SIW917)
++    if (siw917Trace)
++    {
++        printf("[CRSFHandset] compacted ptr=%u\n",
++               (unsigned)SerialInPacketPtr);
++        siw917HandleTraceCount++;
++    }
++#endif
+ }
+ 
+ void CRSFHandset::handleOutput(const uint32_t receivedBytes)
+@@ -341,6 +765,10 @@ void CRSFHandset::handleOutput(const uint32_t receivedBytes)
+                 packageLengthRemaining = SerialOutFIFO.pop();
+                 SerialOutFIFO.popBytes(CRSFoutBuffer, packageLengthRemaining);
+                 sendingOffset = 0;
++#if defined(PLATFORM_SIW917) && SIW917_CRSF_PROTOCOL_DIAG
++                siw917CountTxFrame(CRSFoutBuffer[2], packageLengthRemaining);
++                siw917TraceCrsfLuaFrame("TX", CRSFoutBuffer, packageLengthRemaining);
++#endif
+             }
+             SerialOutFIFO.unlock();
+ 
+@@ -348,7 +776,24 @@ void CRSFHandset::handleOutput(const uint32_t receivedBytes)
+             uint8_t writeLength = std::min(packageLengthRemaining, periodBytesRemaining);
+ 
+             // write the packet out, if it's a large package the offset holds the starting position
+-            Port.write(CRSFoutBuffer + sendingOffset, writeLength);
++            const size_t primaryWritten = Port.write(CRSFoutBuffer + sendingOffset, writeLength);
++#if defined(PLATFORM_SIW917) && SIW917_CRSF_PROTOCOL_DIAG
++            const uint8_t writeType = CRSFoutBuffer[2];
++            const uint8_t writeOffset = sendingOffset;
++            if (siw917IsLuaWriteTraceFrame(writeType) && siw917CrsfLuaWriteTraceCount < 24)
++            {
++                printf("[CRSF_LUA] WRITE %s type=0x%02X offset=%u len=%u wrote=%u remaining_before=%u\n",
++                       siw917CrsfFrameName(writeType),
++                       writeType,
++                       (unsigned)writeOffset,
++                       (unsigned)writeLength,
++                       (unsigned)primaryWritten,
++                       (unsigned)packageLengthRemaining);
++                siw917CrsfLuaWriteTraceCount++;
++            }
++#else
++            (void)primaryWritten;
++#endif
+             if (PortSecondary)
+             {
+                 PortSecondary->write(CRSFoutBuffer + sendingOffset, writeLength);
+@@ -554,7 +999,18 @@ bool CRSFHandset::UARTwdt()
+         // If no packets or more bad than good packets, rate cycle/autobaud the UART but
+         // do not adjust the parameters while in wifi mode. If a firmware is being
+         // uploaded, it will cause tons of serial errors during the flash writes
+-        if ((connectionState != wifiUpdate) && (BadPktsCount >= GoodPktsCount || !controllerConnected))
++        bool shouldCycleUart =
++            (connectionState != wifiUpdate) &&
++            (BadPktsCount >= GoodPktsCount || !controllerConnected);
++#if defined(PLATFORM_SIW917)
++        // SiW917 uses upstream's fallback baud scanner. Do not tear down a live
++        // handset link merely because a short RX backlog produced some bad
++        // frames; scan again only after a complete window with no valid frame.
++        shouldCycleUart =
++            (connectionState != wifiUpdate) &&
++            (!controllerConnected || GoodPktsCount == 0);
++#endif
++        if (shouldCycleUart)
+         {
+             DBGLN("Too many bad UART RX packets!");
+ 
+@@ -593,11 +1049,50 @@ bool CRSFHandset::UARTwdt()
+         if (retval)
+         {
+             // Speed up the cycling
++#if defined(PLATFORM_SIW917)
++            UARTwdtLastChecked -= UARTwdtInterval - UARTwdtScanInterval;
++#else
+             UARTwdtLastChecked -= 3 * (UARTwdtInterval >> 2);
++#endif
+         }
+ 
+         GoodPktsCountResult = GoodPktsCount;
+         BadPktsCountResult = BadPktsCount;
++#if defined(PLATFORM_SIW917) && SIW917_CRSF_PROTOCOL_DIAG
++        if ((uint32_t)(now - siw917LastCrsfProtocolStatsMs) >= SIW917_CRSF_STATS_INTERVAL_MS)
++        {
++            siw917LastCrsfProtocolStatsMs = now;
++            uint16_t fifoSize = 0;
++            SerialOutFIFO.lock();
++            fifoSize = SerialOutFIFO.size();
++            SerialOutFIFO.unlock();
++            printf("[CRSF_UART] connected=%u good=%lu bad=%lu avail=%d fifo=%u max=%u/%u "
++                   "rx{rc=%lu hb=%lu ping=%lu read=%lu write=%lu cmd=%lu other=%lu} "
++                   "tx{link=%lu sync=%lu dev=%lu param=%lu status=%lu other=%lu bytes=%lu}\n",
++                   controllerConnected ? 1U : 0U,
++                   (unsigned long)GoodPktsCount,
++                   (unsigned long)BadPktsCount,
++                   Port.available(),
++                   (unsigned)fifoSize,
++                   (unsigned)maxPacketBytes,
++                   (unsigned)maxPeriodBytes,
++                   (unsigned long)siw917RxRcCount,
++                   (unsigned long)siw917RxHeartbeatCount,
++                   (unsigned long)siw917RxPingCount,
++                   (unsigned long)siw917RxParamReadCount,
++                   (unsigned long)siw917RxParamWriteCount,
++                   (unsigned long)siw917RxCommandCount,
++                   (unsigned long)siw917RxOtherCount,
++                   (unsigned long)siw917TxLinkCount,
++                   (unsigned long)siw917TxHandsetCount,
++                   (unsigned long)siw917TxDeviceInfoCount,
++                   (unsigned long)siw917TxParamEntryCount,
++                   (unsigned long)siw917TxElrsStatusCount,
++                   (unsigned long)siw917TxOtherCount,
++                   (unsigned long)siw917TxFrameBytes);
++            siw917ResetCrsfProtocolCounters();
++        }
++#endif
+         BadPktsCount = 0;
+         GoodPktsCount = 0;
+     }
+diff --git a/src/lib/LR1121Driver/LR1121.cpp b/src/lib/LR1121Driver/LR1121.cpp
+index 175feeb2977be32f0f74f0da892a9f5e1f1e4f4d..85c7379f3d00707382409174e2dd3a7d69eb33b9 100644
+--- a/src/lib/LR1121Driver/LR1121.cpp
++++ b/src/lib/LR1121Driver/LR1121.cpp
+@@ -12,6 +12,37 @@
+ LR1121Hal hal;
+ LR1121Driver *LR1121Driver::instance = NULL;
+ 
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++static volatile uint32_t siw917_lr1121_isr_count;
++static volatile uint32_t siw917_lr1121_rx_done_count;
++static volatile uint32_t siw917_lr1121_tx_done_count;
++static volatile uint32_t siw917_lr1121_other_irq_count;
++static volatile uint32_t siw917_lr1121_last_irq_status;
++
++extern "C" void lr1121_get_isr_stats(uint32_t *isr_count,
++                                      uint32_t *rx_count,
++                                      uint32_t *tx_count,
++                                      uint32_t *other_count,
++                                      uint32_t *last_irq)
++{
++    if (isr_count) {
++        *isr_count = siw917_lr1121_isr_count;
++    }
++    if (rx_count) {
++        *rx_count = siw917_lr1121_rx_done_count;
++    }
++    if (tx_count) {
++        *tx_count = siw917_lr1121_tx_done_count;
++    }
++    if (other_count) {
++        *other_count = siw917_lr1121_other_irq_count;
++    }
++    if (last_irq) {
++        *last_irq = siw917_lr1121_last_irq_status;
++    }
++}
++#endif
++
+ //DEBUG_LR1121_OTA_TIMING
+ 
+ #if defined(DEBUG_LR1121_OTA_TIMING)
+@@ -797,6 +828,19 @@ void ICACHE_RAM_ATTR LR1121Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber
+     const SX12XX_Radio_Number_t otherRadioNumber = radioNumber == SX12XX_Radio_1 ? SX12XX_Radio_2 : SX12XX_Radio_1;
+ 
+     const uint32_t irqStatus = instance->GetIrqStatus(radioNumber);
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_lr1121_isr_count++;
++    siw917_lr1121_last_irq_status = irqStatus;
++    if (irqStatus & LR1121_IRQ_TX_DONE) {
++        siw917_lr1121_tx_done_count++;
++    }
++    if (irqStatus & LR1121_IRQ_RX_DONE) {
++        siw917_lr1121_rx_done_count++;
++    }
++    if ((irqStatus & (LR1121_IRQ_TX_DONE | LR1121_IRQ_RX_DONE)) == 0U) {
++        siw917_lr1121_other_irq_count++;
++    }
++#endif
+     if (irqStatus & LR1121_IRQ_TX_DONE)
+     {
+         instance->TXnbISR();
+diff --git a/src/lib/tx-crsf/TXModuleEndpoint.cpp b/src/lib/tx-crsf/TXModuleEndpoint.cpp
+index 162b6be0a80fd78cbf591e6c0fe9ee6a96d3ab29..91bb21e128cb47afc1a257412e026ec297e2e282 100644
+--- a/src/lib/tx-crsf/TXModuleEndpoint.cpp
++++ b/src/lib/tx-crsf/TXModuleEndpoint.cpp
+@@ -17,6 +17,12 @@ RTC_DATA_ATTR int rtcModelId = 0;
+ 
+ void ModelUpdateReq();
+ 
++#if defined(TARGET_TX) && defined(SIW917_ELRS_TX_PC_BENCH)
++extern "C" void siw917_pcbench_capture_crsf_channels(const uint32_t *channels,
++                                                      uint8_t channelCount,
++                                                      uint8_t armed);
++#endif
++
+ void TXModuleEndpoint::begin()
+ {
+ #if defined(PLATFORM_ESP32)
+@@ -151,6 +157,11 @@ void TXModuleEndpoint::RcPacketToChannelsData(const crsf_header_t *message) // d
+         }
+     }
+ 
++#if defined(TARGET_TX) && defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_pcbench_capture_crsf_channels(localChannelData, CRSF_NUM_CHANNELS,
++                                         armCmd ? 1U : 0U);
++#endif
++
+     // monitoring arming state
+     if (isArmed != armCmd)
+     {
+diff --git a/src/src/tx_main.cpp b/src/src/tx_main.cpp
+index 10e60e03da7f948da7510e9ce7cf1bd3d6865b25..0bf9e944681cf42588a8f4256e8cc05d2b06129f 100644
+--- a/src/src/tx_main.cpp
++++ b/src/src/tx_main.cpp
+@@ -36,10 +36,19 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
+ #include "TXOTAConnector.h"
+ #include "TXUSBConnector.h"
+ 
++#if defined(PLATFORM_SIW917)
++#include <new>
++#endif
++
+ #if defined(PLATFORM_ESP8266)
+ #include <user_interface.h>
+ #endif
+ 
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++#include <stdio.h>
++#define SIW917_TXLOOPDBG(fmt, ...) printf("[TXLOOPDBG] " fmt "\n", __VA_ARGS__)
++#endif
++
+ /// define some libs to use ///
+ MSP msp;
+ ELRS_EEPROM eeprom;
+@@ -91,6 +100,94 @@ StubbornReceiver DataDlReceiver;
+ StubbornSender DataUlSender;
+ uint8_t CRSFinBuffer[CRSF_MAX_PACKET_LEN+1];
+ 
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++static volatile uint32_t siw917_txdbg_send_attempts;
++static volatile uint32_t siw917_txdbg_send_sync;
++static volatile uint32_t siw917_txdbg_send_rc;
++static volatile uint32_t siw917_txdbg_send_data;
++static volatile uint32_t siw917_txdbg_lbt_none;
++static volatile uint32_t siw917_txdbg_tx_done_cb;
++static volatile uint32_t siw917_txdbg_tx_done_ignored;
++static volatile uint32_t siw917_txdbg_rx_window_req;
++static volatile uint32_t siw917_txdbg_rx_expected;
++static volatile uint32_t siw917_txdbg_rx_missed;
++static volatile uint32_t siw917_txdbg_rx_done_cb;
++static volatile uint32_t siw917_txdbg_rx_ignored;
++static volatile uint32_t siw917_txdbg_rx_accept;
++static volatile uint32_t siw917_txdbg_rx_reject;
++
++extern "C" void siw917_txdbg_get(uint32_t *send_attempts,
++                                  uint32_t *send_sync,
++                                  uint32_t *send_rc,
++                                  uint32_t *send_data,
++                                  uint32_t *lbt_none,
++                                  uint32_t *tx_done_cb,
++                                  uint32_t *tx_done_ignored,
++                                  uint32_t *rx_window_req,
++                                  uint32_t *rx_expected,
++                                  uint32_t *rx_missed,
++                                  uint32_t *rx_done_cb,
++                                  uint32_t *rx_ignored,
++                                  uint32_t *rx_accept,
++                                  uint32_t *rx_reject,
++                                  uint8_t *nonce,
++                                  uint8_t *tlm_phase,
++                                  uint8_t *busy)
++{
++  if (send_attempts) {
++    *send_attempts = siw917_txdbg_send_attempts;
++  }
++  if (send_sync) {
++    *send_sync = siw917_txdbg_send_sync;
++  }
++  if (send_rc) {
++    *send_rc = siw917_txdbg_send_rc;
++  }
++  if (send_data) {
++    *send_data = siw917_txdbg_send_data;
++  }
++  if (lbt_none) {
++    *lbt_none = siw917_txdbg_lbt_none;
++  }
++  if (tx_done_cb) {
++    *tx_done_cb = siw917_txdbg_tx_done_cb;
++  }
++  if (tx_done_ignored) {
++    *tx_done_ignored = siw917_txdbg_tx_done_ignored;
++  }
++  if (rx_window_req) {
++    *rx_window_req = siw917_txdbg_rx_window_req;
++  }
++  if (rx_expected) {
++    *rx_expected = siw917_txdbg_rx_expected;
++  }
++  if (rx_missed) {
++    *rx_missed = siw917_txdbg_rx_missed;
++  }
++  if (rx_done_cb) {
++    *rx_done_cb = siw917_txdbg_rx_done_cb;
++  }
++  if (rx_ignored) {
++    *rx_ignored = siw917_txdbg_rx_ignored;
++  }
++  if (rx_accept) {
++    *rx_accept = siw917_txdbg_rx_accept;
++  }
++  if (rx_reject) {
++    *rx_reject = siw917_txdbg_rx_reject;
++  }
++  if (nonce) {
++    *nonce = OtaNonce;
++  }
++  if (tlm_phase) {
++    *tlm_phase = (uint8_t)TelemetryRcvPhase;
++  }
++  if (busy) {
++    *busy = busyTransmitting ? 1U : 0U;
++  }
++}
++#endif
++
+ CRSFRouter crsfRouter;
+ TXModuleEndpoint crsfTransmitter;
+ TXOTAConnector otaConnector;
+@@ -382,7 +479,14 @@ expresslrs_tlm_ratio_e ICACHE_RAM_ATTR UpdateTlmRatioEffective()
+ void ICACHE_RAM_ATTR GenerateSyncPacketData(OTA_Sync_s * const syncPtr)
+ {
+   const uint8_t SwitchEncMode = config.GetSwitchMode();
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  // PC bench mode applies the SiW917 NVM rate directly to the runtime RF
++  // path without marking upstream config dirty. During sync-spam, advertise
++  // that runtime rate, not the stale upstream config default.
++  const uint8_t Index = ExpressLRS_currAirRate_Modparams->index;
++#else
+   const uint8_t Index = (syncSpamCounter) ? config.GetRate() : ExpressLRS_currAirRate_Modparams->index;
++#endif
+ 
+   if (syncSpamCounter)
+     --syncSpamCounter;
+@@ -543,6 +647,16 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
+ 
+   uint8_t NonceFHSSresult = OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
+ 
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  // Bench bring-up has no handset/LUA path to poke the link. Keep sync-spam
++  // primed while disconnected so an RX scanning across rates gets repeated
++  // chances to land on this fixed PC-bench RF mode.
++  if (connectionState == disconnected && syncSpamCounter == 0)
++  {
++    syncSpamCounter = 1;
++  }
++#endif
++
+   // Sync spam only happens on slot 1 and 2 and can't be disabled
+   if ((syncSpamCounter || (syncSpamCounterAfterRateChange && FHSSonSyncChannel())) && (NonceFHSSresult == 1 || NonceFHSSresult == 2))
+   {
+@@ -631,6 +745,9 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
+ 
+   if (transmittingRadio == SX12XX_Radio_NONE)
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_lbt_none++;
++#endif
+     // No packet will be sent due to LBT.
+     // Defer TXdoneCallback() to prepare for TLM when the IRQ is normally triggered.
+     deferExecutionMicros(ExpressLRS_currAirRate_RFperfParams->TOA, Radio.TXdoneCallback);
+@@ -638,6 +755,20 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
+   else
+ #endif
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_send_attempts++;
++    switch (otaPkt.std.type) {
++    case PACKET_TYPE_SYNC:
++      siw917_txdbg_send_sync++;
++      break;
++    case PACKET_TYPE_DATA:
++      siw917_txdbg_send_data++;
++      break;
++    default:
++      siw917_txdbg_send_rc++;
++      break;
++    }
++#endif
+     Radio.TXnb((uint8_t*)&otaPkt, false, (uint8_t*)&otaPkt, transmittingRadio);
+   }
+ }
+@@ -690,6 +821,9 @@ void ICACHE_RAM_ATTR timerCallback()
+   if (TelemetryRcvPhase == ttrpPreReceiveGap)
+   {
+     TelemetryRcvPhase = ttrpExpectingTelem;
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_rx_expected++;
++#endif
+ #if defined(Regulatory_Domain_EU_CE_2400)
+     // Use downlink LQ for LBT success ratio instead for EU/CE reg domain
+     linkStats.downlink_Link_quality = LBTSuccessCalc.getLQ();
+@@ -701,6 +835,9 @@ void ICACHE_RAM_ATTR timerCallback()
+   }
+   else if (TelemetryRcvPhase == ttrpExpectingTelem && !LqTQly.currentIsSet())
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_rx_missed++;
++#endif
+     // Indicate no telemetry packet received to the DP system
+     DynamicPower_TelemetryUpdate(DYNPOWER_UPDATE_MISSED);
+   }
+@@ -826,14 +963,27 @@ static void CheckConfigChangePending()
+ 
+ bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
+ {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  siw917_txdbg_rx_done_cb++;
++#endif
+   // busyTransmitting is required here to prevent accidental rxdone IRQs due to interference triggering RXdoneISR.
+   if (LqTQly.currentIsSet() || busyTransmitting)
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_rx_ignored++;
++#endif
+     return false; // Already received tlm, do not run ProcessDownlinkPacket() again.
+   }
+ 
+   LbtCcaTimerStart();
+   const bool packetSuccessful = ProcessDownlinkPacket(status);
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (packetSuccessful) {
++    siw917_txdbg_rx_accept++;
++  } else {
++    siw917_txdbg_rx_reject++;
++  }
++#endif
+   return packetSuccessful;
+ }
+ 
+@@ -841,9 +991,16 @@ void ICACHE_RAM_ATTR TXdoneISR()
+ {
+   if (!busyTransmitting)
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    siw917_txdbg_tx_done_ignored++;
++#endif
+     return; // Already finished transmission and do not call HandleFHSS() a second time, which may hop the frequency!
+   }
+ 
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  siw917_txdbg_tx_done_cb++;
++#endif
++
+   if (connectionState != awaitingModelId)
+   {
+     const uint8_t modResult = (OtaNonce + 1) % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
+@@ -885,6 +1042,9 @@ void ICACHE_RAM_ATTR TXdoneISR()
+     // If TLM enabled and next packet is going to be telemetry
+     if (nextIsTLM)
+     {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++      siw917_txdbg_rx_window_req++;
++#endif
+       TelemetryRcvPhase = ttrpPreReceiveGap;
+     }
+     else if (doRx)
+@@ -1378,6 +1538,7 @@ static void cyclePower()
+   }
+ }
+ 
++#if !defined(SIW917_ELRS_TX_PC_BENCH)
+ static void checkSendLinkStatsToHandset(uint32_t now)
+ {
+   if ((now - LinkStatsLastReported_Ms) > firmwareOptions.tlm_report_interval)
+@@ -1403,9 +1564,27 @@ static void checkSendLinkStatsToHandset(uint32_t now)
+     LinkStatsLastReported_Ms = now;
+   }
+ }
++#endif
+ 
+ void setup()
+ {
++#if defined(PLATFORM_SIW917)
++  // The SiWx917 startup path does not reliably run C++ global constructors for
++  // these CRSF objects. Construct them explicitly before routing handset/Lua
++  // traffic so the router CRC table, endpoint base state, and vtables are valid.
++  static bool siw917CrsfObjectsConstructed = false;
++  if (!siw917CrsfObjectsConstructed)
++  {
++    new (&crsfRouter) CRSFRouter();
++    new (&crsfTransmitter) TXModuleEndpoint();
++    new (&otaConnector) TXOTAConnector();
++    new (&usbConnector) TXUSBConnector();
++    new (&crsfParser) CRSFParser();
++    siw917CrsfObjectsConstructed = true;
++    DBGLN("[CRSF_INIT] tx CRSF objects explicitly constructed");
++  }
++#endif
++
+   if (setupHardwareFromOptions())
+   {
+     setupTarget();
+@@ -1494,9 +1673,23 @@ void setup()
+ 
+ void loop()
+ {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  static uint32_t siw917_loop_trace_count = 0;
++  const bool siw917_trace_loop = false;
++  if (siw917_trace_loop)
++  {
++    SIW917_TXLOOPDBG("loop %lu: enter", (unsigned long)siw917_loop_trace_count);
++  }
++#endif
+   uint32_t now = millis();
+ 
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before HandleUARTout", (unsigned long)siw917_loop_trace_count);
++  #endif
+   HandleUARTout(); // Only used for non-CRSF output
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after HandleUARTout", (unsigned long)siw917_loop_trace_count);
++  #endif
+ 
+   #if defined(USE_BLE_JOYSTICK)
+   if (connectionState != bleJoystick && connectionState != noCrossfire) // Wait until the correct crsf baud has been found
+@@ -1507,30 +1700,93 @@ void loop()
+ 
+   if (connectionState < MODE_STATES)
+   {
++    #if defined(SIW917_ELRS_TX_PC_BENCH)
++    if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before UpdateConnectDisconnectStatus", (unsigned long)siw917_loop_trace_count);
++    #endif
+     UpdateConnectDisconnectStatus();
++    #if defined(SIW917_ELRS_TX_PC_BENCH)
++    if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after UpdateConnectDisconnectStatus", (unsigned long)siw917_loop_trace_count);
++    #endif
+   }
+ 
+   // Update UI devices
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before devicesUpdate", (unsigned long)siw917_loop_trace_count);
++  #endif
+   devicesUpdate(now);
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after devicesUpdate", (unsigned long)siw917_loop_trace_count);
++  #endif
+ 
+   // Not a device because it must be run on the loop core
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before backpack/reboot", (unsigned long)siw917_loop_trace_count);
++  #endif
+   checkBackpackUpdate();
+   checkRebootTime(now);
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after backpack/reboot", (unsigned long)siw917_loop_trace_count);
++  #endif
+ 
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before executeDeferredFunction", (unsigned long)siw917_loop_trace_count);
++  #endif
+   executeDeferredFunction(micros());
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after executeDeferredFunction", (unsigned long)siw917_loop_trace_count);
++  #endif
+ 
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before HandleUARTin", (unsigned long)siw917_loop_trace_count);
++  #endif
+   HandleUARTin();
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after HandleUARTin", (unsigned long)siw917_loop_trace_count);
++  #endif
+ 
+   if (connectionState > MODE_STATES)
+   {
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++    if (siw917_trace_loop)
++    {
++      SIW917_TXLOOPDBG("loop %lu: return mode state=%u", (unsigned long)siw917_loop_trace_count, (unsigned)connectionState);
++      siw917_loop_trace_count++;
++    }
++#endif
+     return;
+   }
+ 
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before CheckReadyToSend", (unsigned long)siw917_loop_trace_count);
++  #endif
+   CheckReadyToSend();
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after CheckReadyToSend", (unsigned long)siw917_loop_trace_count);
++  #endif
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before CheckConfigChangePending", (unsigned long)siw917_loop_trace_count);
++  #endif
+   CheckConfigChangePending();
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after CheckConfigChangePending", (unsigned long)siw917_loop_trace_count);
++  #endif
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before DynamicPower_Update", (unsigned long)siw917_loop_trace_count);
++  #endif
+   DynamicPower_Update(now);
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after DynamicPower_Update", (unsigned long)siw917_loop_trace_count);
++  #endif
++  #if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: before VtxPitmodeSwitchUpdate", (unsigned long)siw917_loop_trace_count);
++  #endif
+   VtxPitmodeSwitchUpdate();
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: after VtxPitmodeSwitchUpdate", (unsigned long)siw917_loop_trace_count);
++  if (siw917_trace_loop) SIW917_TXLOOPDBG("loop %lu: skip handset linkstats in PC bench", (unsigned long)siw917_loop_trace_count);
++#else
+   checkSendLinkStatsToHandset(now);
++#endif
+ 
+   if (DataDlReceiver.HasFinishedData())
+   {
+@@ -1579,4 +1835,11 @@ void loop()
+   {
+     otaConnector.pumpSender();
+   }
++#if defined(SIW917_ELRS_TX_PC_BENCH)
++  if (siw917_trace_loop)
++  {
++    SIW917_TXLOOPDBG("loop %lu: exit", (unsigned long)siw917_loop_trace_count);
++    siw917_loop_trace_count++;
++  }
++#endif
+ }

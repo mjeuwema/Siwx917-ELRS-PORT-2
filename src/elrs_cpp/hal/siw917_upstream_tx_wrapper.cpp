@@ -25,6 +25,45 @@ RXtimerState_e RXtimerState = tim_disconnected;
 
 static bool siw917_upstream_tx_initialized = false;
 static bool siw917_upstream_tx_running = false;
+static connectionState_e siw917_last_reported_link_state = hardwareUndefined;
+
+static const char *siw917_link_state_name(connectionState_e state)
+{
+    switch (state)
+    {
+    case connected:
+        return "connected";
+    case tentative:
+        return "tentative";
+    case awaitingModelId:
+        return "awaiting-model";
+    case radioFailed:
+        return "radio-failed";
+    case hardwareUndefined:
+        return "hardware-undefined";
+    default:
+        return "disconnected";
+    }
+}
+
+static void siw917_report_link_transition()
+{
+    if (connectionState == siw917_last_reported_link_state)
+    {
+        return;
+    }
+
+    siw917_last_reported_link_state = connectionState;
+    const expresslrs_mod_settings_s *rate = ExpressLRS_currAirRate_Modparams;
+    printf("[TXLINK] state=%s rate_index=%u rf_mode=%u interval_us=%lu "
+           "tlm_denom=%u lq=%u\n",
+           siw917_link_state_name(connectionState),
+           rate != nullptr ? (unsigned)rate->index : 255U,
+           rate != nullptr ? (unsigned)rate->enum_rate : 255U,
+           rate != nullptr ? (unsigned long)rate->interval : 0UL,
+           (unsigned)ExpressLRS_currTlmDenom,
+           (unsigned)linkStats.uplink_Link_quality);
+}
 
 extern "C" bool elrs_tx_init(void)
 {
@@ -34,6 +73,9 @@ extern "C" bool elrs_tx_init(void)
     }
 
     printf("[ELRS_CPP] initializing upstream TX with SiW917 HAL\n");
+#if defined(SIW917_ELRS_CRSF_BENCH_2WIRE)
+    printf("[ELRS_CPP] handset transport: EdgeTX two-wire electrical, paced CRSF replies\n");
+#endif
     if (elrs_config_init() != 0)
     {
         printf("[ELRS_CPP] WARNING: platform options storage init failed\n");
@@ -73,6 +115,7 @@ extern "C" void elrs_tx_loop(void)
     siw917_lr1121_handle_deferred_isr();
     loop();
     siw917_lr1121_handle_deferred_isr();
+    siw917_report_link_transition();
 }
 
 extern "C" void elrs_tx_stop(void)

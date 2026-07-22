@@ -1,20 +1,26 @@
 # Working TX Checkpoint
 
-Date: 2026-07-15
+Date: 2026-07-21
 
-This checkpoint records the first confirmed working RadioMaster TX16S Mark 3
-connection using the custom EdgeTX two-wire external-module transport.
+Git tag: `checkpoint/tx-lua-atomic-dma-2026-07-21`
 
-## SiW917 firmware
+This checkpoint records the confirmed working SiW917 ExpressLRS transmitter
+state after restoring atomic UART baud-change RX rearming and verifying the
+complete EdgeTX Lua request/reply path. High-volume CRSF protocol diagnostics
+are disabled in the checkpoint firmware.
+
+## Firmware Configuration
 
 - Role: ExpressLRS transmitter
 - ELRS core: upstream `tx_main.cpp`
-- Handset transport: direct two-wire UART1
-- UART: normal polarity, 400000 baud, 8N1
+- Radio: single LR1121, FCC 915 MHz plus 2.4 GHz modes
+- Handset transport: direct two-wire UART1 for the custom TX16S EdgeTX build
+- UART: normal polarity, 8N1, upstream baud scan with 1.87 Mbaud preferred
 - SiW917 RX: GPIO_6, BRD2605A breakout pin 21
 - SiW917 TX: GPIO_7, BRD2605A breakout pin 24
-- Adapter/TX_OE_N: not used
+- Adapter/TX_OE_N: not used by the two-wire build
 - PC bench mode: disabled
+- CRSF protocol diagnostics: disabled
 - Radio return diagnostic sweep: disabled
 
 Build options:
@@ -25,16 +31,62 @@ SIW917_ELRS_CRSF_BENCH_2WIRE=ON
 SIW917_ELRS_TX_PC_BENCH=OFF
 SIW917_ELRS_USE_UPSTREAM_TX_MAIN=ON
 SIW917_CRSF_RADIO_RETURN_DIAG=OFF
+SIW917_ELRS_EVENT_COUNTERS=OFF
 ```
 
-Current timing-stable artifact:
+## Checkpoint Firmware
+
+Canonical build output:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS_TX_AI_Handoff_Build\tx_module_2wire\base\SiW917_ELRS_TX_TwoWire_Stable_81B714C4.rps
-SHA256: 81B714C45A98ED55770A7B376F106C66F65154F4A4E0DA8A0449C65765F1AD31
+C:\Users\mjeuw\OneDrive\Documents\ELRS TX\cmake_gcc\build-tx-clean-port\base\wifi_gspi_merged.rps
 ```
 
-## Radio wiring
+Stable local copy:
+
+```text
+C:\Users\mjeuw\OneDrive\Documents\ELRS TX\firmware\SiW917_ELRS_TX_TwoWire_Checkpoint_9C66E512.rps
+```
+
+```text
+Size:   363348 bytes
+SHA256: 9C66E512B28D6B35DBACA5660C3BBBEE017F95A442F4179EB6BC164D036D0257
+```
+
+## Upstream Source Identity
+
+The build uses the local ExpressLRS checkout at:
+
+```text
+C:\Users\mjeuw\OneDrive\Documents\ELRS TX\upstream_expresslrs_master
+```
+
+Base commit:
+
+```text
+cfa88c0bb3e686e104a237d7239bdbbeb3ed4e9e
+```
+
+The exact four-file upstream working-tree delta is captured by:
+
+```text
+patches\siw917-tx-upstream-cfa88c0.patch
+SHA256: AC4C341ACA8781DB3A4694234B302A0066A2C1C3F0E3CB7D65FE076B9BE244BF
+Patch ID: 570e0b4d5d4fdde8a2194e017bed3bb3532570bd
+```
+
+The patch was verified by applying it to a temporary clean worktree at the
+base commit.
+
+## Build
+
+```powershell
+cd "C:\Users\mjeuw\OneDrive\Documents\ELRS TX\cmake_gcc"
+$env:ELRS_UPSTREAM_DIR = "C:\Users\mjeuw\OneDrive\Documents\ELRS TX\upstream_expresslrs_master\src"
+cmake --workflow --preset tx-clean-port
+```
+
+## Radio Wiring
 
 ```text
 TX16S pin 1 PPM       -> SiW917 GPIO_6 / UART1 RX
@@ -44,30 +96,14 @@ TX16S pin 3 VBAT      -> regulator only; not connected directly to SiW917
 TX16S pin 5 S.Port    -> disconnected
 ```
 
-## Upstream source identity
-
-The build uses the upstream source snapshot at:
-
-```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS TX AI Handoff\ELRS_TX_workspace_refs\upstream_expresslrs_master\src
-```
-
-Key source hashes:
-
-```text
-src/tx_main.cpp
-26AB4A305E2E99BC9B57C9B6D71179F09E961C2E0E2F782EC5E9E022F82399EC
-
-lib/tx-crsf/TXModuleParameters.cpp
-77D83A7C086A91AAC9894FB97CDCF053E35E4C29F3A75B67AF3518D1DB7F2DD4
-```
-
-## Confirmed behavior
+## Confirmed Behavior
 
 - EdgeTX detects the SiW917 TX module over direct two-wire UART.
-- The ExpressLRS Lua interface loads on the radio.
-- Lua parameter loading is responsive after repeated module reboots.
-- RF band selection persists when switching between FCC 915 MHz and 2.4 GHz.
-- The TX connects to the RX and maintains telemetry at the tested packet rates.
-- No inverter, line combiner, S.Port connection, or TX output-enable signal is
-  required with the custom EdgeTX firmware.
+- The ExpressLRS Lua interface loads and exchanges all TX parameter frames.
+- The diagnostic run received more than 1000 valid handset frames with zero
+  invalid frames and confirmed device ping, device info, reads, and writes.
+- UART baud changes return with RX DMA armed.
+- Handset TX uses a queued DMA path with lossless backpressure.
+- The TX connects to an RX and exchanges RF telemetry.
+- Temporary `[CRSF_UART]` and `[CRSF_LUA]` serial tracing is not compiled into
+  this checkpoint firmware.

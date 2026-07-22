@@ -507,9 +507,9 @@
  *
  * The generic raw GSPI helper is useful as a safe fallback, but the 100/150 Hz
  * telemetry window is dominated by a small set of short write-only commands:
- * WriteBuffer8_SetTx, SetRx, SetRfFrequency, and the optional fused
- * SetRfFrequency_SetRx. This path emits those commands with the same tiny
- * register loop used by FAST_CLEAR_IRQ.
+ * WriteBuffer8_SetTx, SetRx, SetTxParams, SetRfFrequency, and the optional
+ * fused SetRfFrequency_SetRx. This path emits those commands with the same
+ * tiny register loop used by FAST_CLEAR_IRQ.
  */
 #ifndef SIW917_ELRS_FAST_HOT_COMMANDS
 #define SIW917_ELRS_FAST_HOT_COMMANDS SIW917_ELRS_TIMING_LEAN
@@ -521,6 +521,11 @@
 
 #ifndef SIW917_ELRS_RAW_GSPI_SET_RX
 #define SIW917_ELRS_RAW_GSPI_SET_RX SIW917_ELRS_TIMING_LEAN
+#endif
+
+/* CommitOutputPower() may issue SetTxParams directly from TX_DONE ISR. */
+#ifndef SIW917_ELRS_RAW_GSPI_SET_TX_PARAMS
+#define SIW917_ELRS_RAW_GSPI_SET_TX_PARAMS SIW917_ELRS_TIMING_LEAN
 #endif
 
 /*

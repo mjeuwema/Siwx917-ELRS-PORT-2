@@ -77,6 +77,14 @@ void HardwareSerial::end() {
     }
 }
 
+void HardwareSerial::updateBaudRate(unsigned long baud) {
+    begin(baud);
+    if (_crsfSerialActive) {
+        crsf_serial_discard_rx();
+        _suppressNextAvailable = true;
+    }
+}
+
 size_t HardwareSerial::write(uint8_t c) {
     if (_crsfSerialActive) {
         return crsf_serial_send_frame(&c, 1U) == 0 ? 1U : 0U;
@@ -100,6 +108,15 @@ size_t HardwareSerial::write(const uint8_t *buffer, size_t size) {
 
 int HardwareSerial::available() {
     if (!_crsfSerialActive) {
+        return 0;
+    }
+
+    if (_suppressNextAvailable) {
+        // Upstream flush_port_input() waits for an electrically quiet UART.
+        // EdgeTX transmits continuously, so discard one snapshot atomically
+        // and let that cleanup check complete instead of chasing new bytes.
+        crsf_serial_discard_rx();
+        _suppressNextAvailable = false;
         return 0;
     }
 
@@ -128,8 +145,9 @@ size_t HardwareSerial::readBytes(uint8_t *buffer, size_t length) {
 }
 
 void HardwareSerial::flush() {
-    // crsf_serial_send_frame() does not return until the final stop bit has
-    // left the UART and TX_OE_N is high, so there is nothing left to drain.
+    if (_crsfSerialActive) {
+        (void)crsf_serial_flush();
+    }
 }
 
 //=============================================================================

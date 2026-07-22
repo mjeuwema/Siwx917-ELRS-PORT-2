@@ -177,7 +177,7 @@ public:
     }
     void end();
     void setTimeout(unsigned long timeout) { (void)timeout; }
-    void updateBaudRate(unsigned long baud) { begin(baud); }
+    void updateBaudRate(unsigned long baud);
     size_t write(uint8_t c) override;
     size_t write(const uint8_t *buffer, size_t size) override;
     int available() override;
@@ -188,6 +188,7 @@ public:
 private:
     int _uartIndex = 0;
     bool _crsfSerialActive = false;
+    bool _suppressNextAvailable = false;
 };
 
 extern HardwareSerial Serial;

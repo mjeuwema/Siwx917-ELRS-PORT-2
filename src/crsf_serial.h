@@ -184,6 +184,9 @@ int crsf_serial_send_link_stats(const crsf_link_stats_t *stats);
  */
 int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len);
 
+/** Wait until all queued bytes and the UART shift register are empty. */
+int crsf_serial_flush(void);
+
 /**
  * @brief Enable or disable USART RX byte capture
  *
@@ -193,6 +196,12 @@ int crsf_serial_send_frame(const uint8_t *frame, uint32_t frame_len);
  * @return 0 on success, negative on error
  */
 int crsf_serial_set_rx_enabled(bool enable);
+
+/** Service deferred handset UART work from the platform task. */
+void crsf_serial_service(void);
+
+/** Atomically discard bytes captured before or during a baud-rate change. */
+void crsf_serial_discard_rx(void);
 
 /**
  * @brief Return the number of bytes currently buffered from USART RX
