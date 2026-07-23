@@ -17,6 +17,7 @@ bool siw917_mavlink_wifi_init(void);
 void siw917_mavlink_wifi_set_enabled(bool enabled);
 bool siw917_mavlink_wifi_is_enabled(void);
 bool siw917_mavlink_wifi_is_running(void);
+bool siw917_mavlink_wifi_wait_stopped(uint32_t timeout_ms);
 
 bool siw917_mavlink_wifi_enqueue_downlink(const uint8_t *data, size_t length);
 size_t siw917_mavlink_wifi_uplink_available(void);

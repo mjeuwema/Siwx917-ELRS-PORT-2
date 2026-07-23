@@ -267,6 +267,35 @@ void sendCRSFTelemetryToBackpack(uint8_t *) {}
 void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #endif")
 
+    set(old_link_diag_marker
+"static void UpdateConnectDisconnectStatus()
+{")
+    set(new_link_diag_marker
+"extern \"C\" void siw917_tx_get_link_diag(uint32_t *last_tlm_ms,
+                                              uint32_t *last_link_stats_ms,
+                                              uint8_t *telemetry_phase,
+                                              bool *radio_busy)
+{
+  if (last_tlm_ms)
+  {
+    *last_tlm_ms = LastTLMpacketRecv_Ms;
+  }
+  if (last_link_stats_ms)
+  {
+    *last_link_stats_ms = LinkStatsLastReported_Ms;
+  }
+  if (telemetry_phase)
+  {
+    *telemetry_phase = (uint8_t)TelemetryRcvPhase;
+  }
+  if (radio_busy)
+  {
+    *radio_busy = busyTransmitting;
+  }
+}
+
+${old_link_diag_marker}")
+
     file(READ "${input_file}" source_text)
     string(FIND "${source_text}" "${old_block}" block_offset)
     if(block_offset EQUAL -1)
@@ -275,6 +304,15 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
         )
     endif()
     string(REPLACE "${old_block}" "${new_block}" source_text "${source_text}")
+
+    string(FIND "${source_text}" "${old_link_diag_marker}" link_diag_offset)
+    if(link_diag_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX link diagnostic patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_link_diag_marker}" "${new_link_diag_marker}"
+        source_text "${source_text}")
 
     set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
     set(output_file "${output_dir}/tx_main.cpp")

@@ -3158,3 +3158,27 @@ void crsf_serial_debug_dump(void)
              (long)g_tx_queue_last_error);
 #endif
 }
+
+void crsf_serial_get_tx_diag(crsf_serial_tx_diag_t *diag)
+{
+    if (diag == NULL) {
+        return;
+    }
+
+    memset(diag, 0, sizeof(*diag));
+    diag->tx_count = g_tx_count;
+    diag->temt_timeout_count = g_tx_temt_timeout_count;
+    diag->tx_in_progress = g_tx_in_progress;
+#if CRSF_SERIAL_DIRECT_UART1
+    diag->backpressure_count = g_uart_tx_backpressure_count;
+#endif
+#if CRSF_SERIAL_ASYNC_TX_QUEUE
+    diag->queue_full_count = g_tx_queue_full_count;
+    diag->backpressure_count = g_tx_queue_full_count;
+    diag->queue_error_count = g_tx_queue_error_count;
+    diag->queue_last_error = g_tx_queue_last_error;
+    diag->queue_depth = g_tx_queue_count;
+    diag->queue_high_water = g_tx_queue_high_water;
+    diag->queue_active = g_tx_queue_active;
+#endif
+}

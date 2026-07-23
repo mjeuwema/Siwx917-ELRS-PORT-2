@@ -5,16 +5,20 @@
 #include "stubborn_sender.h"
 #include "TXOTAConnector.h"
 #include "../elrs_main.h"
+#include "siw917_mavlink_backpack.h"
 
 #include <stdio.h>
 #include <string.h>
 
 extern "C" {
 #include "elrs_config.h"
+#include "crsf_serial.h"
 void elrs_cpp_request_wifi_mode(void);
 void siw917_lr1121_handle_deferred_isr(void);
-void siw917_mavlink_backpack_init(void);
-void siw917_mavlink_backpack_service(void);
+void siw917_tx_get_link_diag(uint32_t *last_tlm_ms,
+                             uint32_t *last_link_stats_ms,
+                             uint8_t *telemetry_phase,
+                             bool *radio_busy);
 }
 
 void setup();
@@ -59,6 +63,7 @@ static void siw917_report_link_transition()
         return;
     }
 
+    const connectionState_e previousState = siw917_last_reported_link_state;
     siw917_last_reported_link_state = connectionState;
     siw917_last_reported_rate_index = rateIndex;
     printf("[TXLINK] state=%s rate_index=%u rf_mode=%u interval_us=%lu "
@@ -69,6 +74,52 @@ static void siw917_report_link_transition()
            rate != nullptr ? (unsigned long)rate->interval : 0UL,
            (unsigned)ExpressLRS_currTlmDenom,
            (unsigned)linkStats.uplink_Link_quality);
+
+    if (connectionState == previousState)
+    {
+        return;
+    }
+
+    uint32_t lastTlmMs = 0U;
+    uint32_t lastLinkStatsMs = 0U;
+    uint8_t telemetryPhase = 0U;
+    bool radioBusy = false;
+    siw917_tx_get_link_diag(&lastTlmMs, &lastLinkStatsMs,
+                            &telemetryPhase, &radioBusy);
+
+    const uint32_t now = millis();
+    const uint32_t telemetryAge = lastTlmMs != 0U ? now - lastTlmMs : UINT32_MAX;
+    const uint32_t linkStatsAge =
+        lastLinkStatsMs != 0U ? now - lastLinkStatsMs : UINT32_MAX;
+    uint32_t lossTimeout = 514U;
+    if (rate != nullptr)
+    {
+        const uint32_t calculated =
+            ((uint32_t)ExpressLRS_currTlmDenom * rate->interval) / 200U + 2U;
+        if (calculated > lossTimeout)
+        {
+            lossTimeout = calculated;
+        }
+    }
+
+    crsf_serial_rx_diag_t rxDiag = {};
+    crsf_serial_tx_diag_t txDiag = {};
+    crsf_serial_get_rx_diag(&rxDiag);
+    crsf_serial_get_tx_diag(&txDiag);
+    printf("[TXLINK_DIAG] tlm_age_ms=%lu timeout_ms=%lu phase=%u "
+           "radio_busy=%u linkstats_age_ms=%lu handset_rx_overrun=%lu "
+           "handset_tx_q=%u/%u full=%lu errors=%lu temt=%lu\n",
+           (unsigned long)telemetryAge,
+           (unsigned long)lossTimeout,
+           (unsigned)telemetryPhase,
+           radioBusy ? 1U : 0U,
+           (unsigned long)linkStatsAge,
+           (unsigned long)rxDiag.rx_overrun_count,
+           (unsigned)txDiag.queue_depth,
+           (unsigned)txDiag.queue_high_water,
+           (unsigned long)txDiag.queue_full_count,
+           (unsigned long)txDiag.queue_error_count,
+           (unsigned long)txDiag.temt_timeout_count);
 }
 
 extern "C" bool elrs_tx_init(void)

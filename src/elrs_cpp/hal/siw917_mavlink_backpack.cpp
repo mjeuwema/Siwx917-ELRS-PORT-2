@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "common.h"
 #include "config.h"
+#include "siw917_mavlink_backpack.h"
 #include "siw917_mavlink_wifi.h"
 
 #include <stdio.h>
@@ -48,6 +49,21 @@ extern "C" void siw917_mavlink_backpack_set_lua_enabled(bool enabled)
 extern "C" bool siw917_mavlink_backpack_get_lua_enabled(void)
 {
     return luaMavlinkWifiEnabled;
+}
+
+extern "C" bool siw917_mavlink_backpack_prepare_for_update(uint32_t timeout_ms)
+{
+    luaMavlinkWifiEnabled = false;
+    lastBridgeRequested = false;
+    siw917_mavlink_wifi_set_enabled(false);
+
+    if (!siw917_mavlink_wifi_wait_stopped(timeout_ms)) {
+        printf("[MAVWIFI] Update handoff timed out; bridge still owns WiFi\n");
+        return false;
+    }
+
+    printf("[MAVWIFI] Update handoff complete; WiFi transport released\n");
+    return true;
 }
 
 extern "C" void siw917_mavlink_backpack_init(void)

@@ -79,6 +79,8 @@ static volatile uint32_t uplink_tail;
 
 static volatile bool bridge_enabled;
 static volatile bool bridge_running;
+static volatile bool bridge_operation_active;
+static volatile bool bridge_last_stop_ok = true;
 static volatile bool peer_valid;
 static volatile bool peer_announce_pending;
 static volatile bool peer_disconnect_pending;
@@ -287,12 +289,11 @@ static bool start_bridge(void)
   return true;
 }
 
-static void stop_bridge(void)
+static bool stop_bridge(void)
 {
   const int socket_to_close = udp_socket;
 
   /* Prevent socket callbacks from accepting data before AP teardown starts. */
-  bridge_running = false;
   peer_valid = false;
   peer_announce_pending = false;
   peer_disconnect_pending = false;
@@ -309,12 +310,18 @@ static void stop_bridge(void)
   osDelay(10U);
 
   const sl_status_t status = sl_wifi_stop_ap(SL_WIFI_AP_2_4GHZ_INTERFACE);
-  if (status == SL_STATUS_OK || status == SL_STATUS_WIFI_INTERFACE_NOT_UP) {
+  const bool stopped =
+    status == SL_STATUS_OK || status == SL_STATUS_WIFI_INTERFACE_NOT_UP;
+  bridge_running = false;
+  bridge_last_stop_ok = stopped;
+  __DMB();
+  if (stopped) {
     DEBUGOUT("[MAVWIFI] Bridge Off; WiFi AP stopped, NWP retained\n");
   } else {
     DEBUGOUT("[MAVWIFI] WiFi AP stop failed: 0x%lX\n",
              (unsigned long)status);
   }
+  return stopped;
 }
 
 static bool pop_downlink(uint8_t *data, size_t *length)
@@ -379,7 +386,13 @@ static void mavlink_wifi_task(void *argument)
       peer_announce_pending = false;
       reset_queues();
       if (!bridge_enabled && bridge_running) {
-        stop_bridge();
+        bridge_operation_active = true;
+        __DMB();
+        (void)stop_bridge();
+        bridge_operation_active = false;
+        __DMB();
+      } else if (!bridge_enabled) {
+        bridge_last_stop_ok = true;
       } else if (bridge_enabled && bridge_running) {
         DEBUGOUT("[MAVWIFI] Bridge resumed; waiting for a GCS UDP packet\n");
       }
@@ -392,7 +405,12 @@ static void mavlink_wifi_task(void *argument)
     }
 
     if (bridge_enabled && !bridge_running && (int32_t)(now - retry_at) >= 0) {
-      if (!start_bridge()) {
+      bridge_operation_active = true;
+      __DMB();
+      const bool started = start_bridge();
+      bridge_operation_active = false;
+      __DMB();
+      if (!started) {
         retry_at = now + 5000U;
       }
     }
@@ -456,6 +474,9 @@ void siw917_mavlink_wifi_set_enabled(bool enabled)
   bridge_enabled = enabled;
   if (!enabled) {
     peer_valid = false;
+    if (bridge_running || bridge_operation_active) {
+      bridge_last_stop_ok = false;
+    }
   }
   bridge_state_change_pending = true;
   __DMB();
@@ -469,6 +490,24 @@ bool siw917_mavlink_wifi_is_enabled(void)
 bool siw917_mavlink_wifi_is_running(void)
 {
   return bridge_running;
+}
+
+bool siw917_mavlink_wifi_wait_stopped(uint32_t timeout_ms)
+{
+  const uint32_t started_at = osKernelGetTickCount();
+
+  while (1) {
+    __DMB();
+    if (!bridge_enabled && !bridge_running && !bridge_operation_active &&
+        !bridge_state_change_pending && bridge_last_stop_ok) {
+      return true;
+    }
+
+    if ((uint32_t)(osKernelGetTickCount() - started_at) >= timeout_ms) {
+      return false;
+    }
+    osDelay(2U);
+  }
 }
 
 bool siw917_mavlink_wifi_enqueue_downlink(const uint8_t *data, size_t length)

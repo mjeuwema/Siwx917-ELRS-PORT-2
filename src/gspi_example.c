@@ -24,6 +24,7 @@
 #include "elrs_cpp/hal/elrs_task_wakeup.h"
 #if defined(SIW917_ELRS_TARGET_TX)
 #include "crsf_serial.h"
+#include "elrs_cpp/hal/siw917_mavlink_backpack.h"
 #endif
 
 #include "rsi_rom_clks.h"
@@ -1118,6 +1119,20 @@ void elrs_cpp_task(void *argument) {
 
       /* Stop RX before starting WiFi */
       elrs_role_stop();
+
+#if defined(SIW917_ELRS_TARGET_TX)
+      /*
+       * The internal MAVLink bridge and the configuration server share the
+       * SiW917 AP interface. Release the bridge's UDP socket and AP before
+       * handing ownership to HTTP/OTA.
+       */
+      if (!siw917_mavlink_backpack_prepare_for_update(3000U)) {
+        DEBUGOUT("[ELRS] WiFi update aborted: MAVLink bridge handoff failed\n");
+        status_led_set_mode(LED_MODE_DISCONNECTED);
+        elrs_role_start();
+        continue;
+      }
+#endif
 
       /* Start WiFi HTTP server - blocks until reboot/exit */
       wifi_http_test_run();

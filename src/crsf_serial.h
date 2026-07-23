@@ -90,6 +90,19 @@ typedef struct {
     bool rx_armed;
 } crsf_serial_rx_diag_t;
 
+typedef struct {
+    uint32_t tx_count;
+    uint32_t temt_timeout_count;
+    uint32_t backpressure_count;
+    uint32_t queue_full_count;
+    uint32_t queue_error_count;
+    int32_t queue_last_error;
+    uint8_t queue_depth;
+    uint8_t queue_high_water;
+    bool queue_active;
+    bool tx_in_progress;
+} crsf_serial_tx_diag_t;
+
 /**
  * @brief Link statistics for CRSF output
  */
@@ -226,6 +239,11 @@ uint32_t crsf_serial_get_rx_overrun_count(void);
  * @brief Snapshot low-overhead handset RX/DMA diagnostics
  */
 void crsf_serial_get_rx_diag(crsf_serial_rx_diag_t *diag);
+
+/**
+ * @brief Snapshot low-overhead handset TX/DMA diagnostics
+ */
+void crsf_serial_get_tx_diag(crsf_serial_tx_diag_t *diag);
 
 /**
  * @brief Print raw UART RX/TX diagnostic state without consuming buffered bytes

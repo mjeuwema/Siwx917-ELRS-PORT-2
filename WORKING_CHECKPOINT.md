@@ -39,13 +39,13 @@ SIW917_ELRS_EVENT_COUNTERS=OFF
 Canonical build output:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS TX\cmake_gcc\build-tx-clean-port\base\wifi_gspi_merged.rps
+C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\cmake_gcc\build-tx-clean-port\base\wifi_gspi_merged.rps
 ```
 
 Stable local copy:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS TX\firmware\SiW917_ELRS_TX_TwoWire_Checkpoint_9C66E512.rps
+C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\firmware\SiW917_ELRS_TX_TwoWire_Checkpoint_9C66E512.rps
 ```
 
 ```text
@@ -58,7 +58,7 @@ SHA256: 9C66E512B28D6B35DBACA5660C3BBBEE017F95A442F4179EB6BC164D036D0257
 The build uses the local ExpressLRS checkout at:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS TX\upstream_expresslrs_master
+C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\upstream_expresslrs_master
 ```
 
 Base commit:
@@ -71,7 +71,7 @@ The exact four-file upstream working-tree delta is captured by:
 
 ```text
 patches\siw917-tx-upstream-cfa88c0.patch
-SHA256: AC4C341ACA8781DB3A4694234B302A0066A2C1C3F0E3CB7D65FE076B9BE244BF
+SHA256: 5013E2A10408A036B72B9295CAD4F0DC7C4E5FA0F14B455C6D6776AB0B0AD7E9
 Patch ID: 570e0b4d5d4fdde8a2194e017bed3bb3532570bd
 ```
 
@@ -81,8 +81,7 @@ base commit.
 ## Build
 
 ```powershell
-cd "C:\Users\mjeuw\OneDrive\Documents\ELRS TX\cmake_gcc"
-$env:ELRS_UPSTREAM_DIR = "C:\Users\mjeuw\OneDrive\Documents\ELRS TX\upstream_expresslrs_master\src"
+cd "C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\cmake_gcc"
 cmake --workflow --preset tx-clean-port
 ```
 

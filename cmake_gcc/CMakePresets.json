@@ -27,7 +27,7 @@
           "SIW917_ELRS_CRSF_BENCH_2WIRE": "ON",
           "SIW917_ELRS_TX_PC_BENCH": "OFF",
           "SIW917_ELRS_USE_UPSTREAM_TX_MAIN": "ON",
-          "SIW917_ELRS_UPSTREAM_DIR": "$env{ELRS_UPSTREAM_DIR}"
+          "SIW917_ELRS_UPSTREAM_DIR": "${sourceDir}/../upstream_expresslrs_master/src"
         }
       }
     ],

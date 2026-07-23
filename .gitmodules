@@ -1,0 +1,6 @@
+[submodule "third_party/mavlink_c_library_v2"]
+	path = third_party/mavlink_c_library_v2
+	url = https://github.com/mavlink/c_library_v2.git
+[submodule "upstream_expresslrs_master"]
+	path = upstream_expresslrs_master
+	url = https://github.com/ExpressLRS/ExpressLRS.git

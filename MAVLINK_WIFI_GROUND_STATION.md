@@ -10,7 +10,7 @@ a UDP socket.
 Flash the canonical build output:
 
 ```text
-C:\Users\mjeuw\OneDrive\Documents\ELRS TX\cmake_gcc\build-tx-clean-port\base\wifi_gspi_merged.rps
+C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\cmake_gcc\build-tx-clean-port\base\wifi_gspi_merged.rps
 ```
 
 ## Start The Bridge
@@ -90,6 +90,7 @@ rate-limited to once every ten seconds.
 - Disconnecting the last WiFi station clears the learned UDP peer and queued
   data without tearing down the NWP during a live RF session. Reconnect to the
   existing AP and send a packet to establish the peer again.
-- OTA/HTTP integration is intentionally unchanged in this phase. Do not enter
-  OTA configuration mode while the MAVLink bridge is active; coordinated
-  handoff between these two WiFi users is the next WiFi/OTA task.
+- Entering local WiFi configuration/update mode turns the MAVLink bridge Off,
+  waits for its UDP socket and AP teardown to complete, and only then starts
+  the HTTP/OTA server. If the bridge cannot release the AP within three
+  seconds, update mode is aborted and the TX scheduler resumes.
