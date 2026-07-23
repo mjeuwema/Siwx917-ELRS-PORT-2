@@ -1,13 +1,14 @@
 # Working TX Checkpoint
 
-Date: 2026-07-21
+Date: 2026-07-23
 
-Git tag: `checkpoint/tx-lua-atomic-dma-2026-07-21`
+Git tag: `checkpoint/tx-http-ota-2026-07-23`
 
 This checkpoint records the confirmed working SiW917 ExpressLRS transmitter
-state after restoring atomic UART baud-change RX rearming and verifying the
-complete EdgeTX Lua request/reply path. High-volume CRSF protocol diagnostics
-are disabled in the checkpoint firmware.
+state with the EdgeTX Lua request/reply path, MAVLink WiFi bridge, clean
+bridge-to-OTA handoff, streamed HTTP web assets, and TX-specific Web UI
+identity. High-volume CRSF protocol diagnostics are disabled in the checkpoint
+firmware.
 
 ## Firmware Configuration
 
@@ -45,12 +46,12 @@ C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\cmake_gcc\build-tx-clean
 Stable local copy:
 
 ```text
-C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\firmware\SiW917_ELRS_TX_TwoWire_Checkpoint_9C66E512.rps
+C:\Users\mjeuw\SimplicityStudio\TEST\wifi_gspi_tx_clean\firmware\SiW917_ELRS_TX_HTTP_OTA_TX_UI_2026-07-23_A6B85DFC.rps
 ```
 
 ```text
-Size:   363348 bytes
-SHA256: 9C66E512B28D6B35DBACA5660C3BBBEE017F95A442F4179EB6BC164D036D0257
+Size:   378604 bytes
+SHA256: A6B85DFCA3BC2629A5F9294C0FF10A1E09F435B80B5AB13B1C07B6B3FAF1C5E2
 ```
 
 ## Upstream Source Identity
@@ -104,5 +105,10 @@ TX16S pin 5 S.Port    -> disconnected
 - UART baud changes return with RX DMA armed.
 - Handset TX uses a queued DMA path with lossless backpressure.
 - The TX connects to an RX and exchanges RF telemetry.
+- The internal MAVLink WiFi bridge can release the AP cleanly before OTA mode.
+- The Web UI loads its compressed HTML, JavaScript, and CSS assets using the
+  SiWx917 HTTP service's streamed response API.
+- Web UI information identifies the product, Lua device, and module type as TX.
+- The SiWx917 RPS and LR1121 firmware-update endpoints are present.
 - Temporary `[CRSF_UART]` and `[CRSF_LUA]` serial tracing is not compiled into
   this checkpoint firmware.

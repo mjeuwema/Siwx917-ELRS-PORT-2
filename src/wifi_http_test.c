@@ -110,6 +110,7 @@ extern bool interface_is_up[];                     /* Per-interface status array
 
 /* Maximum HTTP headers */
 #define MAX_HTTP_HEADERS         8
+#define WEB_ASSET_HTTP_CHUNK_SIZE 1024U
 
 /*******************************************************************************
  * Base64 Decoding Implementation
@@ -548,10 +549,49 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
       response.headers              = headers;
       response.header_count         = 2;
       response.data                 = (uint8_t *)WEB_ASSETS[i].data;
-      response.current_data_length  = WEB_ASSETS[i].size;
       response.expected_data_length = WEB_ASSETS[i].size;
 
-      return sl_http_server_send_response(handle, &response);
+      /*
+       * The SiWx917 HTTP service allocates one temporary buffer large enough
+       * for the headers plus current_data_length. Keep that first allocation
+       * small, then use the service's documented streaming API for the rest.
+       */
+      uint32_t sent = 0U;
+      response.current_data_length =
+        response.expected_data_length > WEB_ASSET_HTTP_CHUNK_SIZE
+          ? WEB_ASSET_HTTP_CHUNK_SIZE
+          : response.expected_data_length;
+
+      sl_status_t status = sl_http_server_send_response(handle, &response);
+      if (status != SL_STATUS_OK) {
+        DEBUGOUT("[HTTP] Asset response start failed: %s status=0x%lX\n",
+                 path, (unsigned long)status);
+        return status;
+      }
+
+      sent = response.current_data_length;
+      while (sent < response.expected_data_length) {
+        const uint32_t remaining = response.expected_data_length - sent;
+        const uint32_t chunk_length =
+          remaining > WEB_ASSET_HTTP_CHUNK_SIZE
+            ? WEB_ASSET_HTTP_CHUNK_SIZE
+            : remaining;
+
+        status = sl_http_server_write_data(
+          handle,
+          (uint8_t *)&WEB_ASSETS[i].data[sent],
+          chunk_length);
+        if (status != SL_STATUS_OK) {
+          DEBUGOUT("[HTTP] Asset stream failed: %s offset=%lu status=0x%lX\n",
+                   path, (unsigned long)sent, (unsigned long)status);
+          return status;
+        }
+        sent += chunk_length;
+      }
+
+      DEBUGOUT("[HTTP] Asset complete: %s (%lu bytes)\n",
+               path, (unsigned long)sent);
+      return SL_STATUS_OK;
     }
   }
 
