@@ -99,6 +99,8 @@ set(ELRS_CPP_SOURCES
     "${ELRS_CPP_LIB_DIR}/rx-crsf/SiW917RXEndpoint.cpp"
 )
 
+list(APPEND ELRS_CPP_SOURCES "../src/mlrs_ota/mlrs_ota.cpp")
+
 #=============================================================================
 # Main executable
 #=============================================================================
@@ -129,6 +131,7 @@ set(ELRS_UPSTREAM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ExpressLRS/src")
 target_include_directories(wifi_gspi_merged PUBLIC
     # Our SiW917 platform headers (must come FIRST to override upstream)
     "../src"
+    "../src/mlrs_ota"
     "../src/elrs_cpp/hal"
     "../src/elrs_cpp/include"
     "../src/elrs_cpp/lib/CRC"

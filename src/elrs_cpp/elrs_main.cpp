@@ -39,6 +39,7 @@
 #include "telemetry_protocol.h"
 #include "msptypes.h"
 #include "siw917_elrs_timing.h"
+#include "mlrs_ota.h"
 
 // Standard includes
 #include <new>
@@ -4589,6 +4590,9 @@ static void DataUlReceiveComplete() {
 #endif
 
   switch (DataUlBuffer[0]) {
+  case MSP_ELRS_SET_AIR_PROTOCOL:
+    mlrs_ota_handle_msp(DataUlBuffer, 4);
+    break;
   case MSP_ELRS_SET_RX_WIFI_MODE:
     elrs_cpp_request_wifi_mode();
     break;
@@ -5005,6 +5009,7 @@ bool elrs_init(void) {
   }
 
   DBGLN("ELRS RX init complete");
+  mlrs_ota_on_elrs_ready();
   return true;
 }
 
@@ -5012,6 +5017,11 @@ void elrs_loop(void) {
   // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
+  mlrs_ota_loop();
+  if (mlrs_ota_is_active()) {
+    hwTimer::service();
+    return;
+  }
   ServiceDeferredTelemetryTx();
   maybeReportStaleTelemetryRx();
   PrepareTelemetryForNextTock();

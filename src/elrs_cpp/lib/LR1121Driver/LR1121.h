@@ -97,8 +97,8 @@ private:
   lr11xx_RadioOperatingModes_t fallBackMode;
   BufferCodec *codec;
 
-  WORD_ALIGNED_ATTR uint8_t rx_buf[32] = {};
-  WORD_ALIGNED_ATTR uint8_t rx2_buf[32] = {};
+  WORD_ALIGNED_ATTR uint8_t rx_buf[128] = {};
+  WORD_ALIGNED_ATTR uint8_t rx2_buf[128] = {};
 
   bool CheckVersion(SX12XX_Radio_Number_t radioNumber);
 

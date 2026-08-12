@@ -915,7 +915,7 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
     }
   }
 
-  WORD_ALIGNED_ATTR uint8_t outBuffer[32];
+  WORD_ALIGNED_ATTR uint8_t outBuffer[128];
   const uint8_t length =
       PayloadLength + 3; // 3 extra zero bytes for the 24-bit timeout
   codec->encode(outBuffer, data, PayloadLength);
@@ -923,7 +923,7 @@ void SIW917_ELRS_RAMFUNC_ATTR ICACHE_RAM_ATTR LR1121Driver::TXnb(
   outBuffer[PayloadLength + 1] = 0;
   outBuffer[PayloadLength + 2] = 0;
   if (sendGeminiBuffer) {
-    WORD_ALIGNED_ATTR uint8_t outBufferGemini[32];
+    WORD_ALIGNED_ATTR uint8_t outBufferGemini[128];
     codec->encode(outBufferGemini, dataGemini, PayloadLength);
     outBufferGemini[PayloadLength] = 0;
     outBufferGemini[PayloadLength + 1] = 0;
