@@ -6,6 +6,7 @@
 #include "TXOTAConnector.h"
 #include "../elrs_main.h"
 #include "siw917_mavlink_backpack.h"
+#include "mlrs_ota.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -142,6 +143,7 @@ extern "C" bool elrs_tx_init(void)
     // persistence. The platform wrapper only enters the upstream lifecycle.
     setup();
     siw917_mavlink_backpack_init();
+    mlrs_ota_on_elrs_ready();
     RXtimerState = tim_disconnected;
     siw917_upstream_tx_initialized =
         connectionState != radioFailed && connectionState != hardwareUndefined;
@@ -172,6 +174,7 @@ extern "C" void elrs_tx_loop(void)
 
     siw917_lr1121_handle_deferred_isr();
     loop();
+    mlrs_ota_loop();
     siw917_mavlink_backpack_service();
     siw917_lr1121_handle_deferred_isr();
     siw917_report_link_transition();

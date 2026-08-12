@@ -36,7 +36,12 @@ public:
   }; // set Idle mode used when switching from RX to TX
   void Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t freq,
               uint8_t PreambleLength, bool InvertIQ, uint8_t PayloadLength,
-              bool setFSKModulation, uint8_t fskSyncWord1, uint8_t fskSyncWord2,
+#if defined(SIW917_ELRS_TARGET_TX)
+              RadioBandMod::Combined modulation,
+#else
+              bool setFSKModulation,
+#endif
+              uint8_t fskSyncWord1, uint8_t fskSyncWord2,
               SX12XX_Radio_Number_t radioNumber = SX12XX_Radio_All);
   void SetFrequencyReg(uint32_t freq, SX12XX_Radio_Number_t radioNumber,
                        bool doRx = false, uint32_t rxTime = 0);

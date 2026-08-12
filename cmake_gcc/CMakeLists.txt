@@ -374,8 +374,74 @@ extern bool BackpackTelemReadyToSend;")
   if (OPT_USE_TX_BACKPACK)
   {")
 
+    set(old_mlrs_include
+"#include \"msptypes.h\"")
+    set(new_mlrs_include
+"#include \"msptypes.h\"
+#include \"mlrs_ota.h\"")
+    set(old_mlrs_parameter
+"static selectionParameter luaAirRate = {
+    {\"Packet Rate\", CRSF_TEXT_SELECTION},
+    0, // value
+    luastrPacketRates,
+    STR_EMPTYSPACE
+};")
+    set(new_mlrs_parameter
+"${old_mlrs_parameter}
+
+static constexpr char luastrAirProtocol[] = \"ELRS;mLRS\";
+static constexpr char luastrMlrsBand[] = \"915MHz;2.4GHz\";
+static selectionParameter luaAirProtocol = {
+    {\"Air Protocol\", CRSF_TEXT_SELECTION},
+    0, // value
+    luastrAirProtocol,
+    STR_EMPTYSPACE
+};
+static selectionParameter luaMlrsRate = {
+    {\"mLRS Rate\", CRSF_TEXT_SELECTION},
+    0, // value
+    MLRS_OTA_RATE_OPTIONS_915,
+    STR_EMPTYSPACE
+};
+static selectionParameter luaMlrsBand = {
+    {\"mLRS Band\", CRSF_TEXT_SELECTION},
+    0, // value
+    luastrMlrsBand,
+    STR_EMPTYSPACE
+};")
+    set(old_mlrs_registration
+"    registerParameter(&luaAirRate, [this](propertiesCommon *item, uint8_t arg) {
+      uint8_t selectedRate = RATE_MAX - 1 - arg;
+      SetPacketRateIdx(selectedRate, true);
+    });")
+    set(new_mlrs_registration
+"${old_mlrs_registration}
+    registerParameter(&luaAirProtocol, [this](propertiesCommon *item, uint8_t arg) {
+      (void)item;
+      mlrs_ota_set_protocol(arg);
+      updateParameters();
+    });
+    registerParameter(&luaMlrsRate, [this](propertiesCommon *item, uint8_t arg) {
+      (void)item;
+      mlrs_ota_set_rate(arg);
+      updateParameters();
+    });
+    registerParameter(&luaMlrsBand, [this](propertiesCommon *item, uint8_t arg) {
+      (void)item;
+      mlrs_ota_set_band(arg);
+      updateParameters();
+    });")
+    set(old_mlrs_state
+"  setTextSelectionValue(&luaAirRate, RATE_MAX - 1 - currentRate);")
+    set(new_mlrs_state
+"  setTextSelectionValue(&luaAirRate, RATE_MAX - 1 - currentRate);
+  luaMlrsRate.options = mlrs_ota_rate_options();
+  setTextSelectionValue(&luaAirProtocol, mlrs_ota_get_protocol());
+  setTextSelectionValue(&luaMlrsRate, mlrs_ota_get_rate());
+  setTextSelectionValue(&luaMlrsBand, mlrs_ota_get_band());")
+
     file(READ "${input_file}" source_text)
-    foreach(patch_name IN ITEMS parameter declarations registration state_update)
+    foreach(patch_name IN ITEMS parameter declarations registration state_update mlrs_include mlrs_parameter mlrs_registration mlrs_state)
         set(old_text "${old_${patch_name}}")
         string(FIND "${source_text}" "${old_text}" patch_offset)
         if(patch_offset EQUAL -1)
@@ -475,6 +541,7 @@ set(ELRS_PLATFORM_SOURCES
     "../src/elrs_cpp/hal/LR1121_hal.cpp"
     "../src/elrs_cpp/hal/elrs_task_wakeup.cpp"
     "../src/siw917_mavlink_wifi.c"
+    "../src/mlrs_ota/mlrs_ota.cpp"
     ${ELRS_MAIN_SOURCE}
     ${ELRS_RXTX_COMMON_SOURCE}
     ${ELRS_COMMON_SOURCE}
@@ -602,6 +669,7 @@ endif()
 target_include_directories(wifi_gspi_merged PUBLIC
     # Our SiW917 platform headers (must come FIRST to override upstream)
     "../src"
+    "../src/mlrs_ota"
     "../src/elrs_cpp/hal"
     "../src/elrs_cpp/include"
     "../src/elrs_cpp/lib/CRC"

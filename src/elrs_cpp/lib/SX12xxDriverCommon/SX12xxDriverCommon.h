@@ -12,6 +12,27 @@ enum
     SX12XX_Radio_All  = 0b00000011      // bit mask for both radios
 };
 
+namespace RadioBandMod {
+    static constexpr uint8_t MOD_SHIFT = 4;
+    static constexpr uint8_t BAND_MASK = (1 << MOD_SHIFT) - 1;
+    static constexpr uint8_t MOD_MASK  = ~BAND_MASK;
+
+    enum Band : uint8_t { B900 = 0, B2G4 = 1, BDUAL = 2 };
+    enum Modulation : uint8_t { LORA = 0, FLRC = 1, GFSK = 2 };
+
+    static constexpr uint8_t pack(Modulation m, Band b) {
+        return (static_cast<uint8_t>(m) << MOD_SHIFT) | static_cast<uint8_t>(b);
+    }
+
+    enum Combined : uint8_t {
+        LORA_900  = pack(LORA, B900),
+        LORA_2G4  = pack(LORA, B2G4),
+        LORA_DUAL = pack(LORA, BDUAL),
+        GFSK_900  = pack(GFSK, B900),
+        GFSK_2G4  = pack(GFSK, B2G4),
+    };
+}
+
 class SX12xxDriverCommon
 {
 public:
