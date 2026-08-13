@@ -1,8 +1,8 @@
 -- TNS|ELRS+mLRS|TNE
 ---- #########################################################################
 ---- # Combined ExpressLRS + native mLRS configurator                        #
----- # ELRS CRSF fields (Air Protocol, packet rate, power, ...) stay here.   #
----- # Open [mLRS Setup] after switching Air Protocol to mLRS.               #
+---- # TX settings stay on the ELRS page (rate, band, power, Air Protocol).  #
+---- # [mLRS Setup] is Edit Rx + Save over the mLRS air link.                #
 ---- # Copy to /SCRIPTS/TOOLS/ELRS-mLRS.lua                                  #
 ---- #########################################################################
 ---- # ExpressLRS portion: OpenTX / ExpressLRS, GPLv2                        #
@@ -1172,10 +1172,6 @@ function MB.build_rows()
   if not MB.complete or MB.plist == nil then return end
   local prefix = (MB.page == 1) and "Tx" or "Rx"
   if MB.page == 0 then
-    MB.rows[#MB.rows+1] = { kind = "p", pidx = 0, name = "Bind Phrase" }
-    MB.rows[#MB.rows+1] = { kind = "p", pidx = 1, name = "Mode" }
-    MB.rows[#MB.rows+1] = { kind = "p", pidx = 2, name = "RF Band" }
-    MB.rows[#MB.rows+1] = { kind = "cmd", name = "Edit Tx", act = "tx" }
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Edit Rx", act = "rx" }
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Save", act = "save" }
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Reload", act = "reload" }
@@ -1425,7 +1421,7 @@ function MB.draw()
     lcd.drawFilledRectangle(0, 0, LCD_W, th, CUSTOM_COLOR)
     lcd.setColor(CUSTOM_COLOR, lcd.RGB(0, 0, 0))
     lcd.drawText(4, 4, "mLRS Setup", CUSTOM_COLOR + BOLD)
-    local sub = (MB.page == 1 and "Edit Tx") or (MB.page == 2 and "Edit Rx") or "Main"
+    local sub = (MB.page == 2 and "Edit Rx") or "Main"
     lcd.drawText(LCD_W-4, 4, sub, CUSTOM_COLOR + RIGHT)
     drawTlmStrip(th, hh)
     y0 = th + hh + 4
@@ -1511,8 +1507,7 @@ function MB.on_enter()
   local row = MB.rows[MB.line]
   if row == nil then return end
   if row.kind == "cmd" then
-    if row.act == "tx" then MB.page = 1; MB.line = 1; MB.build_rows()
-    elseif row.act == "rx" then MB.page = 2; MB.line = 1; MB.build_rows()
+    if row.act == "rx" then MB.page = 2; MB.line = 1; MB.build_rows()
     elseif row.act == "save" then
       MB.push(MBCMD.PARAM_STORE, {})
       MB.save_t = getTime()

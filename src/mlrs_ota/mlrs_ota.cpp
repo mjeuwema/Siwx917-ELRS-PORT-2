@@ -29,6 +29,12 @@ extern expresslrs_mod_settings_s *ExpressLRS_currAirRate_Modparams;
 #include "CRSFRouter.h"
 #include "TXOTAConnector.h"
 #include "mlrs_mbridge.h"
+#ifndef MinPower
+#define MinPower PWR_10mW
+#define MaxPower PWR_100mW
+#endif
+#include "POWERMGNT.h"
+#include "config.h"
 #include "stubborn_sender.h"
 extern StubbornSender DataUlSender;
 extern CRSFRouter crsfRouter;
@@ -81,7 +87,7 @@ extern uint8_t uplinkLQ;
 #define FRAME_TX_SEAL_LEN (FRAME_TX_RCDATA1_LEN + FRAME_TX_RCDATA2_LEN + FRAME_TX_PAYLOAD_LEN)
 #define FRAME_GCM_TAG_LEN 8
 #define MLRS_TLM_BUSY_TIMEOUT_MS 40U
-#define MLRS_OVERLAY_ID "20260813N"
+#define MLRS_OVERLAY_ID "20260813O"
 #define MLRS_MUX_MAGIC 0x5A
 #define MLRS_GCM_CTR_BOOT_GAP 1024U
 #define MLRS_GCM_CTR_RESERVE (1U << 20)
@@ -496,6 +502,195 @@ static uint8_t next_scan_rate(uint8_t rate) {
 static const mlrs_rate_cfg_t *current_rate_cfg() {
   return &kRates[sanitize_band(g_band)][sanitize_rate(g_rate)];
 }
+
+#if MLRS_OTA_IS_TX
+#define MLRS_DYN_LQ_BOOST_DIFF 20
+#define MLRS_DYN_LQ_BOOST_MIN 50
+#define MLRS_DYN_LQ_THRESH_UP 85
+#define MLRS_DYN_LQ_THRESH_DN 95
+#define MLRS_DYN_RSSI_CNT 5
+#define MLRS_DYN_RSSI_THRESH_UP 15
+#define MLRS_DYN_RSSI_THRESH_DN 21
+
+static uint8_t g_dyn_lq_avg = 100;
+static int16_t g_dyn_rssi_acc = 0;
+static uint8_t g_dyn_rssi_n = 0;
+static uint32_t g_dyn_last_tlm_ms = 0;
+static uint8_t g_dyn_rate = 0xFF;
+
+static int8_t rssi_i8_from_u7(uint8_t u7) {
+  if (u7 == 0) {
+    return -1;
+  }
+  return (int8_t)(-(int)u7);
+}
+
+static int8_t mlrs_rx_sensitivity() {
+  const mlrs_rate_cfg_t *rate = current_rate_cfg();
+  if (sanitize_band(g_band) == MLRS_BAND_24) {
+    if (rate->is_fsk) {
+      return -105;
+    }
+    if (sanitize_rate(g_rate) == 0) {
+      return -105;
+    }
+    if (sanitize_rate(g_rate) == 1) {
+      return -108;
+    }
+    return -112;
+  }
+  if (rate->is_fsk) {
+    return -105;
+  }
+  if (sanitize_rate(g_rate) == 0) {
+    return -112;
+  }
+  return -117;
+}
+
+extern bool isArmed;
+
+static void mlrs_dynpower_set_config() {
+  POWERMGNT::setPower((PowerLevels_e)config.GetPower());
+}
+
+static void mlrs_dynpower_reset() {
+  g_dyn_lq_avg = 100;
+  g_dyn_rssi_acc = 0;
+  g_dyn_rssi_n = 0;
+  g_dyn_last_tlm_ms = 0;
+  g_dyn_rate = 0xFF;
+}
+
+static void mlrs_dynpower_begin() {
+  mlrs_dynpower_reset();
+  if (config.GetDynamicPower() && !isArmed) {
+    POWERMGNT::setPower(MinPower);
+  } else {
+    mlrs_dynpower_set_config();
+  }
+}
+
+static void mlrs_dynpower_end() { mlrs_dynpower_set_config(); }
+
+static void mlrs_dynpower_on_event(bool tlm_ok, uint8_t rx_lq, int8_t rx_rssi) {
+  const PowerLevels_e before = POWERMGNT::currPower();
+  const char *why = nullptr;
+
+  if (!config.GetDynamicPower()) {
+    if (tlm_ok && rx_rssi <= -20 && before < (PowerLevels_e)config.GetPower()) {
+      mlrs_dynpower_set_config();
+      why = "restore";
+    }
+    if (why != nullptr && POWERMGNT::currPower() != before) {
+      printf("[mLRS] dynpower %s -> %d dBm\n", why,
+             (int)POWERMGNT::getPowerIndBm());
+    }
+    return;
+  }
+
+  const uint8_t boostChannel = config.GetBoostChannel();
+  if ((connectionState == disconnected && isArmed) ||
+      (boostChannel != 0 &&
+       CRSF_to_BIT(ChannelData[AUX9 + boostChannel - 1]) == 0)) {
+    mlrs_dynpower_set_config();
+    if (POWERMGNT::currPower() != before) {
+      printf("[mLRS] dynpower boost -> %d dBm\n",
+             (int)POWERMGNT::getPowerIndBm());
+    }
+    return;
+  }
+
+  if (!isArmed) {
+    if (before != MinPower) {
+      POWERMGNT::setPower(MinPower);
+      printf("[mLRS] dynpower disarm -> %d dBm\n",
+             (int)POWERMGNT::getPowerIndBm());
+    }
+    return;
+  }
+
+  if (!tlm_ok) {
+    if (before < (PowerLevels_e)config.GetPower() && g_dyn_last_tlm_ms != 0) {
+      const uint32_t interval_ms = current_rate_cfg()->interval_us / 1000U;
+      if ((millis() - g_dyn_last_tlm_ms) > (interval_ms + 8U)) {
+        POWERMGNT::incPower();
+        if (POWERMGNT::currPower() != before) {
+          printf("[mLRS] dynpower tlm-miss -> %d dBm\n",
+                 (int)POWERMGNT::getPowerIndBm());
+        }
+      }
+    }
+    return;
+  }
+
+  g_dyn_last_tlm_ms = millis();
+  if (rx_rssi >= -5) {
+    POWERMGNT::decPower();
+    if (POWERMGNT::currPower() != before) {
+      printf("[mLRS] dynpower overload -> %d dBm\n",
+             (int)POWERMGNT::getPowerIndBm());
+    }
+  }
+
+  if (g_dyn_rate != sanitize_rate(g_rate)) {
+    g_dyn_rate = sanitize_rate(g_rate);
+    g_dyn_lq_avg = rx_lq;
+    g_dyn_rssi_n = 0;
+    g_dyn_rssi_acc = 0;
+  }
+
+  const uint8_t lq_avg = g_dyn_lq_avg;
+  const int32_t lq_diff = (int32_t)lq_avg - (int32_t)rx_lq;
+  g_dyn_lq_avg = (uint8_t)(((uint16_t)g_dyn_lq_avg * 7U + rx_lq) / 8U);
+  if (lq_diff >= MLRS_DYN_LQ_BOOST_DIFF || rx_lq <= MLRS_DYN_LQ_BOOST_MIN) {
+    mlrs_dynpower_set_config();
+    if (POWERMGNT::currPower() != before) {
+      printf("[mLRS] dynpower lq-boost lq=%u -> %d dBm\n", (unsigned)rx_lq,
+             (int)POWERMGNT::getPowerIndBm());
+    }
+    return;
+  }
+
+  const uint8_t configPower = (uint8_t)config.GetPower();
+  const uint8_t currPower = (uint8_t)POWERMGNT::currPower();
+  uint8_t headroom =
+      (configPower > currPower) ? (uint8_t)(configPower - currPower) : 0;
+  const PowerLevels_e start = POWERMGNT::currPower();
+  const int8_t sens = mlrs_rx_sensitivity();
+  g_dyn_rssi_acc = (int16_t)(g_dyn_rssi_acc + rx_rssi);
+  ++g_dyn_rssi_n;
+  if (g_dyn_rssi_n >= MLRS_DYN_RSSI_CNT) {
+    const int8_t avg =
+        (int8_t)(g_dyn_rssi_acc / (int16_t)g_dyn_rssi_n);
+    g_dyn_rssi_acc = 0;
+    g_dyn_rssi_n = 0;
+    if ((avg < (int8_t)(sens + MLRS_DYN_RSSI_THRESH_UP)) && headroom > 0) {
+      POWERMGNT::incPower();
+      why = "rssi-up";
+    } else if (avg > (int8_t)(sens + MLRS_DYN_RSSI_THRESH_DN) &&
+               lq_avg >= MLRS_DYN_LQ_THRESH_DN) {
+      POWERMGNT::decPower();
+      why = "rssi-dn";
+    }
+  }
+
+  headroom = ((uint8_t)config.GetPower() > (uint8_t)POWERMGNT::currPower())
+                 ? (uint8_t)((uint8_t)config.GetPower() -
+                             (uint8_t)POWERMGNT::currPower())
+                 : 0;
+  if (headroom > 0 && start == POWERMGNT::currPower() &&
+      rx_lq <= MLRS_DYN_LQ_THRESH_UP) {
+    POWERMGNT::incPower();
+    why = "lq-up";
+  }
+  if (POWERMGNT::currPower() != before) {
+    printf("[mLRS] dynpower %s rssi=%d lq=%u -> %d dBm\n",
+           why != nullptr ? why : "adj", (int)rx_rssi, (unsigned)rx_lq,
+           (int)POWERMGNT::getPowerIndBm());
+  }
+}
+#endif
 
 static bool tight_slot() {
   return current_rate_cfg()->interval_us <= 20000U;
@@ -1014,6 +1209,9 @@ static void note_missed_rx() {
     --g_valid_window;
   }
   g_lq = (uint8_t)((g_valid_window > 100) ? 100 : g_valid_window);
+#if MLRS_OTA_IS_TX
+  mlrs_dynpower_on_event(false, g_lq, 0);
+#endif
   /* Keep hopping. Resetting hop/follow here desyncs 50 Hz FSK after a
    * short downlink gap and causes connect/disconnect flaps. */
   if (g_connected && (millis() - g_last_rx_ms) > MLRS_LOST_MS) {
@@ -1147,6 +1345,8 @@ static void mlrs_tx_process_downlink() {
   }
   ++g_rx_ok;
   note_valid_rx();
+  mlrs_dynpower_on_event(true, (uint8_t)g_rx_frame.status.LQ_rc,
+                         rssi_i8_from_u7((uint8_t)g_rx_frame.status.rssi_u7));
   if (g_rx_frame.status.payload_len > 0) {
     const uint8_t *p = g_rx_frame.payload;
     uint8_t len = (uint8_t)g_rx_frame.status.payload_len;
@@ -1669,6 +1869,7 @@ static void start_mlrs() {
   g_active = true;
   g_protocol = ELRS_AIR_PROTOCOL_MLRS;
 #if MLRS_OTA_IS_TX
+  mlrs_dynpower_begin();
   /* Keep the last ELRS RQly during the first grace window. If no mLRS
    * downlink arrives, siw917_tx_note_mlrs_link_lost() sends LQ=0. */
   siw917_tx_publish_mlrs_linkstats();
@@ -1718,6 +1919,7 @@ static void stop_mlrs() {
   }
   restore_elrs_radio();
 #if MLRS_OTA_IS_TX
+  mlrs_dynpower_end();
   FHSSsetCurrIndex(0);
   OtaNonce = 0;
 #if defined(SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
@@ -2101,8 +2303,13 @@ extern "C" void mlrs_ota_loop(void) {
   }
   if (g_active && (millis() - g_last_hb_ms) > 2000) {
     g_last_hb_ms = millis();
+#if MLRS_OTA_IS_TX
+    const int pwr_dbm = POWERMGNT::getPowerIndBm();
+#else
+    const int pwr_dbm = 0;
+#endif
     printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxcrc=%u "
-           "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u\n",
+           "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u pwr=%d\n",
            (unsigned)g_lq, (unsigned)g_connected, (unsigned)g_tx_sent,
            (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_rx_junk,
            (unsigned)g_last_rx_fail,
@@ -2110,7 +2317,7 @@ extern "C" void mlrs_ota_loop(void) {
            kRates[advertised_band()][advertised_rate()].name,
            (unsigned long)fhss_curr(), (unsigned)g_fhss_i,
            (int)(int8_t)linkStats.uplink_RSSI_1,
-           (unsigned)linkStats.uplink_Link_quality);
+           (unsigned)linkStats.uplink_Link_quality, pwr_dbm);
   }
   flush_mlrs_config();
 }

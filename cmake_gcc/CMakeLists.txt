@@ -391,6 +391,21 @@ static void UpdateConnectDisconnectStatus()
     string(REPLACE "${old_pump_sender}" "${new_pump_sender}"
         source_text "${source_text}")
 
+    set(old_dynpower_update
+"  DynamicPower_Update(now);")
+    set(new_dynpower_update
+"  if (!mlrs_ota_is_active()) {
+    DynamicPower_Update(now);
+  }")
+    string(FIND "${source_text}" "${old_dynpower_update}" dynpower_offset)
+    if(dynpower_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX mLRS DynamicPower_Update patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_dynpower_update}" "${new_dynpower_update}"
+        source_text "${source_text}")
+
     set(old_linkstats_send
 "static void checkSendLinkStatsToHandset(uint32_t now)
 {
