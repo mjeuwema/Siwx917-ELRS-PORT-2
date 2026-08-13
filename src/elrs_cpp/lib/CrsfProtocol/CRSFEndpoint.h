@@ -32,6 +32,7 @@ protected:
                            bool isElrs = false);
   void sendCommandResponse(commandParameter *cmd, commandStep_e step,
                            const char *message);
+  void sendAllParameters();
 
   static void setTextSelectionValue(selectionParameter *parameter,
                                     uint8_t newValue) {

@@ -15,6 +15,8 @@ extern "C" {
 #define ELRS_RESERVED_AIR_PROTOCOL_OFFSET 26
 #define ELRS_RESERVED_MLRS_RATE_OFFSET 25
 #define ELRS_RESERVED_MLRS_BAND_OFFSET 24
+#define ELRS_RESERVED_MLRS_GCM_SEND_OFFSET 16
+#define ELRS_RESERVED_MLRS_GCM_RECV_OFFSET 20
 
 #define MLRS_BAND_915 0
 #define MLRS_BAND_24 1
@@ -27,9 +29,12 @@ extern "C" {
 #define MLRS_OTA_RATE_OPTIONS_915 "31Hz;19Hz;FSK50"
 #define MLRS_OTA_RATE_OPTIONS_24 "50Hz;31Hz;19Hz"
 #define MLRS_OTA_RATE_OPTIONS MLRS_OTA_RATE_OPTIONS_915
+#define MLRS_AIR_MBRIDGE 0xA0
+#define MLRS_AIR_RX_STATE 0x20
 
 bool mlrs_ota_is_active(void);
 bool mlrs_ota_is_connected(void);
+bool mlrs_ota_tlm_busy(void);
 bool mlrs_ota_take_elrs_first_sync(void);
 uint8_t mlrs_ota_get_protocol(void);
 bool mlrs_ota_set_protocol(uint8_t protocol);

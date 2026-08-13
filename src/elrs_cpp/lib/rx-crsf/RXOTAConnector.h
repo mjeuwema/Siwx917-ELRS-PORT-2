@@ -3,7 +3,7 @@
 #include "CRSFConnector.h"
 #include "FIFO.h"
 
-#define TELEMETRY_FIFO_SIZE 512
+#define TELEMETRY_FIFO_SIZE 2048
 using TelemetryFifo = FIFO<TELEMETRY_FIFO_SIZE>;
 
 class RXOTAConnector : public CRSFConnector {

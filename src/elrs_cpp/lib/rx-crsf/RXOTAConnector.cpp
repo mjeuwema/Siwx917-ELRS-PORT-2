@@ -25,13 +25,16 @@ static action_e compareQueuedMessage(const crsf_header_t *newMessage,
                                      uint16_t queuePosition) {
   const auto frameType = (crsf_frame_type_e)newMessage->type;
 
-  if (frameType == CRSF_FRAMETYPE_DEVICE_INFO ||
-      frameType == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY) {
+  if (frameType == CRSF_FRAMETYPE_DEVICE_INFO) {
     const auto *ext = (const crsf_ext_header_t *)newMessage;
     if (payloads[queuePosition + 3] == ext->dest_addr &&
         payloads[queuePosition + 4] == ext->orig_addr) {
       return ACTION_OVERWRITE;
     }
+    return ACTION_NEXT;
+  }
+
+  if (frameType == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY) {
     return ACTION_NEXT;
   }
 

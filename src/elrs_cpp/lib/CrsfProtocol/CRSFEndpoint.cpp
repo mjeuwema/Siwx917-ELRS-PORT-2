@@ -219,6 +219,22 @@ void CRSFEndpoint::sendCommandResponse(commandParameter *cmd,
   pushResponseChunk(cmd, false);
 }
 
+void CRSFEndpoint::sendAllParameters() {
+  for (uint8_t i = 1; i <= lastParameter && i < MAX_CRSF_PARAMETERS; ++i) {
+    if (paramDefinitions[i] == nullptr) {
+      continue;
+    }
+    uint8_t chunk = 0;
+    uint8_t remain = 0;
+    do {
+      remain = sendParameter(requestOrigin, false,
+                             CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY, chunk,
+                             paramDefinitions[i]);
+      ++chunk;
+    } while (remain > 0 && chunk < 32);
+  }
+}
+
 void CRSFEndpoint::registerParameter(void *definition,
                                      const parameterHandlerCallback &callback,
                                      uint8_t parent) {
@@ -247,6 +263,7 @@ void CRSFEndpoint::parameterUpdateReq(crsf_addr_e origin, bool isElrs,
 #endif
     devicePingCalled();
     sendDeviceInformationPacket();
+    sendAllParameters();
     return;
   }
 

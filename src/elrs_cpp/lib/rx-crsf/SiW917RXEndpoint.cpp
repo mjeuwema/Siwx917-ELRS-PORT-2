@@ -341,9 +341,17 @@ void SiW917RXEndpoint::handleMessage(const crsf_header_t *message) {
 #endif
       return;
     }
-    updateParameters();
-    parameterUpdateReq(extMessage->orig_addr, false, extMessage->type,
-                       payload[0], (void *)(payload + 1));
+    if (message->type == CRSF_FRAMETYPE_PARAMETER_WRITE) {
+      parameterUpdateReq(extMessage->orig_addr, false, extMessage->type,
+                         payload[0], (void *)(payload + 1));
+      /* Refresh after the write callback so Lua read-back sees the new
+       * values. Doing this first restored BLE RemoteID to Off. */
+      updateParameters();
+      sendParameterUpdate(payload[0]);
+    } else {
+      parameterUpdateReq(extMessage->orig_addr, false, extMessage->type,
+                         payload[0], (void *)(payload + 1));
+    }
   }
 }
 
@@ -431,6 +439,7 @@ void SiW917RXEndpoint::registerParameters() {
       const bool enabled = arg != 0;
       elrs_config_set_ble_remote_id(enabled);
       ble_remote_id_service_set_enabled(enabled);
+      setTextSelectionValue(&luaBleRemoteId, enabled ? 1 : 0);
 #if RX_EP_EVENT_LOG
       logParameterWrite("BLE RemoteID", enabled ? 1 : 0);
 #endif

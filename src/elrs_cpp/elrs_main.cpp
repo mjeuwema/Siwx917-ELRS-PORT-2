@@ -4771,6 +4771,9 @@ static void sendMavlinkRcOverride() {
 }
 
 static void serviceMlrsHostBridge(unsigned long now) {
+  if (mlrs_ota_tlm_busy()) {
+    return;
+  }
   if (updateActiveSerialProtocol() ||
       appliedSerialProtocol != ELRS_SERIAL_MAVLINK) {
     applyConfiguredSerialProtocol();
@@ -4778,7 +4781,6 @@ static void serviceMlrsHostBridge(unsigned long now) {
   if (dataUlReady) {
     DataUlReceiveComplete();
   }
-
   updateSerialRxState();
   crsfReceiver.processPending(!otaConnector.IsEmpty());
 
@@ -5130,6 +5132,18 @@ void elrs_loop(void) {
     hwTimer::service();
     status_led_update();
     bind_button_poll();
+    /* Finish downlink TX (and hop back to RX) before Lua/CRSF/UART. Those
+     * handlers were blocking TXdone past the watchdog and dropping Lua
+     * replies, which made the handset retry the whole dump. */
+    if (mlrs_ota_tlm_busy()) {
+      const uint32_t t0 = millis();
+      while (mlrs_ota_tlm_busy() &&
+             (int32_t)(millis() - t0) < 20) {
+        LR1121Hal::handleDeferredISR();
+      }
+    }
+    LR1121Hal::handleDeferredISR();
+    mlrs_ota_loop();
     serviceMlrsHostBridge(millis());
     return;
   }
