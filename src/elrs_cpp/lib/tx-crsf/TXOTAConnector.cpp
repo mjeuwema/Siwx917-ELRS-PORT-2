@@ -53,21 +53,26 @@ void TXOTAConnector::pumpSender() {
 
 bool TXOTAConnector::takeQueuedPayload(uint8_t *out, uint8_t *len,
                                        uint8_t maxLen) {
-  if (out == nullptr || len == nullptr || currentTransmissionLength == 0U) {
+  if (out == nullptr || len == nullptr) {
     if (len != nullptr) {
       *len = 0;
     }
     return false;
   }
-  if (currentTransmissionLength > maxLen) {
-    *len = 0;
-    return false;
+
+  while (currentTransmissionLength > 0U) {
+    if (currentTransmissionLength <= maxLen) {
+      memcpy(out, currentTransmissionBuffer, currentTransmissionLength);
+      *len = currentTransmissionLength;
+      unlockMessage();
+      return true;
+    }
+    /* Oversized CRSF (Lua param dump) must not wedge the queue. */
+    unlockMessage();
   }
 
-  memcpy(out, currentTransmissionBuffer, currentTransmissionLength);
-  *len = currentTransmissionLength;
-  unlockMessage();
-  return true;
+  *len = 0;
+  return false;
 }
 
 void TXOTAConnector::resetOutputQueue() {

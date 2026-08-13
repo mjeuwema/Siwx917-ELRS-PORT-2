@@ -731,6 +731,7 @@ set(ELRS_PLATFORM_SOURCES
     "../src/elrs_cpp/hal/elrs_task_wakeup.cpp"
     "../src/siw917_mavlink_wifi.c"
     "../src/mlrs_ota/mlrs_ota.cpp"
+    "../src/mlrs_ota/mlrs_aes_gcm.cpp"
     ${ELRS_MAIN_SOURCE}
     ${ELRS_RXTX_COMMON_SOURCE}
     ${ELRS_COMMON_SOURCE}
@@ -740,6 +741,10 @@ set(ELRS_PLATFORM_SOURCES
     # Hardware timer test suite
     "../src/hw_timer_test.c"
 )
+
+if(SIW917_ELRS_TARGET_TX)
+    list(APPEND ELRS_PLATFORM_SOURCES "../src/mlrs_ota/mlrs_mbridge.cpp")
+endif()
 
 # ELRS C++ library sources from our elrs_cpp folder.
 # The upstream TX canary replaces TX scheduler/device sources with official
@@ -908,6 +913,7 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
         "${ELRS_DEVICE_SOURCE}"
         ${ELRS_TX_UPSTREAM_EXTRA_SOURCES}
         ${ELRS_CPP_SOURCES}
+        "../src/mlrs_ota/mlrs_mbridge.cpp"
         APPEND PROPERTY COMPILE_OPTIONS ${ELRS_UPSTREAM_SOURCE_INCLUDE_OPTIONS}
     )
     set_property(SOURCE
