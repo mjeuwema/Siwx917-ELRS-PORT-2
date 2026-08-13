@@ -13,6 +13,7 @@ public:
 
   void resetOutputQueue();
   void pumpSender();
+  bool takeQueuedPayload(uint8_t *out, uint8_t *len, uint8_t maxLen);
 
 private:
   void unlockMessage();

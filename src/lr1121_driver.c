@@ -1126,13 +1126,14 @@ bool lr1121_send_command_fast(uint16_t opcode, const uint8_t *params,
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
 #if !SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
-  enum { LR1121_FAST_COMMAND_MAX = 64 };
+  enum { LR1121_FAST_COMMAND_MAX = LR1121_FAST_SPI_MAX_BYTES };
   uint8_t tx[LR1121_FAST_COMMAND_MAX];
 #endif
   const uint16_t total_len = (uint16_t)(2U + param_len);
 
 #if SIW917_ELRS_FAST_HOT_COMMAND_STREAM_PARAMS
-  if (param_len > 62U || (param_len > 0U && params == NULL)) {
+  if (param_len > (LR1121_FAST_SPI_MAX_BYTES - 2U) ||
+      (param_len > 0U && params == NULL)) {
 #else
   if (total_len > sizeof(tx) || (param_len > 0U && params == NULL)) {
 #endif
@@ -1304,7 +1305,8 @@ static bool lr1121_read_response_fast(uint8_t *response,
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
   const uint32_t diag_start_us = hw_timer_get_micros();
 #endif
-  if (response == NULL || response_len == 0U || response_len > 64U) {
+  if (response == NULL || response_len == 0U ||
+      response_len > LR1121_FAST_SPI_MAX_BYTES) {
     LR1121_RAW_GSPI_STAT_INC(lr1121_raw_gspi_fail_count);
 #if SIW917_ELRS_HOTPATH_TIMING_DIAG
     lr1121_diag_update_elapsed_us(&lr1121_raw_gspi_max_us, diag_start_us);
@@ -3189,7 +3191,7 @@ bool lr1121_send_command_polled_pub(uint16_t opcode, const uint8_t *params,
 __attribute__((unused)) static bool
 lr1121_send_command_raw_gspi(uint16_t opcode, const uint8_t *params,
                              uint16_t param_len) {
-  enum { LR1121_COMMAND_BUFFER_MAX = 64 };
+  enum { LR1121_COMMAND_BUFFER_MAX = LR1121_FAST_SPI_MAX_BYTES };
   uint8_t tx_buf[LR1121_COMMAND_BUFFER_MAX];
   const uint16_t total_len = 2 + param_len;
 

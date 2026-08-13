@@ -3,6 +3,8 @@
 #include "common.h"
 #include "stubborn_sender.h"
 
+#include <cstring>
+
 extern StubbornSender DataUlSender;
 
 TXOTAConnector::TXOTAConnector() {
@@ -47,6 +49,25 @@ void TXOTAConnector::pumpSender() {
                                    currentTransmissionLength);
     transferActive = true;
   }
+}
+
+bool TXOTAConnector::takeQueuedPayload(uint8_t *out, uint8_t *len,
+                                       uint8_t maxLen) {
+  if (out == nullptr || len == nullptr || currentTransmissionLength == 0U) {
+    if (len != nullptr) {
+      *len = 0;
+    }
+    return false;
+  }
+  if (currentTransmissionLength > maxLen) {
+    *len = 0;
+    return false;
+  }
+
+  memcpy(out, currentTransmissionBuffer, currentTransmissionLength);
+  *len = currentTransmissionLength;
+  unlockMessage();
+  return true;
 }
 
 void TXOTAConnector::resetOutputQueue() {

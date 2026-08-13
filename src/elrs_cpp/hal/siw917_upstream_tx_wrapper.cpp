@@ -177,7 +177,9 @@ extern "C" void elrs_tx_loop(void)
     mlrs_ota_loop();
     siw917_mavlink_backpack_service();
     siw917_lr1121_handle_deferred_isr();
-    siw917_report_link_transition();
+    if (!mlrs_ota_is_active()) {
+        siw917_report_link_transition();
+    }
 }
 
 extern "C" void elrs_tx_stop(void)

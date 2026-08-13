@@ -267,6 +267,11 @@ void sendCRSFTelemetryToBackpack(uint8_t *) {}
 void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #endif")
 
+    set(old_mlrs_include
+"#include \"stubborn_sender.h\"")
+    set(new_mlrs_include
+"#include \"stubborn_sender.h\"
+#include \"mlrs_ota.h\"")
     set(old_link_diag_marker
 "static void UpdateConnectDisconnectStatus()
 {")
@@ -294,7 +299,37 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
   }
 }
 
-${old_link_diag_marker}")
+extern \"C\" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t snr)
+{
+  LastTLMpacketRecv_Ms = millis();
+  RxDisconnected_Ms = 0;
+  // EdgeTX uses CRSF RQly as TELEMETRY_RSSI. A 0x14 with LQ=0 clears
+  // telemetryStreaming. Do not let the overlay's 0..100 acquire ramp
+  // (3, 5, 47...) replace a healthy ELRS RQly; that trips Telemetry Critical.
+  if (lq > 0 && lq >= linkStats.uplink_Link_quality)
+  {
+    linkStats.uplink_Link_quality = lq;
+    linkStats.downlink_Link_quality = lq;
+  }
+  if (rssi < 0)
+  {
+    linkStats.uplink_RSSI_1 = rssi;
+    linkStats.downlink_RSSI_1 = rssi;
+  }
+  linkStats.uplink_SNR = snr;
+  linkStats.downlink_SNR = snr;
+  if (connectionState != connected && connectionState < MODE_STATES)
+  {
+    setConnectionState(connected);
+  }
+}
+
+static void UpdateConnectDisconnectStatus()
+{
+  if (mlrs_ota_is_active())
+  {
+    return;
+  }")
 
     file(READ "${input_file}" source_text)
     string(FIND "${source_text}" "${old_block}" block_offset)
@@ -305,6 +340,15 @@ ${old_link_diag_marker}")
     endif()
     string(REPLACE "${old_block}" "${new_block}" source_text "${source_text}")
 
+    string(FIND "${source_text}" "${old_mlrs_include}" mlrs_include_offset)
+    if(mlrs_include_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX mLRS include patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_mlrs_include}" "${new_mlrs_include}"
+        source_text "${source_text}")
+
     string(FIND "${source_text}" "${old_link_diag_marker}" link_diag_offset)
     if(link_diag_offset EQUAL -1)
         message(FATAL_ERROR
@@ -312,6 +356,103 @@ ${old_link_diag_marker}")
         )
     endif()
     string(REPLACE "${old_link_diag_marker}" "${new_link_diag_marker}"
+        source_text "${source_text}")
+
+    set(old_pump_sender
+"  else if (!DataUlSender.IsActive())
+  {
+    otaConnector.pumpSender();
+  }")
+    set(new_pump_sender
+"  else if (!mlrs_ota_is_active() && !DataUlSender.IsActive())
+  {
+    otaConnector.pumpSender();
+  }")
+    string(FIND "${source_text}" "${old_pump_sender}" pump_offset)
+    if(pump_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX mLRS pumpSender patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_pump_sender}" "${new_pump_sender}"
+        source_text "${source_text}")
+
+    set(old_linkstats_send
+"static void checkSendLinkStatsToHandset(uint32_t now)
+{
+  if ((now - LinkStatsLastReported_Ms) > firmwareOptions.tlm_report_interval)
+  {
+    // If we have gone to disconnected state, keep sending the ghost linkstats for some time
+    if (RxDisconnected_Ms)
+    {
+      constexpr uint32_t LOST_NOTIFICATION_MAX_DELAY_MS = 3000U;
+      // Delay a variable amount based on the LQ. Lower LQ, lower time before we tell the handset what's up
+      uint32_t TelemetryLostCalloutDelay_Ms = map(constrain(linkStats.uplink_Link_quality, 50, 100), 50, 100, 0, LOST_NOTIFICATION_MAX_DELAY_MS);
+      if (now - RxDisconnected_Ms > TelemetryLostCalloutDelay_Ms)
+      {
+        RxDisconnected_Ms = 0;
+        linkStats.uplink_Link_quality = 0;
+      }
+    }
+
+    CRSF_MK_FRAME_T(crsfLinkStatistics_t) linkStatisticsFrame;
+    crsfRouter.makeLinkStatisticsPacket(&linkStatisticsFrame.h);
+    // the linkStats originates from the OTA connector so we don't send it back there.
+    crsfRouter.deliverMessage(&otaConnector, &linkStatisticsFrame.h);
+    sendCRSFTelemetryToBackpack((uint8_t *)&linkStatisticsFrame);
+    LinkStatsLastReported_Ms = now;
+  }
+}")
+    set(new_linkstats_send
+"static void sendLinkStatsToHandsetNow()
+{
+  CRSF_MK_FRAME_T(crsfLinkStatistics_t) linkStatisticsFrame;
+  crsfRouter.makeLinkStatisticsPacket(&linkStatisticsFrame.h);
+  // the linkStats originates from the OTA connector so we don't send it back there.
+  crsfRouter.deliverMessage(&otaConnector, &linkStatisticsFrame.h);
+  sendCRSFTelemetryToBackpack((uint8_t *)&linkStatisticsFrame);
+  LinkStatsLastReported_Ms = millis();
+}
+
+static void checkSendLinkStatsToHandset(uint32_t now)
+{
+  if ((now - LinkStatsLastReported_Ms) > firmwareOptions.tlm_report_interval)
+  {
+    // If we have gone to disconnected state, keep sending the ghost linkstats for some time
+    if (!mlrs_ota_is_active() && RxDisconnected_Ms)
+    {
+      constexpr uint32_t LOST_NOTIFICATION_MAX_DELAY_MS = 3000U;
+      // Delay a variable amount based on the LQ. Lower LQ, lower time before we tell the handset what's up
+      uint32_t TelemetryLostCalloutDelay_Ms = map(constrain(linkStats.uplink_Link_quality, 50, 100), 50, 100, 0, LOST_NOTIFICATION_MAX_DELAY_MS);
+      if (now - RxDisconnected_Ms > TelemetryLostCalloutDelay_Ms)
+      {
+        RxDisconnected_Ms = 0;
+        linkStats.uplink_Link_quality = 0;
+      }
+    }
+
+    sendLinkStatsToHandsetNow();
+  }
+}
+
+extern \"C\" void siw917_tx_publish_mlrs_linkstats(void)
+{
+  if (linkStats.uplink_Link_quality == 0)
+  {
+    linkStats.uplink_Link_quality = 1;
+    linkStats.downlink_Link_quality = 1;
+  }
+  RxDisconnected_Ms = 0;
+  LastTLMpacketRecv_Ms = millis();
+  sendLinkStatsToHandsetNow();
+}")
+    string(FIND "${source_text}" "${old_linkstats_send}" linkstats_offset)
+    if(linkstats_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX mLRS handset linkstats patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_linkstats_send}" "${new_linkstats_send}"
         source_text "${source_text}")
 
     set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
@@ -415,7 +556,13 @@ static selectionParameter luaMlrsBand = {
       SetPacketRateIdx(selectedRate, true);
     });")
     set(new_mlrs_registration
-"${old_mlrs_registration}
+"    registerParameter(&luaAirRate, [this](propertiesCommon *item, uint8_t arg) {
+      if (mlrs_ota_is_active()) {
+        return;
+      }
+      uint8_t selectedRate = RATE_MAX - 1 - arg;
+      SetPacketRateIdx(selectedRate, true);
+    });
     registerParameter(&luaAirProtocol, [this](propertiesCommon *item, uint8_t arg) {
       (void)item;
       mlrs_ota_set_protocol(arg);
