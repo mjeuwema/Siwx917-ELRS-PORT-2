@@ -1167,6 +1167,9 @@ static uint8_t getNormalOtaSerialProtocol(uint8_t storedProtocol) {
 }
 
 static uint8_t getDesiredActiveSerialProtocol() {
+  if (mlrs_ota_is_active()) {
+    return ELRS_SERIAL_MAVLINK;
+  }
   if (TxOtaProtocol == TX_MAVLINK_MODE) {
     return ELRS_SERIAL_MAVLINK;
   }
@@ -1321,7 +1324,8 @@ static void applyConfiguredSerialProtocol() {
     return;
   }
 
-  if (wantsMavlink && TxOtaProtocol != TX_MAVLINK_MODE) {
+  if (wantsMavlink && TxOtaProtocol != TX_MAVLINK_MODE &&
+      !mlrs_ota_is_active()) {
     if (crsf_serial_is_ready()) {
       crsf_serial_deinit();
     }
@@ -1457,7 +1461,8 @@ static void updateSerialRxState() {
   const uint8_t protocol = getConfiguredSerialProtocol();
 
   if (protocol == ELRS_SERIAL_MAVLINK) {
-    shouldEnable = TxOtaProtocol == TX_MAVLINK_MODE && crsf_serial_is_ready();
+    shouldEnable = (TxOtaProtocol == TX_MAVLINK_MODE || mlrs_ota_is_active()) &&
+                   crsf_serial_is_ready();
   }
 #if SIW917_ELRS_ENABLE_CRSF_FC_TELEMETRY
   else if (serialProtocolUsesCrsf(protocol)) {
@@ -2465,6 +2470,9 @@ static bool updateTeamraceModelMatch() {
 }
 
 static bool shouldOutputSerialRcFrames() {
+  if (mlrs_ota_is_active()) {
+    return false;
+  }
   if (InBindingMode || InWiFiMode || !crsf_serial_is_ready() ||
       !configuredSerialProtocolSendsRc() ||
       (TxOtaProtocol != TX_NORMAL_MODE)) {
@@ -3152,7 +3160,8 @@ ProcessRfPacket_SYNC(uint32_t const now, OTA_Sync_s const *const otaSync) {
   uint8_t modelXor = (~modelMatchId) & MODELMATCH_MASK;
   bool modelMatched = otaSync->UID5 == (UID[5] ^ modelXor);
 
-  if (otaProtocolSelectionChanged && connectionState == disconnected) {
+  if (otaProtocolSelectionChanged && connectionState == disconnected &&
+      !mlrs_ota_take_elrs_first_sync()) {
     RFmodeLastCycled = now;
     DBGLN("TX OTA protocol changed; waiting for next SYNC before lock");
     return false;
@@ -4685,6 +4694,10 @@ void mlrs_elrs_rx_accept_uplink(const uint8_t *payload, uint8_t len) {
   if (payload == nullptr || len == 0) {
     return;
   }
+  if ((payload[0] == 0xFD || payload[0] == 0xFE) && crsf_serial_is_ready()) {
+    (void)crsf_serial_send_frame(payload, len);
+    return;
+  }
   if (len > ELRS_DATA_UL_BUFFER) {
     len = ELRS_DATA_UL_BUFFER;
   }
@@ -4697,73 +4710,82 @@ uint8_t mlrs_elrs_rx_take_downlink(uint8_t *payload, uint8_t maxLen) {
     return 0;
   }
   uint8_t nextPayloadSize = 0;
-  if (!otaConnector.GetNextPayload(&nextPayloadSize, payload) ||
-      nextPayloadSize == 0) {
-    return 0;
+  if (otaConnector.GetNextPayload(&nextPayloadSize, payload) &&
+      nextPayloadSize != 0) {
+    if (nextPayloadSize > maxLen) {
+      nextPayloadSize = maxLen;
+    }
+    return nextPayloadSize;
   }
-  if (nextPayloadSize > maxLen) {
-    nextPayloadSize = maxLen;
+  if (crsf_serial_is_ready()) {
+    const uint32_t copied = crsf_serial_read(payload, maxLen);
+    return copied > UINT8_MAX ? UINT8_MAX : (uint8_t)copied;
   }
-  return nextPayloadSize;
+  return 0;
+}
+
+static uint16_t crsf_chan_to_us(uint32_t crsf) {
+  if (crsf < 172U) {
+    crsf = 172U;
+  }
+  if (crsf > 1811U) {
+    crsf = 1811U;
+  }
+  return (uint16_t)(988U + ((crsf - 172U) * 1024U) / 1639U);
+}
+
+static uint16_t mavlink1_crc(const uint8_t *buf, uint8_t len, uint8_t extra) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; ++i) {
+    uint8_t tmp = buf[i] ^ (uint8_t)(crc & 0xFF);
+    tmp ^= (uint8_t)(tmp << 4);
+    crc = (uint16_t)((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4));
+  }
+  uint8_t tmp = extra ^ (uint8_t)(crc & 0xFF);
+  tmp ^= (uint8_t)(tmp << 4);
+  crc = (uint16_t)((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4));
+  return crc;
+}
+
+static void sendMavlinkRcOverride() {
+  if (!crsf_serial_is_ready()) {
+    return;
+  }
+  uint8_t buf[26];
+  static uint8_t seq;
+  buf[0] = 0xFE;
+  buf[1] = 18;
+  buf[2] = seq++;
+  buf[3] = 255;
+  buf[4] = 190;
+  buf[5] = 70;
+  for (uint8_t i = 0; i < 8; ++i) {
+    const uint16_t us = crsf_chan_to_us(ChannelData[i]);
+    buf[6U + (i * 2U)] = (uint8_t)(us & 0xFF);
+    buf[7U + (i * 2U)] = (uint8_t)(us >> 8);
+  }
+  const uint16_t crc = mavlink1_crc(&buf[1], 23, 124);
+  buf[24] = (uint8_t)(crc & 0xFF);
+  buf[25] = (uint8_t)(crc >> 8);
+  (void)crsf_serial_send_frame(buf, sizeof(buf));
 }
 
 static void serviceMlrsHostBridge(unsigned long now) {
+  if (updateActiveSerialProtocol() ||
+      appliedSerialProtocol != ELRS_SERIAL_MAVLINK) {
+    applyConfiguredSerialProtocol();
+  }
   if (dataUlReady) {
     DataUlReceiveComplete();
   }
 
   updateSerialRxState();
-  serviceCrsfSerialTelemetry();
   crsfReceiver.processPending(!otaConnector.IsEmpty());
 
-  static uint32_t lastRcOutput = 0;
-  const uint8_t serialProtocol = getConfiguredSerialProtocol();
-  const bool shouldSendSerialRc = shouldOutputSerialRcFrames();
-  const uint32_t rcOutputAge = now - lastRcOutput;
-  if (shouldSendSerialRc &&
-      rcOutputAge >= serialRcOutputIntervalMs(serialProtocol)) {
-    lastRcOutput = now;
-    if (serialProtocolUsesSbus(serialProtocol)) {
-      const bool failsafeActive = connectionState != connected;
-      (void)crsf_serial_send_sbus_channels(ChannelData, failsafeActive,
-                                           failsafeActive);
-    } else if (serialProtocolUsesSumd(serialProtocol)) {
-      (void)crsf_serial_send_sumd_channels(ChannelData);
-    } else {
-      uint32_t crsfChannels[CRSF_NUM_CHANNELS] = {};
-      prepareCrsfSerialChannels(crsfChannels);
-      (void)crsf_serial_send_channels(crsfChannels);
-    }
-  }
-
-  static uint32_t lastLinkStatsUpdate = 0;
-  if ((now - lastLinkStatsUpdate) > SEND_LINK_STATS_TO_FC_INTERVAL) {
-    lastLinkStatsUpdate = now;
-    currentLinkStats.rssi_1 = linkStats.uplink_RSSI_1;
-    currentLinkStats.rssi_2 = linkStats.uplink_RSSI_2;
-    currentLinkStats.snr = linkStats.uplink_SNR;
-    currentLinkStats.lq = uplinkLQ;
-    currentLinkStats.active_ant = antenna;
-    if (ExpressLRS_currAirRate_Modparams) {
-      currentLinkStats.rf_mode = ExpressLRS_currAirRate_Modparams->index;
-    }
-    if (crsf_serial_is_ready() && configuredSerialProtocolUsesCrsf() &&
-        (connectionState == connected) && (TxOtaProtocol == TX_NORMAL_MODE)) {
-      crsf_link_stats_t crsfStats;
-      crsfStats.uplink_rssi_1 = linkStats.uplink_RSSI_1;
-      crsfStats.uplink_rssi_2 = linkStats.uplink_RSSI_2;
-      crsfStats.uplink_lq = uplinkLQ;
-      crsfStats.uplink_snr = linkStats.uplink_SNR;
-      crsfStats.active_antenna = antenna;
-      crsfStats.rf_mode = ExpressLRS_currAirRate_Modparams
-                              ? ExpressLRS_currAirRate_Modparams->index
-                              : 0;
-      crsfStats.uplink_tx_power = linkStats.uplink_TX_Power;
-      crsfStats.downlink_rssi = 0;
-      crsfStats.downlink_lq = 0;
-      crsfStats.downlink_snr = 0;
-      crsf_serial_send_link_stats(&crsfStats);
-    }
+  static uint32_t lastRcOverrideMs = 0;
+  if ((now - lastRcOverrideMs) >= 20U) {
+    lastRcOverrideMs = now;
+    sendMavlinkRcOverride();
   }
 }
 
