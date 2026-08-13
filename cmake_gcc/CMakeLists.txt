@@ -328,6 +328,7 @@ extern \"C\" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t s
 
 extern \"C\" void siw917_tx_note_mlrs_link_lost(void)
 {
+  LastTLMpacketRecv_Ms = 0;
   linkStats.uplink_Link_quality = 0;
   linkStats.downlink_Link_quality = 0;
   RxDisconnected_Ms = millis();

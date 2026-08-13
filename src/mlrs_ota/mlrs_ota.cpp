@@ -31,10 +31,19 @@ extern expresslrs_mod_settings_s *ExpressLRS_currAirRate_Modparams;
 extern StubbornSender DataUlSender;
 extern CRSFRouter crsfRouter;
 extern TXOTAConnector otaConnector;
-void sendCRSFTelemetryToBackpack(uint8_t *);
+extern "C" {
+#include "siw917_mavlink_wifi.h"
+}
 extern "C" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t snr);
 extern "C" void siw917_tx_note_mlrs_link_lost(void);
 extern "C" void siw917_tx_publish_mlrs_linkstats(void);
+#if defined(SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
+// Same counters tx_main.cpp uses for a rate/model change. A cold RX only
+// locks from PACKET_TYPE_SYNC on the FHSS sync channel.
+extern volatile uint8_t syncSpamCounter;
+extern volatile uint8_t syncSpamCounterAfterRateChange;
+extern uint32_t SyncPacketLastSent;
+#endif
 #else
 #define MLRS_OTA_IS_TX 0
 #endif
@@ -197,6 +206,7 @@ static uint8_t g_band = MLRS_BAND_915;
 static uint8_t g_rate = MLRS_RATE_31HZ;
 static bool g_active = false;
 static bool g_elrs_ready = false;
+static bool g_lock_first_elrs_sync = false;
 static uint32_t g_apply_at_ms = 0;
 static uint8_t g_pending_protocol = 0xFF;
 static volatile uint8_t g_pending_rate = 0xFF;
@@ -788,16 +798,20 @@ static void restore_elrs_radio() {
     return;
   }
   const uint32_t freq = FHSSgetInitialFreq();
+  // Match ELRS SetRFLinkRate: invertIQ from UID[5], sync bytes UID[5], UID[4].
+  // Using UID[4], UID[5] here made a restored TX unhearable to a fresh RX.
+  const bool invertIQ = (UID[5] & 0x01) != 0;
 #if defined(SIW917_ELRS_USE_UPSTREAM_TX_MAIN) || defined(SIW917_ELRS_TARGET_TX)
-  Radio.Config(mod->bw, mod->sf, mod->cr, freq, mod->PreambleLen, false,
+  Radio.Config(mod->bw, mod->sf, mod->cr, freq, mod->PreambleLen, invertIQ,
                mod->PayloadLength,
-               static_cast<RadioBandMod::Combined>(mod->radio_type), UID[4],
-               UID[5], SX12XX_Radio_All);
+               static_cast<RadioBandMod::Combined>(mod->radio_type),
+               (uint8_t)UID[5], (uint8_t)UID[4], SX12XX_Radio_All);
 #else
   const bool fsk = (mod->radio_type == RADIO_TYPE_LR1121_GFSK_900) ||
                    (mod->radio_type == RADIO_TYPE_LR1121_GFSK_2G4);
-  Radio.Config(mod->bw, mod->sf, mod->cr, freq, mod->PreambleLen, false,
-               mod->PayloadLength, fsk, UID[4], UID[5], SX12XX_Radio_All);
+  Radio.Config(mod->bw, mod->sf, mod->cr, freq, mod->PreambleLen, invertIQ,
+               mod->PayloadLength, fsk, (uint8_t)UID[5], (uint8_t)UID[4],
+               SX12XX_Radio_All);
 #endif
   calib_image_for_freq(freq);
   Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false, 0);
@@ -885,9 +899,11 @@ static void mlrs_tx_send_frame() {
     payload[0] = MLRS_RATE_CMD;
     payload[1] = sanitize_rate(g_pending_rate);
     payload_len = 2;
-  } else {
-    (void)otaConnector.takeQueuedPayload(payload, &payload_len,
-                                         FRAME_TX_PAYLOAD_LEN);
+  } else if (!otaConnector.takeQueuedPayload(payload, &payload_len,
+                                            FRAME_TX_PAYLOAD_LEN) ||
+             payload_len == 0) {
+    payload_len = (uint8_t)siw917_mavlink_wifi_uplink_read_bytes(
+        payload, FRAME_TX_PAYLOAD_LEN);
   }
   pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq, false, payload,
                 payload_len);
@@ -916,10 +932,15 @@ static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
   if (fail == 0) {
     ++g_rx_ok;
     note_valid_rx();
-    if (g_rx_frame.status.payload_len >= CRSF_MIN_PACKET_LEN) {
-      crsfRouter.processMessage(&otaConnector,
-                                (crsf_header_t *)g_rx_frame.payload);
-      sendCRSFTelemetryToBackpack(g_rx_frame.payload);
+    if (g_rx_frame.status.payload_len > 0) {
+      const uint8_t stx = g_rx_frame.payload[0];
+      if (stx == 0xFD || stx == 0xFE) {
+        (void)siw917_mavlink_wifi_enqueue_downlink(
+            g_rx_frame.payload, g_rx_frame.status.payload_len);
+      } else {
+        crsfRouter.processMessage(&otaConnector,
+                                  (crsf_header_t *)g_rx_frame.payload);
+      }
     }
   } else {
     g_last_rx_fail = fail;
@@ -1029,25 +1050,39 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
   if (g_tx_frame.status.frame_type == FRAME_TYPE_TX_RX_CMD ||
       (g_tx_frame.status.payload_len == 1 &&
        g_tx_frame.payload[0] == MLRS_SWITCH_CMD)) {
-    printf("[mLRS] rx switch cmd -> ELRS type=%u plen=%u\n",
-           (unsigned)g_tx_frame.status.frame_type,
-           (unsigned)g_tx_frame.status.payload_len);
-    g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
-    g_apply_at_ms = millis() + 50;
+    if (g_pending_protocol != ELRS_AIR_PROTOCOL_ELRS) {
+      printf("[mLRS] rx switch cmd -> ELRS type=%u plen=%u\n",
+             (unsigned)g_tx_frame.status.frame_type,
+             (unsigned)g_tx_frame.status.payload_len);
+      g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
+    }
+    /* Keep deferring until the TX announce stream stops. */
+    g_apply_at_ms = millis() + 100;
     g_fhss_follow = false;
   } else if (g_tx_frame.status.payload_len >= 3 &&
              g_tx_frame.payload[0] == MLRS_BAND_CMD) {
-    printf("[mLRS] rx band cmd -> %s / %s\n",
-           g_tx_frame.payload[1] == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
-           kRates[sanitize_band(g_tx_frame.payload[1])]
-                 [sanitize_rate(g_tx_frame.payload[2])]
-                     .name);
+    static uint8_t logged_band = 0xFF;
+    static uint8_t logged_band_rate = 0xFF;
+    if (logged_band != g_tx_frame.payload[1] ||
+        logged_band_rate != g_tx_frame.payload[2]) {
+      logged_band = g_tx_frame.payload[1];
+      logged_band_rate = g_tx_frame.payload[2];
+      printf("[mLRS] rx band cmd -> %s / %s\n",
+             g_tx_frame.payload[1] == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
+             kRates[sanitize_band(g_tx_frame.payload[1])]
+                   [sanitize_rate(g_tx_frame.payload[2])]
+                       .name);
+    }
   } else if (g_tx_frame.status.payload_len >= 2 &&
              g_tx_frame.payload[0] == MLRS_RATE_CMD) {
-    printf("[mLRS] rx rate cmd -> %s spare=%u\n",
-           kRates[sanitize_band(g_band)][sanitize_rate(g_tx_frame.payload[1])]
-               .name,
-           (unsigned)g_last_rx_spare);
+    static uint8_t logged_rate = 0xFF;
+    if (logged_rate != g_tx_frame.payload[1]) {
+      logged_rate = g_tx_frame.payload[1];
+      printf("[mLRS] rx rate cmd -> %s spare=%u\n",
+             kRates[sanitize_band(g_band)][sanitize_rate(g_tx_frame.payload[1])]
+                 .name,
+             (unsigned)g_last_rx_spare);
+    }
   } else if (g_tx_frame.status.payload_len > 0) {
     mlrs_elrs_rx_accept_uplink(g_tx_frame.payload,
                                (uint8_t)g_tx_frame.status.payload_len);
@@ -1168,7 +1203,7 @@ static void start_mlrs() {
          g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz", current_rate_cfg()->name,
          (unsigned)g_sync_word, (unsigned long)fhss_curr(),
          (unsigned)g_fhss_count);
-  printf("[mLRS] CRSF frames in payload (no stubborn)\n");
+  printf("[mLRS] MAVLink pipe + CRSF Lua in payload\n");
 }
 
 static void stop_mlrs() {
@@ -1192,14 +1227,30 @@ static void stop_mlrs() {
 #if MLRS_OTA_IS_TX
   FHSSsetCurrIndex(0);
   OtaNonce = 0;
+#if defined(SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
+  // Same as an ELRS rate change: SYNC on nonce slots 1/2 even off hop 0
+  // so a tentative RX keeps hearing packets at 1000 Hz.
+  syncSpamCounter = 3;
+  syncSpamCounterAfterRateChange = 10;
+  SyncPacketLastSent = 0;
+#endif
+  // Drop mLRS downlink age so ELRS does not fake "connected" and skip SYNC.
+  siw917_tx_note_mlrs_link_lost();
 #endif
   delay(5);
   g_active = false;
   g_protocol = ELRS_AIR_PROTOCOL_ELRS;
   flush_mlrs_config();
   setConnectionState(disconnected);
+#if MLRS_OTA_IS_TX
   hwTimer::resume();
-#if !MLRS_OTA_IS_TX
+#else
+  // Stock ELRS keeps the RX timer stopped while disconnected so the next
+  // SYNC can start it in phase. Resuming here hops on a leftover nonce and
+  // the RX hears one SYNC, goes tentative, then misses every later packet.
+  FHSSsetCurrIndex(0);
+  OtaNonce = 0;
+  g_lock_first_elrs_sync = true;
   Radio.RXnb();
 #endif
   printf("[mLRS] restored ELRS air protocol\n");
@@ -1217,6 +1268,14 @@ static void apply_protocol(uint8_t protocol) {
 }
 
 extern "C" bool mlrs_ota_is_active(void) { return g_active; }
+
+extern "C" bool mlrs_ota_take_elrs_first_sync(void) {
+  if (!g_lock_first_elrs_sync) {
+    return false;
+  }
+  g_lock_first_elrs_sync = false;
+  return true;
+}
 
 extern "C" bool mlrs_ota_is_connected(void) { return g_active && g_connected; }
 

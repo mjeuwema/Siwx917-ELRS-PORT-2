@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "common.h"
 #include "config.h"
+#include "mlrs_ota.h"
 #include "siw917_mavlink_backpack.h"
 #include "siw917_mavlink_wifi.h"
 
@@ -85,7 +86,8 @@ extern "C" void siw917_mavlink_backpack_init(void)
 
 extern "C" void siw917_mavlink_backpack_service(void)
 {
-    const bool mavlinkMode = config.GetLinkMode() == TX_MAVLINK_MODE;
+    const bool mavlinkMode =
+        config.GetLinkMode() == TX_MAVLINK_MODE || mlrs_ota_is_active();
     const bool bridgeRequested = mavlinkMode && luaMavlinkWifiEnabled;
     const bool linkModeChanged = mavlinkMode != lastMavlinkMode;
     if (!linkModeChanged && bridgeRequested == lastBridgeRequested) {
@@ -110,8 +112,8 @@ void checkBackpackUpdate()
     }
 
     TxBackpackWiFiReadyToSend = false;
-    if (config.GetLinkMode() != TX_MAVLINK_MODE) {
-        printf("[MAVWIFI] Backpack WiFi request ignored: select Link Mode MAVLink first\n");
+    if (config.GetLinkMode() != TX_MAVLINK_MODE && !mlrs_ota_is_active()) {
+        printf("[MAVWIFI] Backpack WiFi request ignored: select mLRS or Link Mode MAVLink first\n");
         return;
     }
 

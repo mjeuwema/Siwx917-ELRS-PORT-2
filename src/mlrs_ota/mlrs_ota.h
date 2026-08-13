@@ -30,6 +30,7 @@ extern "C" {
 
 bool mlrs_ota_is_active(void);
 bool mlrs_ota_is_connected(void);
+bool mlrs_ota_take_elrs_first_sync(void);
 uint8_t mlrs_ota_get_protocol(void);
 bool mlrs_ota_set_protocol(uint8_t protocol);
 uint8_t mlrs_ota_get_rate(void);
