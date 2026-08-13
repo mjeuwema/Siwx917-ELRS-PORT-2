@@ -303,14 +303,16 @@ extern \"C\" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t s
 {
   LastTLMpacketRecv_Ms = millis();
   RxDisconnected_Ms = 0;
-  // EdgeTX uses CRSF RQly as TELEMETRY_RSSI. A 0x14 with LQ=0 clears
-  // telemetryStreaming. Do not let the overlay's 0..100 acquire ramp
-  // (3, 5, 47...) replace a healthy ELRS RQly; that trips Telemetry Critical.
-  if (lq > 0 && lq >= linkStats.uplink_Link_quality)
+  // Floor handset RQly at 50 while a real downlink is arriving so the
+  // overlay acquire ramp does not trip EdgeTX Telemetry Critical. Real
+  // loss is reported by siw917_tx_note_mlrs_link_lost().
+  uint8_t reported = lq;
+  if (reported > 0 && reported < 50)
   {
-    linkStats.uplink_Link_quality = lq;
-    linkStats.downlink_Link_quality = lq;
+    reported = 50;
   }
+  linkStats.uplink_Link_quality = reported;
+  linkStats.downlink_Link_quality = reported;
   if (rssi < 0)
   {
     linkStats.uplink_RSSI_1 = rssi;
@@ -321,6 +323,17 @@ extern \"C\" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t s
   if (connectionState != connected && connectionState < MODE_STATES)
   {
     setConnectionState(connected);
+  }
+}
+
+extern \"C\" void siw917_tx_note_mlrs_link_lost(void)
+{
+  linkStats.uplink_Link_quality = 0;
+  linkStats.downlink_Link_quality = 0;
+  RxDisconnected_Ms = millis();
+  if (connectionState == connected)
+  {
+    setConnectionState(disconnected);
   }
 }
 
@@ -437,13 +450,6 @@ static void checkSendLinkStatsToHandset(uint32_t now)
 
 extern \"C\" void siw917_tx_publish_mlrs_linkstats(void)
 {
-  if (linkStats.uplink_Link_quality == 0)
-  {
-    linkStats.uplink_Link_quality = 1;
-    linkStats.downlink_Link_quality = 1;
-  }
-  RxDisconnected_Ms = 0;
-  LastTLMpacketRecv_Ms = millis();
   sendLinkStatsToHandsetNow();
 }")
     string(FIND "${source_text}" "${old_linkstats_send}" linkstats_offset)
@@ -571,7 +577,8 @@ static selectionParameter luaMlrsBand = {
     registerParameter(&luaMlrsRate, [this](propertiesCommon *item, uint8_t arg) {
       (void)item;
       mlrs_ota_set_rate(arg);
-      updateParameters();
+      luaMlrsRate.options = mlrs_ota_rate_options();
+      setTextSelectionValue(&luaMlrsRate, mlrs_ota_get_rate());
     });
     registerParameter(&luaMlrsBand, [this](propertiesCommon *item, uint8_t arg) {
       (void)item;
@@ -607,6 +614,36 @@ static selectionParameter luaMlrsBand = {
     set(${output_var} "${output_file}" PARENT_SCOPE)
 endfunction()
 
+function(siw917_generate_lr1121_config_source input_file output_var)
+    set(old_stdby
+"    SetMode(LR1121_MODE_STDBY_RC, radioNumber);
+
+    this->modulation = _modulation;
+
+    // 8.1.1 SetPacketType")
+    set(new_stdby
+"    SetMode(LR1121_MODE_STDBY_XOSC, radioNumber);
+    delay(5);
+
+    this->modulation = _modulation;
+
+    // 8.1.1 SetPacketType")
+    file(READ "${input_file}" source_text)
+    string(FIND "${source_text}" "${old_stdby}" patch_offset)
+    if(patch_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 LR1121 Config standby patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_stdby}" "${new_stdby}" source_text "${source_text}")
+    set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
+    set(output_file "${output_dir}/LR1121.cpp")
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(WRITE "${output_file}" "${source_text}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_file}")
+    set(${output_var} "${output_file}" PARENT_SCOPE)
+endfunction()
+
 # SiW917 platform abstraction files (Arduino compatibility layer)
 # Prefer the SiW917 adapter until the upstream tx_main canary compiles cleanly.
 if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
@@ -625,6 +662,10 @@ if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
     set(ELRS_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/common.cpp")
     set(ELRS_RXTX_COMMON_SOURCE "${ELRS_UPSTREAM_DIR}/src/rxtx_common.cpp")
     set(ELRS_LR1121_SOURCE "${ELRS_UPSTREAM_DIR}/lib/LR1121Driver/LR1121.cpp")
+    siw917_generate_lr1121_config_source(
+        "${ELRS_LR1121_SOURCE}"
+        ELRS_LR1121_SOURCE
+    )
     set(ELRS_HANDSET_SOURCE "${ELRS_UPSTREAM_DIR}/lib/Handset/CRSFHandset.cpp")
     set(ELRS_TX_MODULE_PARAMETERS_SOURCE
         "${ELRS_UPSTREAM_DIR}/lib/tx-crsf/TXModuleParameters.cpp")
