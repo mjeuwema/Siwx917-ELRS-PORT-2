@@ -15,6 +15,7 @@
 
 extern "C" {
 #include "elrs_config.h"
+bool lr1121_elrs_calib_image(uint32_t freq_min, uint32_t freq_max);
 }
 
 extern LR1121Driver Radio;
@@ -59,7 +60,8 @@ extern uint8_t uplinkLQ;
 #define FHSS_BIND_CH_24 46
 #define MLRS_SWITCH_CMD 0xE1
 #define MLRS_RATE_CMD 0xE2
-#define MLRS_ANNOUNCE_MS 500
+#define MLRS_BAND_CMD 0xE3
+#define MLRS_ANNOUNCE_MIN_MS 4000
 #define MLRS_RX_SCAN_MS 5000
 #define MLRS_LOST_MS 2000
 
@@ -218,9 +220,13 @@ static bool g_logged_switch_cmd = false;
 #else
 static bool g_fhss_follow = false;
 static volatile uint8_t g_fhss_arm_rx = 0;
+static volatile uint8_t g_fhss_do_hop = 0;
+static volatile uint8_t g_fhss_pending_hops = 0;
+static volatile uint8_t g_slot_rx = 0;
+static volatile uint8_t g_rx_need_rearm = 0;
+static volatile uint8_t g_miss_streak = 0;
 static bool g_had_link = false;
-static uint32_t g_rxok_stall_ms = 0;
-static uint32_t g_rxok_stall_count = 0;
+static uint32_t g_last_rf_ms = 0;
 static uint8_t g_last_rx_spare = 0xFF;
 #endif
 static uint8_t g_seq = 0;
@@ -234,6 +240,7 @@ static volatile uint8_t g_print_disconnected = 0;
 static uint32_t g_tx_sent = 0;
 static uint32_t g_rx_ok = 0;
 static uint32_t g_rx_fail = 0;
+static uint32_t g_rx_junk = 0;
 static uint8_t g_last_rx_fail = 0;
 #if MLRS_OTA_IS_TX
 static volatile uint8_t g_tx_send_pending = 0;
@@ -348,6 +355,40 @@ static const mlrs_rate_cfg_t *current_rate_cfg() {
   return &kRates[sanitize_band(g_band)][sanitize_rate(g_rate)];
 }
 
+static bool tight_slot() {
+  return current_rate_cfg()->interval_us <= 20000U;
+}
+
+#if MLRS_OTA_IS_TX
+static uint32_t announce_ms() {
+  const uint32_t slot_ms = current_rate_cfg()->interval_us / 1000U;
+  uint32_t hold_ms =
+      MLRS_LOST_MS + (uint32_t)g_fhss_count * slot_ms * 2U;
+  if (hold_ms < MLRS_ANNOUNCE_MIN_MS) {
+    hold_ms = MLRS_ANNOUNCE_MIN_MS;
+  }
+  return hold_ms;
+}
+
+static bool announcing() {
+  return g_pending_protocol != 0xFF || g_pending_rate != 0xFF ||
+         g_pending_band != 0xFF;
+}
+#endif
+
+static void calib_image_for_freq(uint32_t freq) {
+  uint32_t lo;
+  uint32_t hi;
+  if (freq >= 1000000000UL) {
+    lo = 2400000000UL;
+    hi = 2480000000UL;
+  } else {
+    lo = 900000000UL;
+    hi = 931000000UL;
+  }
+  (void)lr1121_elrs_calib_image(lo, hi);
+}
+
 static void fhss_generate() {
   const uint8_t list_len =
       (g_band == MLRS_BAND_24) ? FHSS_LIST_24_LEN : kFhssListLen;
@@ -415,6 +456,11 @@ static void fhss_generate() {
 #else
   g_fhss_follow = false;
   g_fhss_arm_rx = 0;
+  g_fhss_do_hop = 0;
+  g_fhss_pending_hops = 0;
+  g_slot_rx = 0;
+  g_rx_need_rearm = 0;
+  g_miss_streak = 0;
 #endif
 }
 
@@ -698,11 +744,16 @@ static void configure_mlrs_radio() {
                FRAME_TX_RX_LEN, rate->is_fsk != 0, sync1, sync2,
                SX12XX_Radio_All);
 #endif
+  calib_image_for_freq(freq);
   Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false, 0);
   if (rate->is_fsk) {
     delay(5);
     printf("[mLRS] GFSK 100kbps BW=312k fdev=50k plen=%u\n",
            (unsigned)FRAME_TX_RX_LEN);
+  } else if (g_band == MLRS_BAND_24) {
+    printf("[mLRS] 2.4G LoRa BW=800k SF=%u CR=LI4/5 plen=%u freq=%lu\n",
+           (unsigned)rate->sf, (unsigned)FRAME_TX_RX_LEN,
+           (unsigned long)freq);
   }
 }
 
@@ -718,11 +769,17 @@ static void apply_mlrs_rate() {
   hwTimer::updateInterval(current_rate_cfg()->interval_us);
   hwTimer::resume();
 #if !MLRS_OTA_IS_TX
+  g_valid_window = 0;
+  g_lq = 0;
+  g_connected = false;
+  g_miss_streak = 0;
+  g_fhss_pending_hops = 0;
   Radio.RXnb();
 #endif
-  printf("[mLRS] %s / %s (%u us, %u hops)\n",
+  printf("[mLRS] %s / %s (%u us, %u hops%s)\n",
          g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz", current_rate_cfg()->name,
-         (unsigned)current_rate_cfg()->interval_us, (unsigned)g_fhss_count);
+         (unsigned)current_rate_cfg()->interval_us, (unsigned)g_fhss_count,
+         tight_slot() ? ", tlm/2" : "");
 }
 
 static void restore_elrs_radio() {
@@ -742,6 +799,7 @@ static void restore_elrs_radio() {
   Radio.Config(mod->bw, mod->sf, mod->cr, freq, mod->PreambleLen, false,
                mod->PayloadLength, fsk, UID[4], UID[5], SX12XX_Radio_All);
 #endif
+  calib_image_for_freq(freq);
   Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false, 0);
 }
 
@@ -761,8 +819,6 @@ static void note_valid_rx() {
   linkStats.uplink_SNR = (int8_t)SNR_DESCALE(Radio.LastPacketSNRRaw);
   connectionHasModelMatch = true;
   g_rate_scan_ms = g_last_rx_ms;
-  g_rxok_stall_ms = g_last_rx_ms;
-  g_rxok_stall_count = g_rx_ok;
 #endif
   if (!g_connected && g_valid_window >= 3) {
     g_connected = true;
@@ -801,7 +857,10 @@ static void fill_rc_from_handset(uint16_t rc[16]) {
 }
 
 static void mlrs_tx_send_frame() {
-  if (g_fhss_need_hop) {
+  if (announcing()) {
+    g_fhss_i = 0;
+    g_fhss_need_hop = false;
+  } else if (g_fhss_need_hop) {
     fhss_hop();
     g_fhss_need_hop = false;
   }
@@ -817,6 +876,11 @@ static void mlrs_tx_send_frame() {
   if (g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS) {
     payload[0] = MLRS_SWITCH_CMD;
     payload_len = 1;
+  } else if (g_pending_band != 0xFF) {
+    payload[0] = MLRS_BAND_CMD;
+    payload[1] = sanitize_band(g_pending_band);
+    payload[2] = sanitize_rate(g_pending_rate != 0xFF ? g_pending_rate : g_rate);
+    payload_len = 3;
   } else if (g_pending_rate != 0xFF) {
     payload[0] = MLRS_RATE_CMD;
     payload[1] = sanitize_rate(g_pending_rate);
@@ -858,9 +922,13 @@ static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
       sendCRSFTelemetryToBackpack(g_rx_frame.payload);
     }
   } else {
-    ++g_rx_fail;
     g_last_rx_fail = fail;
-    note_missed_rx();
+    if (fail == 1) {
+      ++g_rx_junk;
+    } else {
+      ++g_rx_fail;
+      note_missed_rx();
+    }
   }
   return true;
 }
@@ -880,6 +948,13 @@ static void apply_rc_to_elrs(const uint16_t rc[16]) {
   }
 }
 
+static void mlrs_rx_hop_listen() {
+  if (g_fhss_follow) {
+    fhss_hop();
+  }
+  Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
+}
+
 static void mlrs_rx_send_tlm() {
   uint8_t payload[FRAME_RX_PAYLOAD_LEN] = {};
   const uint8_t payload_len =
@@ -889,24 +964,34 @@ static void mlrs_rx_send_tlm() {
   ++g_tx_sent;
 }
 
-static void mlrs_rx_done_tx() { g_fhss_arm_rx = 1; }
+static void mlrs_rx_done_tx() {
+  g_fhss_do_hop = 1;
+  g_fhss_arm_rx = 1;
+}
 
 static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
   memcpy(&g_tx_frame, Radio.RXdataBuffer, sizeof(g_tx_frame));
   const uint8_t fail = check_tx_frame(&g_tx_frame);
   if (fail != 0) {
-    ++g_rx_fail;
+    g_last_rf_ms = millis();
     g_last_rx_fail = fail;
-    note_missed_rx();
-    if (g_fhss_follow) {
-      g_fhss_arm_rx = 1;
+    if (fail == 1) {
+      ++g_rx_junk;
     } else {
-      Radio.RXnb();
+      ++g_rx_fail;
     }
-    return true;
+    /* Leave the radio in FS. Re-arming RX here lets SF5 2.4 false-locks
+     * chain into a junk storm and miss the real uplink. Tock re-arms
+     * (and hops once following). */
+    g_rx_need_rearm = 1;
+    return false;
   }
   ++g_rx_ok;
   note_valid_rx();
+  g_last_rf_ms = g_last_rx_ms;
+  g_slot_rx = 1;
+  g_rx_need_rearm = 0;
+  g_miss_streak = 0;
   fhss_set_index(g_tx_frame.status.fhss_index);
   g_fhss_follow = true;
   if ((g_tx_frame.status.fhss_index_band != g_band) &&
@@ -918,13 +1003,23 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
       g_tx_frame.payload[0] == MLRS_RATE_CMD &&
       g_tx_frame.payload[1] < MLRS_RATE_COUNT) {
     g_pending_rate = g_tx_frame.payload[1];
+  } else if (g_tx_frame.status.payload_len >= 3 &&
+             g_tx_frame.payload[0] == MLRS_BAND_CMD) {
+    if (g_tx_frame.payload[1] < MLRS_BAND_COUNT) {
+      g_pending_band = g_tx_frame.payload[1];
+    }
+    if (g_tx_frame.payload[2] < MLRS_RATE_COUNT) {
+      g_pending_rate = g_tx_frame.payload[2];
+    }
   } else if ((g_tx_frame.status.spare != g_rate) &&
              (g_tx_frame.status.spare < MLRS_RATE_COUNT)) {
     g_pending_rate = (uint8_t)g_tx_frame.status.spare;
   }
-  /* Downlink first so FSK 20 ms slots are not spent in CRSF before TX. */
-  if (current_rate_cfg()->is_fsk && ((g_rx_ok & 1U) != 0U)) {
-    g_fhss_arm_rx = 1;
+  /* 20 ms slots (FSK50 and 2.4 50 Hz) cannot TX downlink every packet:
+   * two-way LoRa ToA is ~16 ms, so CRSF after every TX overruns the next
+   * uplink and desyncs hops. Skip tlm every other packet and hop now. */
+  if (tight_slot() && ((g_rx_ok & 1U) != 0U)) {
+    mlrs_rx_hop_listen();
   } else {
     mlrs_rx_send_tlm();
   }
@@ -940,6 +1035,13 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
     g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
     g_apply_at_ms = millis() + 50;
     g_fhss_follow = false;
+  } else if (g_tx_frame.status.payload_len >= 3 &&
+             g_tx_frame.payload[0] == MLRS_BAND_CMD) {
+    printf("[mLRS] rx band cmd -> %s / %s\n",
+           g_tx_frame.payload[1] == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
+           kRates[sanitize_band(g_tx_frame.payload[1])]
+                 [sanitize_rate(g_tx_frame.payload[2])]
+                     .name);
   } else if (g_tx_frame.status.payload_len >= 2 &&
              g_tx_frame.payload[0] == MLRS_RATE_CMD) {
     printf("[mLRS] rx rate cmd -> %s spare=%u\n",
@@ -955,12 +1057,38 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
 
 static void mlrs_rx_tock() {
   if (!g_fhss_follow) {
+    /* Search/listen: re-arm only after junk put the radio in FS. */
+    if (g_rx_need_rearm) {
+      g_fhss_do_hop = 0;
+      g_fhss_arm_rx = 1;
+    }
     return;
   }
-  const uint32_t interval_ms = current_rate_cfg()->interval_us / 1000U;
-  const uint32_t miss_ms = interval_ms + 8U;
-  if ((millis() - g_last_rx_ms) > miss_ms) {
+  /* Hop once per missed slot on the same cadence as TX. Waiting
+   * interval+8 ms hopped late (TX already on n+1) and desynced 50 Hz. */
+  if (g_slot_rx) {
+    g_slot_rx = 0;
+    if (g_rx_need_rearm) {
+      g_fhss_do_hop = 0;
+      g_fhss_arm_rx = 1;
+    }
+  } else {
     note_missed_rx();
+    if (g_miss_streak < 255) {
+      ++g_miss_streak;
+    }
+    if (g_fhss_count > 0 && g_miss_streak >= g_fhss_count) {
+      /* Full hop cycle with no lock: sit hop 0 and reacquire. */
+      g_fhss_follow = false;
+      g_fhss_i = 0;
+      g_fhss_pending_hops = 0;
+      g_miss_streak = 0;
+      g_fhss_do_hop = 0;
+      g_fhss_arm_rx = 1;
+      return;
+    }
+    ++g_fhss_pending_hops;
+    g_fhss_do_hop = 0;
     g_fhss_arm_rx = 1;
   }
 }
@@ -1001,6 +1129,7 @@ static void start_mlrs() {
   g_tx_sent = 0;
   g_rx_ok = 0;
   g_rx_fail = 0;
+  g_rx_junk = 0;
   g_last_rx_fail = 0;
   g_mlrs_started_ms = millis();
   g_last_rx_ms = 0;
@@ -1009,8 +1138,12 @@ static void start_mlrs() {
   g_logged_switch_cmd = false;
 #else
   g_had_link = false;
-  g_rxok_stall_ms = 0;
-  g_rxok_stall_count = 0;
+  g_last_rf_ms = 0;
+  g_slot_rx = 0;
+  g_rx_need_rearm = 0;
+  g_fhss_do_hop = 0;
+  g_fhss_pending_hops = 0;
+  g_miss_streak = 0;
 #endif
   g_active = true;
   g_protocol = ELRS_AIR_PROTOCOL_MLRS;
@@ -1049,10 +1182,17 @@ static void stop_mlrs() {
   Radio.TXdoneCallback = g_saved_tx_cb;
   hwTimer::callbackTick = g_saved_tick;
   hwTimer::callbackTock = g_saved_tock;
-  if (g_saved_interval_us != 0) {
+  if (ExpressLRS_currAirRate_Modparams != nullptr &&
+      ExpressLRS_currAirRate_Modparams->interval != 0) {
+    hwTimer::updateInterval(ExpressLRS_currAirRate_Modparams->interval);
+  } else if (g_saved_interval_us != 0) {
     hwTimer::updateInterval(g_saved_interval_us);
   }
   restore_elrs_radio();
+#if MLRS_OTA_IS_TX
+  FHSSsetCurrIndex(0);
+  OtaNonce = 0;
+#endif
   delay(5);
   g_active = false;
   g_protocol = ELRS_AIR_PROTOCOL_ELRS;
@@ -1110,8 +1250,9 @@ extern "C" bool mlrs_ota_set_protocol(uint8_t protocol) {
   }
   if (protocol == ELRS_AIR_PROTOCOL_ELRS && g_active) {
     g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
-    g_apply_at_ms = millis() + MLRS_ANNOUNCE_MS;
-    printf("[mLRS] announce ELRS for %u ms\n", (unsigned)MLRS_ANNOUNCE_MS);
+    const uint32_t hold_ms = announce_ms();
+    g_apply_at_ms = millis() + hold_ms;
+    printf("[mLRS] announce ELRS for %u ms on hop 0\n", (unsigned)hold_ms);
     return true;
   }
 #endif
@@ -1155,11 +1296,11 @@ extern "C" bool mlrs_ota_set_rate(uint8_t rate) {
   }
   if (g_active && rate != g_rate) {
     g_pending_rate = rate;
-    g_apply_rate_at_ms = millis() + MLRS_ANNOUNCE_MS;
+    const uint32_t hold_ms = announce_ms();
+    g_apply_rate_at_ms = millis() + hold_ms;
     save_rate(rate);
-    printf("[mLRS] announce rate %s for %u ms\n",
-           kRates[sanitize_band(g_band)][rate].name,
-           (unsigned)MLRS_ANNOUNCE_MS);
+    printf("[mLRS] announce rate %s for %u ms on hop 0\n",
+           kRates[sanitize_band(g_band)][rate].name, (unsigned)hold_ms);
     return true;
   }
   if (g_active && rate == g_rate) {
@@ -1194,11 +1335,12 @@ extern "C" bool mlrs_ota_set_band(uint8_t band) {
   if (g_active && band != g_band) {
     g_pending_band = band;
     g_pending_rate = new_rate;
-    g_apply_band_at_ms = millis() + MLRS_ANNOUNCE_MS;
+    const uint32_t hold_ms = announce_ms();
+    g_apply_band_at_ms = millis() + hold_ms;
     g_apply_rate_at_ms = 0;
-    printf("[mLRS] announce band %s for %u ms\n",
+    printf("[mLRS] announce band %s / %s for %u ms on hop 0\n",
            band == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
-           (unsigned)MLRS_ANNOUNCE_MS);
+           kRates[band][new_rate].name, (unsigned)hold_ms);
     return true;
   }
   if (g_active && band == g_band) {
@@ -1268,9 +1410,17 @@ extern "C" void mlrs_ota_loop(void) {
 #else
   if (g_active && g_fhss_arm_rx) {
     g_fhss_arm_rx = 0;
-    if (g_fhss_follow) {
+    g_rx_need_rearm = 0;
+    uint8_t hops = g_fhss_pending_hops;
+    g_fhss_pending_hops = 0;
+    if (hops != 0) {
+      while (hops-- != 0) {
+        fhss_hop();
+      }
+    } else if (g_fhss_follow && g_fhss_do_hop) {
       fhss_hop();
     }
+    g_fhss_do_hop = 0;
     Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
   }
 #endif
@@ -1282,9 +1432,7 @@ extern "C" void mlrs_ota_loop(void) {
   if (g_apply_band_at_ms != 0 &&
       (int32_t)(millis() - g_apply_band_at_ms) >= 0) {
     if (g_pending_band != 0xFF && g_pending_band != g_band) {
-      g_rate = remap_rate_for_band(
-          g_band, g_pending_band,
-          g_pending_rate != 0xFF ? g_pending_rate : g_rate);
+      g_rate = sanitize_rate(g_pending_rate != 0xFF ? g_pending_rate : g_rate);
       g_band = sanitize_band(g_pending_band);
       save_band(g_band);
       save_rate(g_rate);
@@ -1310,6 +1458,9 @@ extern "C" void mlrs_ota_loop(void) {
   const uint8_t pending_rate = g_pending_rate;
   if (pending_band != 0xFF && pending_band != g_band &&
       pending_band < MLRS_BAND_COUNT) {
+    printf("[mLRS] rx follow band %s -> %s\n",
+           g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
+           pending_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz");
     g_band = pending_band;
     save_band(g_band);
     config_changed = true;
@@ -1326,7 +1477,6 @@ extern "C" void mlrs_ota_loop(void) {
     g_rate = sanitize_rate(pending_rate);
     save_rate(g_rate);
     config_changed = true;
-    g_rxok_stall_ms = 0;
   }
   if (pending_rate != 0xFF && g_pending_rate == pending_rate) {
     g_pending_rate = 0xFF;
@@ -1335,24 +1485,14 @@ extern "C" void mlrs_ota_loop(void) {
     apply_mlrs_rate();
   }
   if (g_active && !g_connected) {
+    const uint32_t heard_ms = g_last_rf_ms != 0 ? g_last_rf_ms : g_last_rx_ms;
     const bool heard_recently =
-        (g_last_rx_ms != 0) &&
-        ((int32_t)(millis() - g_last_rx_ms) < (int32_t)MLRS_RX_SCAN_MS);
+        (heard_ms != 0) &&
+        ((int32_t)(millis() - heard_ms) < (int32_t)MLRS_RX_SCAN_MS);
     if (heard_recently) {
       g_rate_scan_ms = millis();
-      g_rxok_stall_ms = millis();
     } else if (g_had_link) {
-      if (g_rxok_stall_ms == 0 || g_rx_ok != g_rxok_stall_count) {
-        g_rxok_stall_ms = millis();
-        g_rxok_stall_count = g_rx_ok;
-      } else if ((int32_t)(millis() - g_rxok_stall_ms) >=
-                 (int32_t)MLRS_RX_SCAN_MS) {
-        g_rxok_stall_ms = millis();
-        g_rate = next_scan_rate(g_rate);
-        save_rate(g_rate);
-        printf("[mLRS] rx lost, scan rate %s\n", current_rate_cfg()->name);
-        apply_mlrs_rate();
-      }
+      /* Stay on last rate/hop 0 so SWITCH_CMD and RATE_CMD can be heard. */
     } else {
       if (g_rate_scan_ms == 0) {
         g_rate_scan_ms = millis();
@@ -1369,7 +1509,6 @@ extern "C" void mlrs_ota_loop(void) {
     }
   } else {
     g_rate_scan_ms = 0;
-    g_rxok_stall_ms = 0;
   }
 #endif
   if (g_active && g_connected && (millis() - g_last_rx_ms) > MLRS_LOST_MS) {
@@ -1377,10 +1516,11 @@ extern "C" void mlrs_ota_loop(void) {
   }
   if (g_active && (millis() - g_last_hb_ms) > 2000) {
     g_last_hb_ms = millis();
-    printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxfail=%u/%u "
-           "rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u\n",
+    printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxcrc=%u "
+           "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u\n",
            (unsigned)g_lq, (unsigned)g_connected, (unsigned)g_tx_sent,
-           (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_last_rx_fail,
+           (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_rx_junk,
+           (unsigned)g_last_rx_fail,
            current_rate_cfg()->name,
            kRates[advertised_band()][advertised_rate()].name,
            (unsigned long)fhss_curr(), (unsigned)g_fhss_i,
