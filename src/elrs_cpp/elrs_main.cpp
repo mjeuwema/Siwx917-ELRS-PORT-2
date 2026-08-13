@@ -4681,6 +4681,92 @@ static void DataUlReceiveComplete() {
   dataUlReady = false;
 }
 
+void mlrs_elrs_rx_accept_uplink(const uint8_t *payload, uint8_t len) {
+  if (payload == nullptr || len == 0) {
+    return;
+  }
+  if (len > ELRS_DATA_UL_BUFFER) {
+    len = ELRS_DATA_UL_BUFFER;
+  }
+  memcpy(DataUlBuffer, payload, len);
+  dataUlReady = true;
+}
+
+uint8_t mlrs_elrs_rx_take_downlink(uint8_t *payload, uint8_t maxLen) {
+  if (payload == nullptr || maxLen == 0) {
+    return 0;
+  }
+  uint8_t nextPayloadSize = 0;
+  if (!otaConnector.GetNextPayload(&nextPayloadSize, payload) ||
+      nextPayloadSize == 0) {
+    return 0;
+  }
+  if (nextPayloadSize > maxLen) {
+    nextPayloadSize = maxLen;
+  }
+  return nextPayloadSize;
+}
+
+static void serviceMlrsHostBridge(unsigned long now) {
+  if (dataUlReady) {
+    DataUlReceiveComplete();
+  }
+
+  updateSerialRxState();
+  serviceCrsfSerialTelemetry();
+  crsfReceiver.processPending(!otaConnector.IsEmpty());
+
+  static uint32_t lastRcOutput = 0;
+  const uint8_t serialProtocol = getConfiguredSerialProtocol();
+  const bool shouldSendSerialRc = shouldOutputSerialRcFrames();
+  const uint32_t rcOutputAge = now - lastRcOutput;
+  if (shouldSendSerialRc &&
+      rcOutputAge >= serialRcOutputIntervalMs(serialProtocol)) {
+    lastRcOutput = now;
+    if (serialProtocolUsesSbus(serialProtocol)) {
+      const bool failsafeActive = connectionState != connected;
+      (void)crsf_serial_send_sbus_channels(ChannelData, failsafeActive,
+                                           failsafeActive);
+    } else if (serialProtocolUsesSumd(serialProtocol)) {
+      (void)crsf_serial_send_sumd_channels(ChannelData);
+    } else {
+      uint32_t crsfChannels[CRSF_NUM_CHANNELS] = {};
+      prepareCrsfSerialChannels(crsfChannels);
+      (void)crsf_serial_send_channels(crsfChannels);
+    }
+  }
+
+  static uint32_t lastLinkStatsUpdate = 0;
+  if ((now - lastLinkStatsUpdate) > SEND_LINK_STATS_TO_FC_INTERVAL) {
+    lastLinkStatsUpdate = now;
+    currentLinkStats.rssi_1 = linkStats.uplink_RSSI_1;
+    currentLinkStats.rssi_2 = linkStats.uplink_RSSI_2;
+    currentLinkStats.snr = linkStats.uplink_SNR;
+    currentLinkStats.lq = uplinkLQ;
+    currentLinkStats.active_ant = antenna;
+    if (ExpressLRS_currAirRate_Modparams) {
+      currentLinkStats.rf_mode = ExpressLRS_currAirRate_Modparams->index;
+    }
+    if (crsf_serial_is_ready() && configuredSerialProtocolUsesCrsf() &&
+        (connectionState == connected) && (TxOtaProtocol == TX_NORMAL_MODE)) {
+      crsf_link_stats_t crsfStats;
+      crsfStats.uplink_rssi_1 = linkStats.uplink_RSSI_1;
+      crsfStats.uplink_rssi_2 = linkStats.uplink_RSSI_2;
+      crsfStats.uplink_lq = uplinkLQ;
+      crsfStats.uplink_snr = linkStats.uplink_SNR;
+      crsfStats.active_antenna = antenna;
+      crsfStats.rf_mode = ExpressLRS_currAirRate_Modparams
+                              ? ExpressLRS_currAirRate_Modparams->index
+                              : 0;
+      crsfStats.uplink_tx_power = linkStats.uplink_TX_Power;
+      crsfStats.downlink_rssi = 0;
+      crsfStats.downlink_lq = 0;
+      crsfStats.downlink_snr = 0;
+      crsf_serial_send_link_stats(&crsfStats);
+    }
+  }
+}
+
 //=============================================================================
 // Rate cycling for connection scanning
 //=============================================================================
@@ -5020,6 +5106,9 @@ void elrs_loop(void) {
   mlrs_ota_loop();
   if (mlrs_ota_is_active()) {
     hwTimer::service();
+    status_led_update();
+    bind_button_poll();
+    serviceMlrsHostBridge(millis());
     return;
   }
   ServiceDeferredTelemetryTx();

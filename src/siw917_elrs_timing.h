@@ -333,6 +333,15 @@
 #endif
 
 /*
+ * Fast GSPI command/response cap. ELRS packets stay well under 32 bytes, but
+ * mLRS uses 91-byte frames (GET_PACKET reads 97, WRITE_BUFFER8_SET_TX writes
+ * 94). The byte-by-byte FIFO loop is not limited to 64 bytes of hardware FIFO.
+ */
+#ifndef LR1121_FAST_SPI_MAX_BYTES
+#define LR1121_FAST_SPI_MAX_BYTES 128U
+#endif
+
+/*
  * Low-rate Lua/downlink progress trace. This runs from the ELRS task only, not
  * from RF IRQ context, so it should not disturb the timer/DIO hot path while we
  * diagnose long Lua parameter downloads.

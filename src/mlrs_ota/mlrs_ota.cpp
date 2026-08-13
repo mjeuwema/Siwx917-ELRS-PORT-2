@@ -5,6 +5,7 @@
 #include "LR1121.h"
 #include "LR1121_Regs.h"
 #include "common.h"
+#include "crsf_protocol.h"
 #include "device.h"
 #include "hwTimer.h"
 
@@ -22,15 +23,27 @@ extern expresslrs_mod_settings_s *ExpressLRS_currAirRate_Modparams;
 
 #if defined(SIW917_ELRS_TARGET_TX) || defined(TARGET_TX)
 #define MLRS_OTA_IS_TX 1
+#include "CRSFRouter.h"
+#include "TXOTAConnector.h"
 #include "stubborn_sender.h"
 extern StubbornSender DataUlSender;
+extern CRSFRouter crsfRouter;
+extern TXOTAConnector otaConnector;
+void sendCRSFTelemetryToBackpack(uint8_t *);
+extern "C" void siw917_tx_note_mlrs_downlink(uint8_t lq, int8_t rssi, int8_t snr);
+extern "C" void siw917_tx_publish_mlrs_linkstats(void);
 #else
 #define MLRS_OTA_IS_TX 0
 #endif
 
-#ifndef PACKED
-#define PACKED(__Declaration__) __Declaration__ __attribute__((packed))
+extern elrsLinkStatistics_t linkStats;
+extern bool connectionHasModelMatch;
+#if !MLRS_OTA_IS_TX
+extern uint8_t uplinkLQ;
 #endif
+
+#undef PACKED
+#define PACKED(__Declaration__) __Declaration__ __attribute__((packed))
 
 #define FRAME_TX_RX_LEN 91
 #define FRAME_TX_RX_HEADER_LEN 7
@@ -43,6 +56,8 @@ extern StubbornSender DataUlSender;
 #define FHSS_LIST_24_LEN 80
 #define FHSS_BIND_CH_24 46
 #define MLRS_SWITCH_CMD 0xE1
+#define MLRS_ANNOUNCE_MS 500
+#define MLRS_RX_SCAN_MS 800
 
 typedef struct {
   uint32_t interval_us;
@@ -76,6 +91,7 @@ static const mlrs_rate_cfg_t kRates[MLRS_BAND_COUNT][MLRS_RATE_COUNT] = {
 enum {
   FRAME_TYPE_TX = 0x00,
   FRAME_TYPE_RX = 0x01,
+  FRAME_TYPE_TX_RX_CMD = 0x02,
 };
 
 PACKED(typedef struct {
@@ -150,6 +166,8 @@ PACKED(typedef struct {
 })
 tRxFrame;
 
+static_assert(sizeof(tTxFrameStatus) == 5, "tTxFrameStatus size");
+static_assert(sizeof(tRxFrameStatus) == 5, "tRxFrameStatus size");
 static_assert(sizeof(tTxFrame) == FRAME_TX_RX_LEN, "tTxFrame size");
 static_assert(sizeof(tRxFrame) == FRAME_TX_RX_LEN, "tRxFrame size");
 
@@ -176,17 +194,42 @@ static uint32_t g_apply_at_ms = 0;
 static uint8_t g_pending_protocol = 0xFF;
 static uint8_t g_pending_rate = 0xFF;
 static uint8_t g_pending_band = 0xFF;
+static uint32_t g_apply_rate_at_ms = 0;
+static uint32_t g_apply_band_at_ms = 0;
+#if !MLRS_OTA_IS_TX
+static uint32_t g_rate_scan_ms = 0;
+#endif
 static uint16_t g_sync_word = 0;
 static uint32_t g_fhss_seed = 0;
 static uint32_t g_fhss_list[FHSS_MAX_HOPS] = {};
 static uint8_t g_fhss_ch[FHSS_MAX_HOPS] = {};
 static uint8_t g_fhss_count = FHSS_NUM_915;
 static uint8_t g_fhss_i = 0;
+#if MLRS_OTA_IS_TX
+static bool g_fhss_need_hop = false;
+static bool g_logged_switch_cmd = false;
+#else
+static bool g_fhss_follow = false;
+static volatile uint8_t g_fhss_arm_rx = 0;
+static bool g_had_link = false;
+static uint32_t g_rxok_stall_ms = 0;
+static uint32_t g_rxok_stall_count = 0;
+#endif
 static uint8_t g_seq = 0;
 static uint8_t g_lq = 0;
 static uint8_t g_valid_window = 0;
 static uint32_t g_last_rx_ms = 0;
+static uint32_t g_last_hb_ms = 0;
 static bool g_connected = false;
+static volatile uint8_t g_print_connected = 0;
+static volatile uint8_t g_print_disconnected = 0;
+static uint32_t g_tx_sent = 0;
+static uint32_t g_rx_ok = 0;
+static uint32_t g_rx_fail = 0;
+static uint8_t g_last_rx_fail = 0;
+#if MLRS_OTA_IS_TX
+static volatile uint8_t g_tx_send_pending = 0;
+#endif
 static tTxFrame g_tx_frame = {};
 static tRxFrame g_rx_frame = {};
 
@@ -264,10 +307,37 @@ static uint8_t sanitize_band(uint8_t band) {
 
 static uint8_t sanitize_rate(uint8_t rate) {
   if (rate >= MLRS_RATE_COUNT) {
-    return 0;
+    return MLRS_RATE_31HZ;
+  }
+  /* 915 FSK is not proven on this SPI path; keep LoRa until it is. */
+  if (sanitize_band(g_band) == MLRS_BAND_915 && rate == MLRS_RATE_FSK50) {
+    return MLRS_RATE_31HZ;
   }
   return rate;
 }
+
+static uint8_t advertised_rate() {
+  if (g_pending_rate != 0xFF) {
+    return sanitize_rate(g_pending_rate);
+  }
+  return sanitize_rate(g_rate);
+}
+
+static uint8_t advertised_band() {
+  if (g_pending_band != 0xFF) {
+    return sanitize_band(g_pending_band);
+  }
+  return sanitize_band(g_band);
+}
+
+#if !MLRS_OTA_IS_TX
+static uint8_t next_scan_rate(uint8_t rate) {
+  if (sanitize_band(g_band) == MLRS_BAND_915) {
+    return (rate == MLRS_RATE_31HZ) ? MLRS_RATE_19HZ : MLRS_RATE_31HZ;
+  }
+  return (uint8_t)((rate + 1U) % MLRS_RATE_COUNT);
+}
+#endif
 
 static const mlrs_rate_cfg_t *current_rate_cfg() {
   return &kRates[sanitize_band(g_band)][sanitize_rate(g_rate)];
@@ -335,6 +405,12 @@ static void fhss_generate() {
     g_fhss_count = k;
   }
   g_fhss_i = 0;
+#if MLRS_OTA_IS_TX
+  g_fhss_need_hop = false;
+#else
+  g_fhss_follow = false;
+  g_fhss_arm_rx = 0;
+#endif
 }
 
 static uint32_t fhss_curr() { return g_fhss_list[g_fhss_i]; }
@@ -378,7 +454,9 @@ static void save_protocol(uint8_t protocol) {
   if (cfg == nullptr) {
     return;
   }
-  cfg->reserved[ELRS_RESERVED_AIR_PROTOCOL_OFFSET] = protocol;
+  /* Do not persist mLRS across reboot until the overlay is stable. */
+  (void)protocol;
+  cfg->reserved[ELRS_RESERVED_AIR_PROTOCOL_OFFSET] = ELRS_AIR_PROTOCOL_ELRS;
   (void)elrs_config_save();
 }
 
@@ -444,7 +522,7 @@ static uint8_t remap_rate_for_band(uint8_t from_band, uint8_t to_band,
 
 #if MLRS_OTA_IS_TX
 static void pack_tx_frame(tTxFrame *frame, const uint16_t rc[16],
-                          uint8_t fhss_index, uint8_t seq, uint8_t lq,
+                          uint8_t fhss_index, uint8_t seq, uint8_t lq, bool ack,
                           const uint8_t *payload, uint8_t payload_len) {
   memset(frame, 0, sizeof(*frame));
   if (payload_len > FRAME_TX_PAYLOAD_LEN) {
@@ -452,15 +530,17 @@ static void pack_tx_frame(tTxFrame *frame, const uint16_t rc[16],
   }
   frame->sync_word = g_sync_word;
   frame->status.seq_no = seq & 0x7;
-  frame->status.ack = 0;
-  frame->status.frame_type = FRAME_TYPE_TX;
+  frame->status.ack = ack ? 1 : 0;
+  frame->status.frame_type = (g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS)
+                                 ? FRAME_TYPE_TX_RX_CMD
+                                 : FRAME_TYPE_TX;
   frame->status.antenna = 0;
   frame->status.transmit_antenna = 0;
   frame->status.rssi_u7 = rssi_u7_from_i8(Radio.LastPacketRSSI);
-  frame->status.fhss_index_band = sanitize_band(g_band) & 0x1;
+  frame->status.fhss_index_band = advertised_band() & 0x1;
   frame->status.fhss_index = fhss_index & 0x3F;
   frame->status.LQ_serial = lq;
-  frame->status.spare = sanitize_rate(g_rate) & 0x3;
+  frame->status.spare = advertised_rate() & 0x3;
   frame->status.payload_len = payload_len;
   frame->rc1.ch0 = rc[0];
   frame->rc1.ch1 = rc[1];
@@ -498,7 +578,8 @@ static uint8_t check_tx_frame(const tTxFrame *frame) {
   if (frame->sync_word != g_sync_word) {
     return 1;
   }
-  if (frame->status.frame_type != FRAME_TYPE_TX) {
+  if ((frame->status.frame_type != FRAME_TYPE_TX) &&
+      (frame->status.frame_type != FRAME_TYPE_TX_RX_CMD)) {
     return 2;
   }
   uint16_t crc;
@@ -538,18 +619,25 @@ static void unpack_tx_rc(const tTxFrame *frame, uint16_t rc[16]) {
   rc[15] = (frame->rc2.ch15 > 1) ? 2047 : ((frame->rc2.ch15 < 1) ? 0 : 1024);
 }
 
-static void pack_rx_frame(tRxFrame *frame, uint8_t seq, uint8_t lq) {
+static void pack_rx_frame(tRxFrame *frame, uint8_t seq, uint8_t lq, bool ack,
+                          const uint8_t *payload, uint8_t payload_len) {
   memset(frame, 0, sizeof(*frame));
+  if (payload_len > FRAME_RX_PAYLOAD_LEN) {
+    payload_len = FRAME_RX_PAYLOAD_LEN;
+  }
   frame->sync_word = g_sync_word;
   frame->status.seq_no = seq & 0x7;
-  frame->status.ack = 1;
+  frame->status.ack = ack ? 1 : 0;
   frame->status.frame_type = FRAME_TYPE_RX;
   frame->status.antenna = 0;
   frame->status.transmit_antenna = 0;
   frame->status.rssi_u7 = rssi_u7_from_i8(Radio.LastPacketRSSI);
   frame->status.LQ_rc = lq;
   frame->status.LQ_serial = lq;
-  frame->status.payload_len = 0;
+  frame->status.payload_len = payload_len;
+  if (payload != nullptr && payload_len > 0) {
+    memcpy(frame->payload, payload, payload_len);
+  }
   uint16_t crc;
   crc_init(&crc);
   crc_accumulate_buf(&crc, (uint8_t *)frame, FRAME_TX_RX_LEN - 2);
@@ -641,10 +729,25 @@ static void note_valid_rx() {
     ++g_valid_window;
   }
   g_lq = (uint8_t)((g_valid_window > 100) ? 100 : g_valid_window);
+#if MLRS_OTA_IS_TX
+  siw917_tx_note_mlrs_downlink(
+      g_lq, Radio.LastPacketRSSI, (int8_t)SNR_DESCALE(Radio.LastPacketSNRRaw));
+#else
+  uplinkLQ = g_lq;
+  linkStats.uplink_Link_quality = g_lq;
+  linkStats.uplink_RSSI_1 = Radio.LastPacketRSSI;
+  linkStats.uplink_SNR = (int8_t)SNR_DESCALE(Radio.LastPacketSNRRaw);
+  connectionHasModelMatch = true;
+#endif
   if (!g_connected && g_valid_window >= 3) {
     g_connected = true;
+    setConnectionState(connected);
+    g_print_connected = 1;
+#if !MLRS_OTA_IS_TX
+    g_had_link = true;
+#endif
+  } else if (g_connected) {
     connectionState = connected;
-    printf("[mLRS] connected lq=%u\n", (unsigned)g_lq);
   }
 }
 
@@ -655,8 +758,14 @@ static void note_missed_rx() {
   g_lq = (uint8_t)((g_valid_window > 100) ? 100 : g_valid_window);
   if (g_connected && (millis() - g_last_rx_ms) > 1000) {
     g_connected = false;
-    connectionState = disconnected;
-    printf("[mLRS] disconnected\n");
+    setConnectionState(disconnected);
+    g_print_disconnected = 1;
+    g_fhss_i = 0;
+#if MLRS_OTA_IS_TX
+    g_fhss_need_hop = false;
+#else
+    g_fhss_follow = false;
+#endif
   }
 }
 
@@ -668,29 +777,56 @@ static void fill_rc_from_handset(uint16_t rc[16]) {
 }
 
 static void mlrs_tx_send_frame() {
+  if (g_fhss_need_hop) {
+    fhss_hop();
+    g_fhss_need_hop = false;
+  }
   uint16_t rc[16];
   fill_rc_from_handset(rc);
-  uint8_t payload[1] = {0};
+  uint8_t payload[FRAME_TX_PAYLOAD_LEN] = {};
   uint8_t payload_len = 0;
   if (g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS) {
     payload[0] = MLRS_SWITCH_CMD;
     payload_len = 1;
+  } else {
+    (void)otaConnector.takeQueuedPayload(payload, &payload_len,
+                                         FRAME_TX_PAYLOAD_LEN);
   }
-  fhss_hop();
-  pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq, payload, payload_len);
+  pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq, false, payload,
+                payload_len);
   Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, false, 0);
   Radio.TXnb((uint8_t *)&g_tx_frame, false, nullptr, SX12XX_Radio_All);
+  ++g_tx_sent;
+  g_fhss_need_hop = true;
+  if (g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS && !g_logged_switch_cmd) {
+    g_logged_switch_cmd = true;
+    printf("[mLRS] tx switch cmd hop=%u plen=%u\n", (unsigned)g_fhss_i,
+           (unsigned)payload_len);
+  }
+  if (g_tx_sent == 1) {
+    printf("[mLRS] first TX hop=%u freq=%lu Hz plen=%u\n", (unsigned)g_fhss_i,
+           (unsigned long)fhss_curr(), (unsigned)FRAME_TX_RX_LEN);
+  }
 }
 
-static void mlrs_tx_tock() { mlrs_tx_send_frame(); }
+static void mlrs_tx_tock() { g_tx_send_pending = 1; }
 
 static void mlrs_tx_done() { Radio.RXnb(); }
 
 static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
-  memcpy(&g_rx_frame, Radio.GetRxPayloadBuffer(), sizeof(g_rx_frame));
-  if (check_rx_frame(&g_rx_frame) == 0) {
+  memcpy(&g_rx_frame, Radio.RXdataBuffer, sizeof(g_rx_frame));
+  const uint8_t fail = check_rx_frame(&g_rx_frame);
+  if (fail == 0) {
+    ++g_rx_ok;
     note_valid_rx();
+    if (g_rx_frame.status.payload_len >= CRSF_MIN_PACKET_LEN) {
+      crsfRouter.processMessage(&otaConnector,
+                                (crsf_header_t *)g_rx_frame.payload);
+      sendCRSFTelemetryToBackpack(g_rx_frame.payload);
+    }
   } else {
+    ++g_rx_fail;
+    g_last_rx_fail = fail;
     note_missed_rx();
   }
   return true;
@@ -712,24 +848,34 @@ static void apply_rc_to_elrs(const uint16_t rc[16]) {
 }
 
 static void mlrs_rx_send_tlm() {
-  pack_rx_frame(&g_rx_frame, g_seq++, g_lq);
+  uint8_t payload[FRAME_RX_PAYLOAD_LEN] = {};
+  const uint8_t payload_len =
+      mlrs_elrs_rx_take_downlink(payload, FRAME_RX_PAYLOAD_LEN);
+  pack_rx_frame(&g_rx_frame, g_seq++, g_lq, false, payload, payload_len);
   Radio.TXnb((uint8_t *)&g_rx_frame, false, nullptr, SX12XX_Radio_All);
+  ++g_tx_sent;
 }
 
-static void mlrs_rx_done_tx() {
-  fhss_hop();
-  Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
-}
+static void mlrs_rx_done_tx() { g_fhss_arm_rx = 1; }
 
 static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
   memcpy(&g_tx_frame, Radio.RXdataBuffer, sizeof(g_tx_frame));
-  if (check_tx_frame(&g_tx_frame) != 0) {
+  const uint8_t fail = check_tx_frame(&g_tx_frame);
+  if (fail != 0) {
+    ++g_rx_fail;
+    g_last_rx_fail = fail;
     note_missed_rx();
-    Radio.RXnb();
+    if (g_fhss_follow) {
+      g_fhss_arm_rx = 1;
+    } else {
+      Radio.RXnb();
+    }
     return true;
   }
+  ++g_rx_ok;
   note_valid_rx();
   fhss_set_index(g_tx_frame.status.fhss_index);
+  g_fhss_follow = true;
   if ((g_tx_frame.status.fhss_index_band != g_band) &&
       (g_tx_frame.status.fhss_index_band < MLRS_BAND_COUNT)) {
     g_pending_band = (uint8_t)g_tx_frame.status.fhss_index_band;
@@ -741,21 +887,31 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
   uint16_t rc[16];
   unpack_tx_rc(&g_tx_frame, rc);
   apply_rc_to_elrs(rc);
-  if (g_tx_frame.status.payload_len > 0 &&
-      g_tx_frame.payload[0] == MLRS_SWITCH_CMD) {
+  if (g_tx_frame.status.frame_type == FRAME_TYPE_TX_RX_CMD ||
+      (g_tx_frame.status.payload_len == 1 &&
+       g_tx_frame.payload[0] == MLRS_SWITCH_CMD)) {
+    printf("[mLRS] rx switch cmd -> ELRS type=%u plen=%u\n",
+           (unsigned)g_tx_frame.status.frame_type,
+           (unsigned)g_tx_frame.status.payload_len);
     g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
     g_apply_at_ms = millis() + 50;
+    g_fhss_follow = false;
+  } else if (g_tx_frame.status.payload_len > 0) {
+    mlrs_elrs_rx_accept_uplink(g_tx_frame.payload,
+                               (uint8_t)g_tx_frame.status.payload_len);
   }
   mlrs_rx_send_tlm();
   return true;
 }
 
 static void mlrs_rx_tock() {
+  if (!g_fhss_follow) {
+    return;
+  }
   const uint32_t miss_ms = (current_rate_cfg()->interval_us / 1000U) + 8U;
   if ((millis() - g_last_rx_ms) > miss_ms) {
     note_missed_rx();
-    fhss_hop();
-    Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
+    g_fhss_arm_rx = 1;
   }
 }
 #endif
@@ -774,7 +930,9 @@ static void start_mlrs() {
 
   hwTimer::stop();
   Radio.SetTxIdleMode();
+  Radio.ClearIrqStatus(SX12XX_Radio_All);
   configure_mlrs_radio();
+  delay(5);
 
 #if MLRS_OTA_IS_TX
   Radio.TXdoneCallback = mlrs_tx_done;
@@ -789,16 +947,42 @@ static void start_mlrs() {
   g_seq = 0;
   g_valid_window = 0;
   g_connected = false;
+  g_tx_sent = 0;
+  g_rx_ok = 0;
+  g_rx_fail = 0;
+  g_last_rx_fail = 0;
+#if MLRS_OTA_IS_TX
+  g_tx_send_pending = 0;
+  g_logged_switch_cmd = false;
+#else
+  g_had_link = false;
+  g_rxok_stall_ms = 0;
+  g_rxok_stall_count = 0;
+#endif
   g_active = true;
   g_protocol = ELRS_AIR_PROTOCOL_MLRS;
-  connectionState = disconnected;
+#if MLRS_OTA_IS_TX
+  /* Keep the last ELRS RQly on the handset. EdgeTX treats CRSF LQ=0 as
+   * telemetry dead and will not recover until a later non-zero 0x14. */
+  siw917_tx_publish_mlrs_linkstats();
+#else
+  setConnectionState(disconnected);
+#endif
   hwTimer::resume();
+#if MLRS_OTA_IS_TX
+  if (g_tx_send_pending) {
+    g_tx_send_pending = 0;
+    mlrs_tx_send_frame();
+  }
+#endif
 #if !MLRS_OTA_IS_TX
   Radio.RXnb();
 #endif
-  printf("[mLRS] air protocol started (%s/%s, sync=0x%04X)\n",
+  printf("[mLRS] air protocol started (%s/%s, sync=0x%04X freq=%lu hop=0/%u)\n",
          g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz", current_rate_cfg()->name,
-         (unsigned)g_sync_word);
+         (unsigned)g_sync_word, (unsigned long)fhss_curr(),
+         (unsigned)g_fhss_count);
+  printf("[mLRS] CRSF frames in payload (no stubborn)\n");
 }
 
 static void stop_mlrs() {
@@ -807,6 +991,7 @@ static void stop_mlrs() {
   }
   hwTimer::stop();
   Radio.SetTxIdleMode();
+  Radio.ClearIrqStatus(SX12XX_Radio_All);
   Radio.RXdoneCallback = g_saved_rx_cb;
   Radio.TXdoneCallback = g_saved_tx_cb;
   hwTimer::callbackTick = g_saved_tick;
@@ -815,9 +1000,10 @@ static void stop_mlrs() {
     hwTimer::updateInterval(g_saved_interval_us);
   }
   restore_elrs_radio();
+  delay(5);
   g_active = false;
   g_protocol = ELRS_AIR_PROTOCOL_ELRS;
-  connectionState = disconnected;
+  setConnectionState(disconnected);
   hwTimer::resume();
 #if !MLRS_OTA_IS_TX
   Radio.RXnb();
@@ -834,10 +1020,11 @@ static void apply_protocol(uint8_t protocol) {
     stop_mlrs();
   }
   save_protocol(protocol);
-  devicesTriggerEvent(EVENT_CONFIG_MAIN_CHANGED);
 }
 
 extern "C" bool mlrs_ota_is_active(void) { return g_active; }
+
+extern "C" bool mlrs_ota_is_connected(void) { return g_active && g_connected; }
 
 extern "C" uint8_t mlrs_ota_get_protocol(void) {
   if (g_pending_protocol != 0xFF) {
@@ -856,10 +1043,21 @@ extern "C" bool mlrs_ota_set_protocol(uint8_t protocol) {
   printf("[mLRS] lua/air protocol -> %s\n",
          protocol == ELRS_AIR_PROTOCOL_MLRS ? "mLRS" : "ELRS");
 #if MLRS_OTA_IS_TX
+  if (protocol == ELRS_AIR_PROTOCOL_MLRS && g_active) {
+    g_pending_protocol = 0xFF;
+    g_apply_at_ms = 0;
+    return true;
+  }
   if (protocol == ELRS_AIR_PROTOCOL_MLRS && !g_active) {
     notify_rx_protocol(protocol);
     g_pending_protocol = protocol;
     g_apply_at_ms = millis() + 400;
+    return true;
+  }
+  if (protocol == ELRS_AIR_PROTOCOL_ELRS && g_active) {
+    g_pending_protocol = ELRS_AIR_PROTOCOL_ELRS;
+    g_apply_at_ms = millis() + MLRS_ANNOUNCE_MS;
+    printf("[mLRS] announce ELRS for %u ms\n", (unsigned)MLRS_ANNOUNCE_MS);
     return true;
   }
 #endif
@@ -896,16 +1094,29 @@ extern "C" bool mlrs_ota_set_rate(uint8_t rate) {
     return true;
   }
   printf("[mLRS] lua/air rate -> %s\n", kRates[sanitize_band(g_band)][rate].name);
-  g_rate = rate;
-  g_pending_rate = 0xFF;
   save_rate(rate);
 #if MLRS_OTA_IS_TX
   if (g_pending_protocol == ELRS_AIR_PROTOCOL_MLRS && !g_active) {
     notify_rx_protocol(ELRS_AIR_PROTOCOL_MLRS);
   }
+  if (g_active && rate != g_rate) {
+    g_pending_rate = rate;
+    g_apply_rate_at_ms = millis() + MLRS_ANNOUNCE_MS;
+    printf("[mLRS] announce rate %s for %u ms\n",
+           kRates[sanitize_band(g_band)][rate].name,
+           (unsigned)MLRS_ANNOUNCE_MS);
+    return true;
+  }
+  if (g_active && rate == g_rate) {
+    g_pending_rate = 0xFF;
+    g_apply_rate_at_ms = 0;
+    return true;
+  }
 #endif
+  g_rate = rate;
+  g_pending_rate = 0xFF;
+  g_apply_rate_at_ms = 0;
   apply_mlrs_rate();
-  devicesTriggerEvent(EVENT_CONFIG_MAIN_CHANGED);
   return true;
 }
 
@@ -914,20 +1125,39 @@ extern "C" bool mlrs_ota_set_band(uint8_t band) {
   if (band == g_band && g_pending_band == 0xFF) {
     return true;
   }
-  g_rate = remap_rate_for_band(g_band, band, g_rate);
-  g_band = band;
-  g_pending_band = 0xFF;
-  save_band(band);
-  save_rate(g_rate);
+  const uint8_t new_rate = remap_rate_for_band(g_band, band, advertised_rate());
   printf("[mLRS] lua/air band -> %s / %s\n",
-         band == MLRS_BAND_24 ? "2.4GHz" : "915MHz", current_rate_cfg()->name);
+         band == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
+         kRates[band][new_rate].name);
+  save_band(band);
+  save_rate(new_rate);
 #if MLRS_OTA_IS_TX
   if (g_pending_protocol == ELRS_AIR_PROTOCOL_MLRS && !g_active) {
     notify_rx_protocol(ELRS_AIR_PROTOCOL_MLRS);
   }
+  if (g_active && band != g_band) {
+    g_pending_band = band;
+    g_pending_rate = new_rate;
+    g_apply_band_at_ms = millis() + MLRS_ANNOUNCE_MS;
+    g_apply_rate_at_ms = 0;
+    printf("[mLRS] announce band %s for %u ms\n",
+           band == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
+           (unsigned)MLRS_ANNOUNCE_MS);
+    return true;
+  }
+  if (g_active && band == g_band) {
+    g_pending_band = 0xFF;
+    g_apply_band_at_ms = 0;
+    return true;
+  }
 #endif
+  g_rate = new_rate;
+  g_band = band;
+  g_pending_band = 0xFF;
+  g_pending_rate = 0xFF;
+  g_apply_band_at_ms = 0;
+  g_apply_rate_at_ms = 0;
   apply_mlrs_rate();
-  devicesTriggerEvent(EVENT_CONFIG_MAIN_CHANGED);
   return true;
 }
 
@@ -935,21 +1165,80 @@ extern "C" void mlrs_ota_on_elrs_ready(void) {
   g_elrs_ready = true;
   g_band = config_band();
   g_rate = config_rate();
-  g_protocol = config_protocol();
-  printf("[mLRS] boot air protocol=%s band=%s rate=%s\n",
-         g_protocol == ELRS_AIR_PROTOCOL_MLRS ? "mLRS" : "ELRS",
+  g_protocol = ELRS_AIR_PROTOCOL_ELRS;
+  if (config_protocol() == ELRS_AIR_PROTOCOL_MLRS) {
+    save_protocol(ELRS_AIR_PROTOCOL_ELRS);
+  }
+  printf("[mLRS] boot air protocol=ELRS band=%s rate=%s (mLRS Lua-selected only)\n",
          g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz",
          current_rate_cfg()->name);
-  if (g_protocol == ELRS_AIR_PROTOCOL_MLRS) {
-    apply_protocol(ELRS_AIR_PROTOCOL_MLRS);
-  }
 }
 
 extern "C" void mlrs_ota_loop(void) {
+  if (g_print_connected) {
+    g_print_connected = 0;
+    printf("[mLRS] connected lq=%u\n", (unsigned)g_lq);
+#if MLRS_OTA_IS_TX
+    siw917_tx_publish_mlrs_linkstats();
+#endif
+  }
+  if (g_print_disconnected) {
+    g_print_disconnected = 0;
+    printf("[mLRS] disconnected\n");
+  }
+#if MLRS_OTA_IS_TX
+  if (g_active && g_tx_send_pending) {
+    g_tx_send_pending = 0;
+    mlrs_tx_send_frame();
+  }
+  if (g_active) {
+    static uint32_t g_last_handset_tlm_ms = 0;
+    if (g_last_handset_tlm_ms == 0 ||
+        (int32_t)(millis() - g_last_handset_tlm_ms) >= 200) {
+      g_last_handset_tlm_ms = millis();
+      siw917_tx_publish_mlrs_linkstats();
+    }
+  }
+#else
+  if (g_active && g_fhss_arm_rx) {
+    g_fhss_arm_rx = 0;
+    if (g_fhss_follow) {
+      fhss_hop();
+    }
+    Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
+  }
+#endif
   if (g_pending_protocol != 0xFF && g_apply_at_ms != 0 &&
       (int32_t)(millis() - g_apply_at_ms) >= 0) {
     apply_protocol(g_pending_protocol);
   }
+#if MLRS_OTA_IS_TX
+  if (g_apply_band_at_ms != 0 &&
+      (int32_t)(millis() - g_apply_band_at_ms) >= 0) {
+    if (g_pending_band != 0xFF && g_pending_band != g_band) {
+      g_rate = remap_rate_for_band(
+          g_band, g_pending_band,
+          g_pending_rate != 0xFF ? g_pending_rate : g_rate);
+      g_band = sanitize_band(g_pending_band);
+      save_band(g_band);
+      save_rate(g_rate);
+      apply_mlrs_rate();
+    }
+    g_pending_band = 0xFF;
+    g_pending_rate = 0xFF;
+    g_apply_band_at_ms = 0;
+    g_apply_rate_at_ms = 0;
+  } else if (g_apply_rate_at_ms != 0 &&
+             (int32_t)(millis() - g_apply_rate_at_ms) >= 0) {
+    if (g_pending_rate != 0xFF && g_pending_rate != g_rate) {
+      g_rate = sanitize_rate(g_pending_rate);
+      save_rate(g_rate);
+      apply_mlrs_rate();
+    }
+    g_pending_rate = 0xFF;
+    g_apply_rate_at_ms = 0;
+  }
+#else
   bool config_changed = false;
   if (g_pending_band != 0xFF && g_pending_band != g_band &&
       g_pending_band < MLRS_BAND_COUNT) {
@@ -960,7 +1249,7 @@ extern "C" void mlrs_ota_loop(void) {
   g_pending_band = 0xFF;
   if (g_pending_rate != 0xFF && g_pending_rate != g_rate &&
       g_pending_rate < MLRS_RATE_COUNT) {
-    g_rate = g_pending_rate;
+    g_rate = sanitize_rate(g_pending_rate);
     save_rate(g_rate);
     config_changed = true;
   }
@@ -968,8 +1257,48 @@ extern "C" void mlrs_ota_loop(void) {
   if (config_changed) {
     apply_mlrs_rate();
   }
+  if (g_active && !g_connected) {
+    if (g_had_link) {
+      if (g_rxok_stall_ms == 0 || g_rx_ok != g_rxok_stall_count) {
+        g_rxok_stall_ms = millis();
+        g_rxok_stall_count = g_rx_ok;
+      } else if ((int32_t)(millis() - g_rxok_stall_ms) >= 3000) {
+        printf("[mLRS] rx lost mLRS, restore ELRS\n");
+        apply_protocol(ELRS_AIR_PROTOCOL_ELRS);
+      }
+    }
+    if (g_rate_scan_ms == 0) {
+      g_rate_scan_ms = millis();
+    }
+    if (g_active &&
+        (int32_t)(millis() - g_rate_scan_ms) >= (int32_t)MLRS_RX_SCAN_MS) {
+      g_rate_scan_ms = millis();
+      const uint8_t next = next_scan_rate(g_rate);
+      if (next != g_rate) {
+        g_rate = next;
+        printf("[mLRS] rx scan rate %s\n", current_rate_cfg()->name);
+        apply_mlrs_rate();
+      }
+    }
+  } else {
+    g_rate_scan_ms = 0;
+    g_rxok_stall_ms = 0;
+  }
+#endif
   if (g_active && g_connected && (millis() - g_last_rx_ms) > 1500) {
     note_missed_rx();
+  }
+  if (g_active && (millis() - g_last_hb_ms) > 2000) {
+    g_last_hb_ms = millis();
+    printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxfail=%u/%u "
+           "rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u\n",
+           (unsigned)g_lq, (unsigned)g_connected, (unsigned)g_tx_sent,
+           (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_last_rx_fail,
+           current_rate_cfg()->name,
+           kRates[advertised_band()][advertised_rate()].name,
+           (unsigned long)fhss_curr(), (unsigned)g_fhss_i,
+           (int)(int8_t)linkStats.uplink_RSSI_1,
+           (unsigned)linkStats.uplink_Link_quality);
   }
 }
 
