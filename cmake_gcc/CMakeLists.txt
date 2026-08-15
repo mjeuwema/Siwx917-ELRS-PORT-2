@@ -126,6 +126,7 @@ set(ELRS_CPP_SOURCES
 
 list(APPEND ELRS_CPP_SOURCES "../src/mlrs_ota/mlrs_ota.cpp")
 list(APPEND ELRS_CPP_SOURCES "../src/mlrs_ota/mlrs_aes_gcm.cpp")
+list(APPEND ELRS_CPP_SOURCES "../src/mlrs_ota/mlrs_mavlinkx.cpp")
 
 #=============================================================================
 # Main executable

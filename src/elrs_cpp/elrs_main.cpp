@@ -4711,6 +4711,13 @@ void mlrs_elrs_rx_accept_uplink(const uint8_t *payload, uint8_t len) {
   dataUlReady = true;
 }
 
+void mlrs_elrs_rx_write_serial(const uint8_t *payload, uint8_t len) {
+  if (payload == nullptr || len == 0 || !crsf_serial_is_ready()) {
+    return;
+  }
+  (void)crsf_serial_send_frame(payload, len);
+}
+
 uint8_t mlrs_elrs_rx_take_downlink(uint8_t *payload, uint8_t maxLen) {
   if (payload == nullptr || maxLen == 0) {
     return 0;
@@ -4723,11 +4730,15 @@ uint8_t mlrs_elrs_rx_take_downlink(uint8_t *payload, uint8_t maxLen) {
     }
     return nextPayloadSize;
   }
-  if (crsf_serial_is_ready()) {
-    const uint32_t copied = crsf_serial_read(payload, maxLen);
-    return copied > UINT8_MAX ? UINT8_MAX : (uint8_t)copied;
-  }
   return 0;
+}
+
+uint8_t mlrs_elrs_rx_take_serial(uint8_t *payload, uint8_t maxLen) {
+  if (payload == nullptr || maxLen == 0 || !crsf_serial_is_ready()) {
+    return 0;
+  }
+  const uint32_t copied = crsf_serial_read(payload, maxLen);
+  return copied > UINT8_MAX ? UINT8_MAX : (uint8_t)copied;
 }
 
 static uint16_t crsf_chan_to_us(uint32_t crsf) {
