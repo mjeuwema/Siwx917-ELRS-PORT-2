@@ -326,7 +326,15 @@ static void queue_info() {
     info[12] = (uint8_t)(mask >> 8);
     info[13] = (uint8_t)(mask >> 16);
     info[14] = (uint8_t)(mask >> 24);
-    info[15] = 0;
+    uint8_t rate = 0;
+    uint8_t band = 0;
+    uint8_t ul_plen = 0;
+    uint8_t dl_plen = 0;
+    mlrs_ota_link_rate_info(&rate, &band, &ul_plen, &dl_plen);
+    info[15] = rate;
+    info[16] = band;
+    info[17] = ul_plen;
+    info[18] = dl_plen;
   }
   queue_cmd(MBRIDGE_CMD_INFO, info);
 }

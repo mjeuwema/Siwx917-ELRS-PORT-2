@@ -646,6 +646,43 @@ local function tlm_proto()
   return "ELRS"
 end
 
+local function fmt_Bps(bps)
+  if bps == nil then
+    return "--"
+  end
+  if bps >= 1000 then
+    return string.format("%.1fkB/s", bps / 1000)
+  end
+  return string.format("%dB/s", math.floor(bps + 0.5))
+end
+
+-- Link payload capacity from air interval (band+rate). LQ scales delivered rate.
+-- Do not use last mux fill: hopmask-only packets are ~9 B and look like 170 B/s.
+local function tlm_payload_Bps(lq)
+  if MB.info == nil then
+    return nil, nil
+  end
+  local rate = MB.info.rate or 0
+  local band = MB.info.band or 0
+  if rate > 2 then rate = 1 end
+  if band > 1 then band = 0 end
+  local us915 = { [0] = 32000, [1] = 53000, [2] = 20000 }
+  local us24  = { [0] = 20000, [1] = 32000, [2] = 53000 }
+  local us = (band == 1) and us24[rate] or us915[rate]
+  if us == nil or us == 0 then
+    return nil, nil
+  end
+  local hz = 1000000 / us
+  local tight = (band == 0 and rate == 2) or (band == 1 and rate == 0)
+  local scale = 1
+  if lq ~= nil and lq > 0 then
+    scale = lq / 100
+  end
+  local ul = hz * 52 * scale
+  local dl = (tight and (hz / 2) or hz) * 70 * scale
+  return ul, dl
+end
+
 local function tlm_text()
   local rssi = tlm_sensor({"1RSS", "RSSI"})
   if rssi == nil then
@@ -665,12 +702,21 @@ local function tlm_text()
   elseif pwr ~= nil then
     pwr_s = string.format("%dmW", pwr)
   end
+  local ul_bps, dl_bps = tlm_payload_Bps(lq)
   if lcd.RGB == nil then
-    return string.format("%s %s %s%% %sdB %s", proto, rssi_s, lq_s, snr_s, pwr_s), lq
+    local spd = (ul_bps ~= nil) and (" " .. fmt_Bps(ul_bps)) or ""
+    return string.format("%s %s %s%% %sdB %s%s", proto, rssi_s, lq_s, snr_s, pwr_s, spd), lq
   end
   local extra = ""
+  if ul_bps ~= nil then
+    if LCD_W ~= nil and LCD_W >= 480 then
+      extra = string.format("  UL %s  DL %s", fmt_Bps(ul_bps), fmt_Bps(dl_bps))
+    else
+      extra = string.format("  %s", fmt_Bps(ul_bps))
+    end
+  end
   if MB.info ~= nil and (MB.info.hop_count or 0) > 0 then
-    extra = string.format("  skip %d/%d", MB.info.hop_skip or 0, MB.info.hop_count)
+    extra = extra .. string.format("  skip %d/%d", MB.info.hop_skip or 0, MB.info.hop_count)
   end
   if rfmd ~= nil and LCD_W ~= nil and LCD_W >= 480 then
     extra = extra .. string.format("  RFMD %d", rfmd)
@@ -1287,7 +1333,16 @@ function MB.handle_cmd(cmd)
       + (cmd.payload[12] or 0) * 256
       + (cmd.payload[13] or 0) * 65536
       + (cmd.payload[14] or 0) * 16777216
-    if MB.complete and MB.page == 0 then
+    MB.info.rate = cmd.payload[15] or 0
+    MB.info.band = cmd.payload[16] or 0
+    MB.info.ul_plen = cmd.payload[17] or 0
+    MB.info.dl_plen = cmd.payload[18] or 0
+    -- Rebuild only when hop/skip text changes. Payload lengths change every
+    -- packet and were rebuilding the page ~3 Hz, which hiccups CRSF.
+    local hop_key = string.format("%d/%d/%d", MB.info.hop_skip or 0,
+                                  MB.info.hop_count or 0, MB.info.hop_mask or 0)
+    if MB.complete and MB.page == 0 and hop_key ~= MB.hop_key then
+      MB.hop_key = hop_key
       MB.build_rows()
     end
   elseif cmd.cmd == MBCMD.PARAM_ITEM then
