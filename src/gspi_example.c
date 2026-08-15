@@ -940,6 +940,9 @@ static void fill_pattern(uint8_t pattern_type) {
 #include "wifi_http_test.h"
 
 static volatile bool elrs_cpp_wifi_requested = false;
+#if defined(SIW917_ELRS_TARGET_TX)
+static bool tx_wifi_http_active = false;
+#endif
 
 #if !defined(SIW917_ELRS_TARGET_TX)
 /* WiFi auto-on prevention flag - set true when connection established
@@ -1012,6 +1015,7 @@ void elrs_cpp_task(void *argument) {
   extern void elrs_tx_start(void);
   extern void elrs_tx_loop(void);
   extern void elrs_tx_stop(void);
+  extern void elrs_tx_enter_wifi_update(void);
   #define elrs_role_init() ((void)elrs_tx_init())
   #define elrs_role_start() elrs_tx_start()
   #define elrs_role_loop() elrs_tx_loop()
@@ -1100,10 +1104,46 @@ void elrs_cpp_task(void *argument) {
     }
 #endif
 
-    /* TX uses explicit requests only; RX may also set this from its timeout. */
+    /* TX uses explicit requests only; RX may also set this from its timeout.
+     * Stock ELRS keeps loop()/CRSF running in wifiUpdate. This port used to
+     * call elrs_role_stop() then block in wifi_http_test_run(), which killed
+     * Lua. TX now starts the AP and keeps pumping elrs_role_loop() so cancel
+     * can schedule a reboot like stock.
+     */
     if (elrs_cpp_wifi_requested) {
       elrs_cpp_wifi_requested = false;
 
+#if defined(SIW917_ELRS_TARGET_TX)
+      if (!tx_wifi_http_active) {
+        DEBUGOUT("\n");
+        DEBUGOUT("========================================\n");
+        DEBUGOUT("  Entering WiFi Configuration Mode\n");
+        DEBUGOUT("========================================\n");
+        DEBUGOUT("  SSID: ELRS_TEST_AP\n");
+        DEBUGOUT("  Password: elrs1234\n");
+        DEBUGOUT("  Web UI: http://192.168.10.10/\n");
+        DEBUGOUT("========================================\n");
+        DEBUGOUT("\n");
+
+        status_led_set_mode(LED_MODE_WIFI);
+        status_led_update();
+
+        elrs_tx_enter_wifi_update();
+        elrs_role_stop();
+
+        if (!siw917_mavlink_backpack_prepare_for_update(3000U)) {
+          DEBUGOUT("[ELRS] WiFi update aborted: MAVLink bridge handoff failed\n");
+          status_led_set_mode(LED_MODE_DISCONNECTED);
+          elrs_role_start();
+        } else if (wifi_http_test_start() != 0) {
+          DEBUGOUT("[ELRS] WiFi update aborted: HTTP AP start failed\n");
+          status_led_set_mode(LED_MODE_DISCONNECTED);
+          elrs_role_start();
+        } else {
+          tx_wifi_http_active = true;
+        }
+      }
+#else
       DEBUGOUT("\n");
       DEBUGOUT("========================================\n");
       DEBUGOUT("  Entering WiFi Configuration Mode\n");
@@ -1120,20 +1160,6 @@ void elrs_cpp_task(void *argument) {
       /* Stop RX before starting WiFi */
       elrs_role_stop();
 
-#if defined(SIW917_ELRS_TARGET_TX)
-      /*
-       * The internal MAVLink bridge and the configuration server share the
-       * SiW917 AP interface. Release the bridge's UDP socket and AP before
-       * handing ownership to HTTP/OTA.
-       */
-      if (!siw917_mavlink_backpack_prepare_for_update(3000U)) {
-        DEBUGOUT("[ELRS] WiFi update aborted: MAVLink bridge handoff failed\n");
-        status_led_set_mode(LED_MODE_DISCONNECTED);
-        elrs_role_start();
-        continue;
-      }
-#endif
-
       /* Start WiFi HTTP server - blocks until reboot/exit */
       wifi_http_test_run();
 
@@ -1142,10 +1168,16 @@ void elrs_cpp_task(void *argument) {
       status_led_set_mode(LED_MODE_DISCONNECTED);
       elrs_role_start();
       continue;
+#endif
     }
 
     /* Normal RX processing - matches upstream loop() */
     elrs_role_loop();
+#if defined(SIW917_ELRS_TARGET_TX)
+    if (tx_wifi_http_active) {
+      wifi_http_test_poll();
+    }
+#endif
 
     /* If DIO1 is already pending, do not add another tick of latency before
      * the ELRS loop can drain the radio IRQ. Otherwise sleep normally so

@@ -691,7 +691,20 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
         "\"stored_crc\":\"0x%04X\","
         "\"calc_crc\":\"0x%04X\""
       "},"
-      "\"options\":{}"
+      "\"options\":{"
+        "\"domain\":%u,"
+        "\"uid\":[%u,%u,%u,%u,%u,%u],"
+        "\"flash-discriminator\":0,"
+        "\"wifi-on-interval\":60,"
+        "\"wifi-ssid\":\"%s\","
+        "\"wifi-password\":\"%s\","
+        "\"tlm-interval\":240,"
+        "\"fan-runtime\":30,"
+        "\"unlock-higher-power\":false,"
+        "\"airport-uart-baud\":420000,"
+        "\"is-airport\":false,"
+        "\"customised\":false"
+      "}"
     "}",
     cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3], cfg->uid[4], cfg->uid[5],
     cfg->serial_protocol,
@@ -713,7 +726,15 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
     (unsigned long)g_nvm3_obj_len,
     (unsigned int)sizeof(elrs_config_t),
     g_nvm3_stored_crc,
-    g_nvm3_calc_crc
+    g_nvm3_calc_crc,
+    (cfg->reg_domain_low == ELRS_DOMAIN_AU_915) ? 0U :
+    (cfg->reg_domain_low == ELRS_DOMAIN_EU_868) ? 2U :
+    (cfg->reg_domain_low == ELRS_DOMAIN_IN_866) ? 3U :
+    (cfg->reg_domain_low == ELRS_DOMAIN_AU_433) ? 4U :
+    (cfg->reg_domain_low == ELRS_DOMAIN_EU_433) ? 5U : 1U,
+    cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3], cfg->uid[4], cfg->uid[5],
+    cfg->wifi_ssid,
+    cfg->wifi_password
   );
   
   return len;

@@ -32,11 +32,11 @@
  {
    rom   (rx)  : ORIGIN = 0x8202000, LENGTH = 0x1fe000
 
-   ram   (rwx) : ORIGIN = 0xc, LENGTH = 0x2fbf4
+   ram   (rwx) : ORIGIN = 0xc, LENGTH = 0x4fbf4
  }
  MEMORY
  {
-   udma0   (rwx)  : ORIGIN = 0x2fc00, LENGTH = 0x400
+   udma0   (rwx)  : ORIGIN = 0x4fc00, LENGTH = 0x400
    udma1   (rwx)  : ORIGIN = 0x24061c00, LENGTH = 0x400
  }
 
@@ -211,7 +211,7 @@ SECTIONS
 		*(.udma_addr1*)		
 	} > udma1 AT> rom	
 
-  __ram_end__ = 0xc + 0x2fbf4;
+  __ram_end__ = 0xc + 0x4fbf4;
    __main_flash_end__ = 0x8202000 + 0x1fe000;
 	   /* This is where we handle flash storage blocks. We use dummy sections for finding the configured
    * block sizes and then "place" them at the end of flash when the size is known. */

@@ -49,6 +49,8 @@ static const char *siw917_link_state_name(connectionState_e state)
         return "radio-failed";
     case hardwareUndefined:
         return "hardware-undefined";
+    case wifiUpdate:
+        return "wifi-update";
     default:
         return "disconnected";
     }
@@ -267,7 +269,14 @@ extern "C" void elrs_exit_binding_mode(void)
     InBindingMode = false;
 }
 
+extern "C" void elrs_tx_enter_wifi_update(void)
+{
+    InBindingMode = false;
+    setConnectionState(wifiUpdate);
+}
+
 void setWifiUpdateMode()
 {
+    elrs_tx_enter_wifi_update();
     elrs_cpp_request_wifi_mode();
 }

@@ -519,10 +519,13 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
 {
   sl_http_server_response_t response = { 0 };
   
-  /* Headers for gzip-compressed content */
-  sl_http_header_t headers[2] = {
-    { .key = "Content-Encoding", .value = "gzip" },
-    { .key = "Cache-Control",    .value = "no-cache" }
+  /* Gzip + CORS. Stock index.html loads module assets with crossorigin. */
+  sl_http_header_t headers[5] = {
+    { .key = "Content-Encoding",          .value = "gzip" },
+    { .key = "Cache-Control",             .value = "no-cache" },
+    { .key = CORS_HEADER_ALLOW_ORIGIN,    .value = CORS_VALUE_ALLOW_ORIGIN },
+    { .key = CORS_HEADER_ALLOW_METHODS,   .value = CORS_VALUE_ALLOW_METHODS },
+    { .key = CORS_HEADER_ALLOW_HEADERS,   .value = CORS_VALUE_ALLOW_HEADERS }
   };
 
   /* Search for asset in ELRS web content */
@@ -547,7 +550,7 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
 
       response.response_code        = SL_HTTP_RESPONSE_OK;
       response.headers              = headers;
-      response.header_count         = 2;
+      response.header_count         = 5;
       response.data                 = (uint8_t *)WEB_ASSETS[i].data;
       response.expected_data_length = WEB_ASSETS[i].size;
 
@@ -3307,11 +3310,15 @@ static bool force_nwp_reinit_after_wdt(uint32_t wakeup_status)
  * Main Test Function
  ******************************************************************************/
 
-void wifi_http_test_run(void)
+int wifi_http_test_start(void)
 {
   sl_status_t status;
   sl_http_server_config_t server_config = { 0 };
   uint32_t wakeup_status;
+
+  if (server_running) {
+    return 0;
+  }
 
   /* ===== BOOT DIAGNOSTICS ===== */
   wakeup_status = print_boot_diagnostics();
@@ -3386,7 +3393,7 @@ void wifi_http_test_run(void)
       } else if (status == 0x10002) {
         DEBUGOUT("[Diag] Error 0x10002 = SL_STATUS_FAIL - General failure\n");
       }
-      return;
+      return -1;
     }
     DEBUGOUT("      WiFi AP interface initialized.\n");
     DEBUGOUT("[Diag] P2P_STATUS after init: 0x%08lX\n", (unsigned long)MCU_P2P_COMM_STATUS_REG);
@@ -3417,7 +3424,7 @@ void wifi_http_test_run(void)
                                  wifi_ap_credential.data_length);
   if (status != SL_STATUS_OK) {
     DEBUGOUT("ERROR: sl_net_set_credential failed: 0x%lX\n", status);
-    return;
+    return -1;
   }
   DEBUGOUT("      Credentials set.\n");
 
@@ -3436,13 +3443,13 @@ void wifi_http_test_run(void)
                               &wifi_ap_profile);
   if (status != SL_STATUS_OK) {
     DEBUGOUT("ERROR: sl_net_set_profile failed: 0x%lX\n", status);
-    return;
+    return -1;
   }
 
   status = sl_net_up(SL_NET_WIFI_AP_INTERFACE, SL_NET_DEFAULT_WIFI_AP_PROFILE_ID);
   if (status != SL_STATUS_OK) {
     DEBUGOUT("ERROR: sl_net_up failed: 0x%lX\n", status);
-    return;
+    return -1;
   }
   ap_running = true;
   DEBUGOUT("      WiFi AP started! SSID: %s\n", WIFI_TEST_AP_SSID);
@@ -3459,14 +3466,14 @@ void wifi_http_test_run(void)
   status = sl_http_server_init(&server_handle, &server_config);
   if (status != SL_STATUS_OK) {
     DEBUGOUT("ERROR: sl_http_server_init failed: 0x%lX\n", status);
-    return;
+    return -1;
   }
 
   status = sl_http_server_start(&server_handle);
   if (status != SL_STATUS_OK) {
     DEBUGOUT("ERROR: sl_http_server_start failed: 0x%lX\n", status);
     sl_http_server_deinit(&server_handle);
-    return;
+    return -1;
   }
   server_running = true;
 
@@ -3486,43 +3493,68 @@ void wifi_http_test_run(void)
   DEBUGOUT("\n");
   DEBUGOUT("Waiting for connections...\n");
   DEBUGOUT("============================================================\n");
+  return 0;
+}
 
-  /* Main Loop */
-  while (server_running) {
-    osDelay(100);  /* Check more frequently for pending saves */
+void wifi_http_test_poll(void)
+{
+  if (!server_running) {
+    return;
+  }
 
-    /* Check for deferred config save
-     * NVM3 writes hang when called from HTTP callback context.
-     * Doing it here in the main loop avoids the NWP/M4 flash contention.
-     */
-    if (config_save_pending) {
-      config_save_pending = false;
-      DEBUGOUT("[WiFi] Performing deferred config save...\n");
-      int result = elrs_config_save();
-      if (result == 0) {
-        DEBUGOUT("[WiFi] Config saved to NVM3 successfully!\n");
-      } else {
-        DEBUGOUT("[WiFi] ERROR: Config save failed: %d\n", result);
-      }
-    }
-
-    static uint32_t tick = 0;
-    if (++tick % 300 == 0) {  /* Every 30 seconds (300 * 100ms) */
-      DEBUGOUT("[Status] Clients: %lu, Requests: %lu, Uptime: %lu ms\n",
-               client_count, request_count, osKernelGetTickCount());
+  /* NVM3 writes hang when called from HTTP callback context.
+   * Doing it here in the caller loop avoids the NWP/M4 flash contention.
+   */
+  if (config_save_pending) {
+    config_save_pending = false;
+    DEBUGOUT("[WiFi] Performing deferred config save...\n");
+    int result = elrs_config_save();
+    if (result == 0) {
+      DEBUGOUT("[WiFi] Config saved to NVM3 successfully!\n");
+    } else {
+      DEBUGOUT("[WiFi] ERROR: Config save failed: %d\n", result);
     }
   }
 
-  /* Cleanup */
-  DEBUGOUT("Stopping HTTP server...\n");
-  sl_http_server_stop(&server_handle);
-  sl_http_server_deinit(&server_handle);
+  static uint32_t last_status_ms = 0;
+  uint32_t now = osKernelGetTickCount();
+  if ((now - last_status_ms) >= 30000U) {
+    last_status_ms = now;
+    DEBUGOUT("[Status] Clients: %lu, Requests: %lu, Uptime: %lu ms\n",
+             client_count, request_count, now);
+  }
+}
 
-  DEBUGOUT("Stopping WiFi AP...\n");
-  sl_net_down(SL_NET_WIFI_AP_INTERFACE);
-  ap_running = false;
+void wifi_http_test_stop(void)
+{
+  if (server_running) {
+    DEBUGOUT("Stopping HTTP server...\n");
+    sl_http_server_stop(&server_handle);
+    sl_http_server_deinit(&server_handle);
+    server_running = false;
+  }
+
+  if (ap_running) {
+    DEBUGOUT("Stopping WiFi AP...\n");
+    sl_net_down(SL_NET_WIFI_AP_INTERFACE);
+    ap_running = false;
+  }
 
   DEBUGOUT("WiFi HTTP test complete.\n");
+}
+
+void wifi_http_test_run(void)
+{
+  if (wifi_http_test_start() != 0) {
+    return;
+  }
+
+  while (server_running) {
+    wifi_http_test_poll();
+    osDelay(100);
+  }
+
+  wifi_http_test_stop();
 }
 
 /*******************************************************************************

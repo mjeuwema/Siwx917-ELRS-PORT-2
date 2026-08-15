@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 /* Include the generated ExpressLRS web assets header */
-#include "web-lr1121-rx.h"
+#include "web-lr1121-tx.h"
 
 /**
  * @brief Find a web asset by path

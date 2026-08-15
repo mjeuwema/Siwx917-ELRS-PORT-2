@@ -53,6 +53,22 @@ extern "C" {
  ******************************************************************************/
 
 /**
+ * @brief Bring up WiFi AP + HTTP server and return (does not block).
+ * @return 0 on success or if already running, -1 on failure
+ */
+int wifi_http_test_start(void);
+
+/**
+ * @brief Pump deferred NVM3 config saves while the HTTP server is up.
+ */
+void wifi_http_test_poll(void);
+
+/**
+ * @brief Stop HTTP server and WiFi AP if they were started.
+ */
+void wifi_http_test_stop(void);
+
+/**
  * @brief Initialize and start WiFi AP + HTTP server test
  *
  * This function:
