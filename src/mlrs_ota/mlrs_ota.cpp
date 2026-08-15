@@ -87,7 +87,7 @@ extern uint8_t uplinkLQ;
 #define FRAME_RX_AAD_LEN 11
 #define FRAME_TX_SEAL_LEN (FRAME_TX_RCDATA1_LEN + FRAME_TX_RCDATA2_LEN + FRAME_TX_PAYLOAD_LEN)
 #define FRAME_GCM_TAG_LEN 8
-#define MLRS_OVERLAY_ID "20260813Q"
+#define MLRS_OVERLAY_ID "20260813R"
 #define MLRS_MUX_MAGIC 0x5A
 #define MLRS_HOP_WIN 16
 #define MLRS_HOP_FAIL_PCT 75
@@ -319,6 +319,8 @@ static mlrs_gcm_ctx_t g_gcm_dn = {};
 static uint32_t g_send_counter = 1;
 static uint32_t g_recv_highest = 0;
 static uint8_t g_gcm_ready = 0;
+static uint8_t g_secret[MLRS_GCM_SECRET_LEN] = {};
+static uint8_t g_secret_ok = 0;
 #if MLRS_OTA_IS_TX
 static uint8_t g_ul_hold[64] = {};
 static uint8_t g_ul_hold_len = 0;
@@ -434,9 +436,28 @@ static uint32_t next_send_counter() {
   return c;
 }
 
+static void load_or_make_secret() {
+  memset(g_secret, 0, sizeof(g_secret));
+  g_secret_ok = 0;
+  if (elrs_config_get_mlrs_secret(g_secret) == 0) {
+    g_secret_ok = 1;
+    return;
+  }
+#if MLRS_OTA_IS_TX
+  if (mlrs_gcm_random(g_secret, sizeof(g_secret)) &&
+      elrs_config_set_mlrs_secret(g_secret) == 0) {
+    (void)elrs_config_save();
+    g_secret_ok = 1;
+    printf("[mLRS] generated TRNG bind secret\n");
+  }
+#endif
+}
+
 static void derive_crypto_from_uid() {
-  mlrs_gcm_derive_from_uid(UID, &g_gcm_up, &g_gcm_dn);
   g_gcm_ready = mlrs_gcm_selftest() ? 1 : 0;
+  load_or_make_secret();
+  uint8_t zeros[MLRS_GCM_SECRET_LEN] = {};
+  mlrs_gcm_derive(UID, g_secret_ok ? g_secret : zeros, &g_gcm_up, &g_gcm_dn);
 }
 
 #if MLRS_OTA_IS_TX
@@ -1624,12 +1645,21 @@ static void mlrs_tx_process_downlink() {
 }
 
 static void notify_rx_protocol(uint8_t protocol) {
-  static uint8_t payload[4];
+  static uint8_t payload[4 + MLRS_GCM_SECRET_LEN];
+  memset(payload, 0, sizeof(payload));
   payload[0] = MSP_ELRS_SET_AIR_PROTOCOL;
   payload[1] = protocol;
   payload[2] = advertised_rate();
   payload[3] = sanitize_band(g_band);
-  DataUlSender.SetDataToTransmit(payload, sizeof(payload));
+  uint8_t n = 4;
+  if (protocol == ELRS_AIR_PROTOCOL_MLRS) {
+    load_or_make_secret();
+    if (g_secret_ok) {
+      memcpy(payload + 4, g_secret, MLRS_GCM_SECRET_LEN);
+      n = (uint8_t)(4 + MLRS_GCM_SECRET_LEN);
+    }
+  }
+  DataUlSender.SetDataToTransmit(payload, n);
 }
 #else
 static void apply_rc_to_elrs(const uint16_t rc[16]) {
@@ -2156,7 +2186,8 @@ static void start_mlrs() {
          MLRS_OVERLAY_ID, (unsigned)FRAME_TX_PAYLOAD_LEN,
          (unsigned)FRAME_RX_PAYLOAD_LEN, (unsigned)FRAME_GCM_TAG_LEN,
          (unsigned long)g_send_counter);
-  printf("[mLRS] AES-GCM backend=%s\n", mlrs_gcm_backend_name());
+  printf("[mLRS] AES-GCM backend=%s secret=%s\n", mlrs_gcm_backend_name(),
+         g_secret_ok ? "ok" : "MISSING");
   printf("[mLRS] mux MBridge Lua + CRSF + MAVLink in %u/%u-byte payloads\n",
          (unsigned)FRAME_TX_PAYLOAD_LEN, (unsigned)FRAME_RX_PAYLOAD_LEN);
 }
@@ -2620,6 +2651,15 @@ extern "C" bool mlrs_ota_handle_msp(const uint8_t *data, uint8_t len) {
   if (len >= 3) {
     g_rate = sanitize_rate(data[2]);
     save_rate(g_rate);
+  }
+  if (len >= (4 + MLRS_GCM_SECRET_LEN) &&
+      data[1] == ELRS_AIR_PROTOCOL_MLRS) {
+    if (elrs_config_set_mlrs_secret(data + 4) == 0) {
+      (void)elrs_config_save();
+      memcpy(g_secret, data + 4, MLRS_GCM_SECRET_LEN);
+      g_secret_ok = 1;
+      printf("[mLRS] stored bind secret from TX\n");
+    }
   }
   (void)mlrs_ota_set_protocol(data[1]);
   return true;

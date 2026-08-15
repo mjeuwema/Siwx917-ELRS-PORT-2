@@ -47,15 +47,30 @@ include(wifi_gspi_merged.cmake)
 if(NOT WISECONNECT3_SDK_DIR)
     set(WISECONNECT3_SDK_DIR "${SDK_PATH}/../../wisece6a05cd369ee2/p")
 endif()
-set(SIW917_GCM_SRC
-    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/src/sl_si91x_gcm.c")
+set(SIW917_CRYPTO_DIR
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto")
+set(SIW917_GCM_SRC "${SIW917_CRYPTO_DIR}/gcm/src/sl_si91x_gcm.c")
 if(EXISTS "${SIW917_GCM_SRC}")
-    target_sources(slc PRIVATE "${SIW917_GCM_SRC}")
-    target_include_directories(slc PUBLIC
-        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/inc"
-        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/inc"
+    target_sources(slc PRIVATE
+        "${SIW917_GCM_SRC}"
+        "${SIW917_CRYPTO_DIR}/hmac/src/sl_si91x_hmac.c"
+        "${SIW917_CRYPTO_DIR}/trng/src/sl_si91x_trng.c"
+        "${SIW917_CRYPTO_DIR}/wrap/src/sl_si91x_wrap.c"
     )
-    target_compile_definitions(slc PUBLIC MLRS_HAVE_SI91X_GCM=1)
+    target_include_directories(slc PUBLIC
+        "${SIW917_CRYPTO_DIR}/gcm/inc"
+        "${SIW917_CRYPTO_DIR}/hmac/inc"
+        "${SIW917_CRYPTO_DIR}/trng/inc"
+        "${SIW917_CRYPTO_DIR}/wrap/inc"
+        "${SIW917_CRYPTO_DIR}/wrap/config"
+        "${SIW917_CRYPTO_DIR}/inc"
+    )
+    target_compile_definitions(slc PUBLIC
+        MLRS_HAVE_SI91X_GCM=1
+        MLRS_HAVE_SI91X_HMAC=1
+        MLRS_HAVE_SI91X_TRNG=1
+        MLRS_HAVE_SI91X_WRAP=1
+    )
 endif()
 
 #=============================================================================

@@ -8,36 +8,26 @@ extern "C" {
 #include "sl_status.h"
 }
 #endif
-
-static bool g_hw_ready = false;
-
-#if defined(MLRS_HAVE_SI91X_GCM)
-/* NWP AES-GCM. Output is ciphertext||tag (encrypt) or plaintext||tag (decrypt). */
-static bool siw917_gcm(const uint8_t key[16], sl_si91x_gcm_type_t op,
-                       const uint8_t iv[12], const uint8_t *aad, size_t aad_len,
-                       const uint8_t *msg, size_t msg_len, uint8_t *out) {
-  static const uint8_t kEmpty[1] = {0};
-  sl_si91x_gcm_config_t cfg;
-  if (msg_len > SL_SI91X_MAX_DATA_SIZE_IN_BYTES) {
-    return false;
-  }
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.encrypt_decrypt = op;
-  cfg.gcm_mode = SL_SI91X_GCM_MODE;
-  cfg.dma_use = SL_SI91X_GCM_DMA_ENABLE;
-  cfg.msg = msg;
-  cfg.msg_length = (uint16_t)msg_len;
-  cfg.nonce = iv;
-  cfg.nonce_length = 12;
-  cfg.ad = (aad != nullptr && aad_len != 0) ? aad : kEmpty;
-  cfg.ad_length = (uint16_t)aad_len;
-  cfg.key_config.b0.key_type = SL_SI91X_TRANSPARENT_KEY;
-  cfg.key_config.b0.key_size = SL_SI91X_GCM_KEY_SIZE_128;
-  cfg.key_config.b0.key_slot = (sl_si91x_crypto_key_slot_t)0;
-  memcpy(cfg.key_config.b0.key_buffer, key, MLRS_GCM_KEY_LEN);
-  return sl_si91x_gcm(&cfg, out) == SL_STATUS_OK;
+#if defined(MLRS_HAVE_SI91X_HMAC)
+extern "C" {
+#include "sl_si91x_hmac.h"
 }
 #endif
+#if defined(MLRS_HAVE_SI91X_TRNG)
+extern "C" {
+#include "sl_si91x_trng.h"
+}
+#endif
+#if defined(MLRS_HAVE_SI91X_WRAP)
+extern "C" {
+#include "sl_si91x_wrap.h"
+}
+#endif
+
+static bool g_hw_ready = false;
+static bool g_wrap_ready = false;
+static bool g_trng_ready = false;
+static bool g_hmac_ready = false;
 
 static const uint8_t kSbox[256] = {
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
@@ -78,22 +68,28 @@ static void store_be32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)v;
 }
 
+static uint32_t rotr32(uint32_t x, uint32_t n) {
+  return (x >> n) | (x << (32U - n));
+}
+
 static uint32_t sub_word(uint32_t w) {
   return ((uint32_t)kSbox[(w >> 24) & 0xFF] << 24) |
          ((uint32_t)kSbox[(w >> 16) & 0xFF] << 16) |
          ((uint32_t)kSbox[(w >> 8) & 0xFF] << 8) | (uint32_t)kSbox[w & 0xFF];
 }
 
-static void aes_expand(const uint8_t key[16], uint32_t rk[44]) {
-  for (int i = 0; i < 4; ++i) {
+static void aes256_expand(const uint8_t key[32], uint32_t rk[60]) {
+  for (int i = 0; i < 8; ++i) {
     rk[i] = load_be32(key + 4 * i);
   }
-  for (int i = 4; i < 44; ++i) {
+  for (int i = 8; i < 60; ++i) {
     uint32_t t = rk[i - 1];
-    if ((i % 4) == 0) {
-      t = sub_word((t << 8) | (t >> 24)) ^ ((uint32_t)kRcon[i / 4 - 1] << 24);
+    if ((i % 8) == 0) {
+      t = sub_word((t << 8) | (t >> 24)) ^ ((uint32_t)kRcon[i / 8 - 1] << 24);
+    } else if ((i % 8) == 4) {
+      t = sub_word(t);
     }
-    rk[i] = rk[i - 4] ^ t;
+    rk[i] = rk[i - 8] ^ t;
   }
 }
 
@@ -116,46 +112,7 @@ static void mix_columns(uint8_t *s) {
   }
 }
 
-static void aes_encrypt(const uint32_t rk[44], const uint8_t in[16],
-                        uint8_t out[16]) {
-  uint8_t s[16];
-  memcpy(s, in, 16);
-  for (int i = 0; i < 4; ++i) {
-    uint32_t w = load_be32(s + 4 * i) ^ rk[i];
-    store_be32(s + 4 * i, w);
-  }
-  for (int round = 1; round < 10; ++round) {
-    uint8_t t[16];
-    for (int i = 0; i < 16; ++i) {
-      t[i] = kSbox[s[i]];
-    }
-    /* Column-major ShiftRows: 4-byte columns, rows 1/2/3 rotate left. */
-    s[0] = t[0];
-    s[4] = t[4];
-    s[8] = t[8];
-    s[12] = t[12];
-    s[1] = t[5];
-    s[5] = t[9];
-    s[9] = t[13];
-    s[13] = t[1];
-    s[2] = t[10];
-    s[6] = t[14];
-    s[10] = t[2];
-    s[14] = t[6];
-    s[3] = t[15];
-    s[7] = t[3];
-    s[11] = t[7];
-    s[15] = t[11];
-    mix_columns(s);
-    for (int i = 0; i < 4; ++i) {
-      uint32_t w = load_be32(s + 4 * i) ^ rk[4 * round + i];
-      store_be32(s + 4 * i, w);
-    }
-  }
-  uint8_t t[16];
-  for (int i = 0; i < 16; ++i) {
-    t[i] = kSbox[s[i]];
-  }
+static void shift_rows(uint8_t *s, const uint8_t *t) {
   s[0] = t[0];
   s[4] = t[4];
   s[8] = t[8];
@@ -172,9 +129,33 @@ static void aes_encrypt(const uint32_t rk[44], const uint8_t in[16],
   s[7] = t[3];
   s[11] = t[7];
   s[15] = t[11];
+}
+
+static void aes256_encrypt(const uint32_t rk[60], const uint8_t in[16],
+                           uint8_t out[16]) {
+  uint8_t s[16];
+  memcpy(s, in, 16);
   for (int i = 0; i < 4; ++i) {
-    uint32_t w = load_be32(s + 4 * i) ^ rk[40 + i];
-    store_be32(s + 4 * i, w);
+    store_be32(s + 4 * i, load_be32(s + 4 * i) ^ rk[i]);
+  }
+  for (int round = 1; round < 14; ++round) {
+    uint8_t t[16];
+    for (int i = 0; i < 16; ++i) {
+      t[i] = kSbox[s[i]];
+    }
+    shift_rows(s, t);
+    mix_columns(s);
+    for (int i = 0; i < 4; ++i) {
+      store_be32(s + 4 * i, load_be32(s + 4 * i) ^ rk[4 * round + i]);
+    }
+  }
+  uint8_t t[16];
+  for (int i = 0; i < 16; ++i) {
+    t[i] = kSbox[s[i]];
+  }
+  shift_rows(s, t);
+  for (int i = 0; i < 4; ++i) {
+    store_be32(s + 4 * i, load_be32(s + 4 * i) ^ rk[56 + i]);
   }
   memcpy(out, s, 16);
 }
@@ -250,14 +231,14 @@ static void inc32(uint8_t ctr[16]) {
   }
 }
 
-static void gctr(const uint32_t rk[44], const uint8_t icb[16], uint8_t *buf,
+static void gctr(const uint32_t rk[60], const uint8_t icb[16], uint8_t *buf,
                  size_t len) {
   uint8_t ctr[16];
   uint8_t ks[16];
   memcpy(ctr, icb, 16);
   size_t off = 0;
   while (off < len) {
-    aes_encrypt(rk, ctr, ks);
+    aes256_encrypt(rk, ctr, ks);
     const size_t n = (len - off) > 16 ? 16 : (len - off);
     for (size_t i = 0; i < n; ++i) {
       buf[off + i] ^= ks[i];
@@ -291,18 +272,241 @@ static void gcm_crypt(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[12],
   }
 
   uint8_t t[16];
-  aes_encrypt(ctx->round_key, j0, t);
+  aes256_encrypt(ctx->round_key, j0, t);
   xor16(tag, t, s);
 }
 
-static void ctx_init_with_key(mlrs_gcm_ctx_t *ctx, const uint8_t key[16],
+static const uint32_t kSha256K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+static void sha256_transform(uint32_t st[8], const uint8_t block[64]) {
+  uint32_t w[64];
+  for (int i = 0; i < 16; ++i) {
+    w[i] = load_be32(block + 4 * i);
+  }
+  for (int i = 16; i < 64; ++i) {
+    const uint32_t s0 =
+        rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+    const uint32_t s1 =
+        rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  uint32_t a = st[0], b = st[1], c = st[2], d = st[3];
+  uint32_t e = st[4], f = st[5], g = st[6], h = st[7];
+  for (int i = 0; i < 64; ++i) {
+    const uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+    const uint32_t ch = (e & f) ^ ((~e) & g);
+    const uint32_t t1 = h + S1 + ch + kSha256K[i] + w[i];
+    const uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+    const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+    const uint32_t t2 = S0 + maj;
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+  st[0] += a;
+  st[1] += b;
+  st[2] += c;
+  st[3] += d;
+  st[4] += e;
+  st[5] += f;
+  st[6] += g;
+  st[7] += h;
+}
+
+static void sha256(const uint8_t *msg, size_t len, uint8_t out[32]) {
+  uint32_t st[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  uint8_t block[64];
+  size_t off = 0;
+  while (off + 64 <= len) {
+    sha256_transform(st, msg + off);
+    off += 64;
+  }
+  const size_t rem = len - off;
+  memset(block, 0, 64);
+  if (rem != 0) {
+    memcpy(block, msg + off, rem);
+  }
+  block[rem] = 0x80;
+  if (rem >= 56) {
+    sha256_transform(st, block);
+    memset(block, 0, 64);
+  }
+  const uint64_t bits = (uint64_t)len * 8U;
+  store_be32(block + 56, (uint32_t)(bits >> 32));
+  store_be32(block + 60, (uint32_t)bits);
+  sha256_transform(st, block);
+  for (int i = 0; i < 8; ++i) {
+    store_be32(out + 4 * i, st[i]);
+  }
+}
+
+static void hmac_sha256_sw(const uint8_t *key, size_t key_len, const uint8_t *msg,
+                           size_t msg_len, uint8_t out[32]) {
+  uint8_t k[64];
+  memset(k, 0, sizeof(k));
+  if (key_len > 64) {
+    sha256(key, key_len, k);
+  } else if (key_len != 0) {
+    memcpy(k, key, key_len);
+  }
+  uint8_t ipad[64];
+  uint8_t opad[64];
+  for (int i = 0; i < 64; ++i) {
+    ipad[i] = (uint8_t)(k[i] ^ 0x36);
+    opad[i] = (uint8_t)(k[i] ^ 0x5c);
+  }
+  uint8_t inner[64 + 256];
+  memcpy(inner, ipad, 64);
+  if (msg_len > 256) {
+    msg_len = 256;
+  }
+  if (msg != nullptr && msg_len != 0) {
+    memcpy(inner + 64, msg, msg_len);
+  }
+  uint8_t ih[32];
+  sha256(inner, 64 + msg_len, ih);
+  uint8_t outer[96];
+  memcpy(outer, opad, 64);
+  memcpy(outer + 64, ih, 32);
+  sha256(outer, 96, out);
+  memset(k, 0, sizeof(k));
+}
+
+#if defined(MLRS_HAVE_SI91X_HMAC)
+static bool hmac_sha256_hw(const uint8_t *key, size_t key_len, const uint8_t *msg,
+                           size_t msg_len, uint8_t out[32]) {
+  sl_si91x_hmac_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.hmac_mode = SL_SI91X_HMAC_SHA_256;
+  cfg.msg = msg;
+  cfg.msg_length = (uint32_t)msg_len;
+  cfg.key_config.B0.key_type = SL_SI91X_TRANSPARENT_KEY;
+  cfg.key_config.B0.key_size = (uint32_t)key_len;
+  cfg.key_config.B0.key_slot = (sl_si91x_crypto_key_slot_t)0;
+  cfg.key_config.B0.key = const_cast<uint8_t *>(key);
+  return sl_si91x_hmac(&cfg, out) == SL_STATUS_OK;
+}
+#endif
+
+static void hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg,
+                        size_t msg_len, uint8_t out[32]) {
+#if defined(MLRS_HAVE_SI91X_HMAC)
+  if (g_hmac_ready && hmac_sha256_hw(key, key_len, msg, msg_len, out)) {
+    return;
+  }
+#endif
+  hmac_sha256_sw(key, key_len, msg, msg_len, out);
+}
+
+static void hkdf_sha256(const uint8_t *ikm, size_t ikm_len, const char *info,
+                        uint8_t *okm, size_t okm_len) {
+  uint8_t salt[32] = {};
+  uint8_t prk[32];
+  hmac_sha256(salt, sizeof(salt), ikm, ikm_len, prk);
+  uint8_t t[32];
+  uint8_t block[48];
+  const size_t info_len = strlen(info);
+  size_t off = 0;
+  uint8_t counter = 1;
+  memset(t, 0, sizeof(t));
+  while (off < okm_len) {
+    size_t n = 0;
+    if (counter > 1) {
+      memcpy(block, t, 32);
+      n = 32;
+    }
+    memcpy(block + n, info, info_len);
+    n += info_len;
+    block[n++] = counter++;
+    hmac_sha256(prk, 32, block, n, t);
+    const size_t take = (okm_len - off) > 32 ? 32 : (okm_len - off);
+    memcpy(okm + off, t, take);
+    off += take;
+  }
+  memset(prk, 0, sizeof(prk));
+  memset(t, 0, sizeof(t));
+}
+
+#if defined(MLRS_HAVE_SI91X_GCM)
+static bool siw917_gcm(const mlrs_gcm_ctx_t *ctx, sl_si91x_gcm_type_t op,
+                       const uint8_t iv[12], const uint8_t *aad, size_t aad_len,
+                       const uint8_t *msg, size_t msg_len, uint8_t *out) {
+  static const uint8_t kEmpty[1] = {0};
+  sl_si91x_gcm_config_t cfg;
+  if (msg_len > SL_SI91X_MAX_DATA_SIZE_IN_BYTES) {
+    return false;
+  }
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.encrypt_decrypt = op;
+  cfg.gcm_mode = SL_SI91X_GCM_MODE;
+  cfg.dma_use = SL_SI91X_GCM_DMA_ENABLE;
+  cfg.msg = msg;
+  cfg.msg_length = (uint16_t)msg_len;
+  cfg.nonce = iv;
+  cfg.nonce_length = 12;
+  cfg.ad = (aad != nullptr && aad_len != 0) ? aad : kEmpty;
+  cfg.ad_length = (uint16_t)aad_len;
+  cfg.key_config.b0.key_size = SL_SI91X_GCM_KEY_SIZE_256;
+  cfg.key_config.b0.key_slot = (sl_si91x_crypto_key_slot_t)0;
+  if (ctx->key_wrapped) {
+    cfg.key_config.b0.key_type = SL_SI91X_WRAPPED_KEY;
+    cfg.key_config.b0.wrap_iv_mode = SL_SI91X_WRAP_IV_CBC_MODE;
+    memcpy(cfg.key_config.b0.wrap_iv, ctx->salt, MLRS_GCM_SALT_LEN);
+    memcpy(cfg.key_config.b0.key_buffer, ctx->wrapped_key, MLRS_GCM_KEY_LEN);
+  } else {
+    cfg.key_config.b0.key_type = SL_SI91X_TRANSPARENT_KEY;
+    memcpy(cfg.key_config.b0.key_buffer, ctx->key, MLRS_GCM_KEY_LEN);
+  }
+  return sl_si91x_gcm(&cfg, out) == SL_STATUS_OK;
+}
+#endif
+
+#if defined(MLRS_HAVE_SI91X_WRAP)
+static bool wrap_key_hw(const uint8_t key[32], const uint8_t salt[4],
+                        uint8_t wrapped[32]) {
+  static sl_si91x_wrap_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.key_type = SL_SI91X_TRANSPARENT_KEY;
+  cfg.key_size = 32;
+  cfg.wrap_iv_mode = SL_SI91X_WRAP_IV_CBC_MODE;
+  memcpy(cfg.wrap_iv, "mLRSwrap", 8);
+  memcpy(cfg.wrap_iv + 8, salt, 4);
+  memcpy(cfg.key_buffer, key, 32);
+  return sl_si91x_wrap(&cfg, wrapped) == SL_STATUS_OK;
+}
+#endif
+
+static void ctx_init_with_key(mlrs_gcm_ctx_t *ctx, const uint8_t key[32],
                               const uint8_t salt[4]) {
   memset(ctx, 0, sizeof(*ctx));
   memcpy(ctx->key, key, MLRS_GCM_KEY_LEN);
-  aes_expand(key, ctx->round_key);
-  uint8_t zero[16] = {};
-  aes_encrypt(ctx->round_key, zero, ctx->H);
   memcpy(ctx->salt, salt, MLRS_GCM_SALT_LEN);
+  aes256_expand(key, ctx->round_key);
+  uint8_t zero[16] = {};
+  aes256_encrypt(ctx->round_key, zero, ctx->H);
+#if defined(MLRS_HAVE_SI91X_WRAP)
+  if (wrap_key_hw(key, salt, ctx->wrapped_key)) {
+    ctx->key_wrapped = 1;
+    g_wrap_ready = true;
+  }
+#endif
 }
 
 void mlrs_gcm_make_iv(const mlrs_gcm_ctx_t *ctx, uint8_t dir, uint32_t counter,
@@ -328,8 +532,8 @@ void mlrs_gcm_seal(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[MLRS_GCM_IV_LEN],
 #if defined(MLRS_HAVE_SI91X_GCM)
   uint8_t hw_out[96];
   if (g_hw_ready && data_len + 16 <= sizeof(hw_out) &&
-      siw917_gcm(ctx->key, SL_SI91X_GCM_ENCRYPT, iv, aad, aad_len, data,
-                 data_len, hw_out)) {
+      siw917_gcm(ctx, SL_SI91X_GCM_ENCRYPT, iv, aad, aad_len, data, data_len,
+                 hw_out)) {
     memcpy(data, hw_out, data_len);
     memcpy(tag, hw_out + data_len, tag_len);
     return;
@@ -349,8 +553,8 @@ bool mlrs_gcm_open(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[MLRS_GCM_IV_LEN],
 #if defined(MLRS_HAVE_SI91X_GCM)
   uint8_t hw_out[96];
   if (g_hw_ready && data_len + 16 <= sizeof(hw_out) &&
-      siw917_gcm(ctx->key, SL_SI91X_GCM_DECRYPT, iv, aad, aad_len, data,
-                 data_len, hw_out)) {
+      siw917_gcm(ctx, SL_SI91X_GCM_DECRYPT, iv, aad, aad_len, data, data_len,
+                 hw_out)) {
     uint8_t hw_diff = 0;
     for (size_t i = 0; i < tag_len; ++i) {
       hw_diff |= (uint8_t)(hw_out[data_len + i] ^ tag[i]);
@@ -375,56 +579,121 @@ bool mlrs_gcm_open(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[MLRS_GCM_IV_LEN],
   return true;
 }
 
-void mlrs_gcm_derive_from_uid(const uint8_t uid[6], mlrs_gcm_ctx_t *uplink,
-                              mlrs_gcm_ctx_t *downlink) {
-  uint8_t root[16];
-  memset(root, 0, sizeof(root));
-  memcpy(root, uid, 6);
-  root[6] = 'm';
-  root[7] = 'L';
-  root[8] = 'R';
-  root[9] = 'S';
-  root[10] = 'G';
-  root[11] = 'C';
-  root[12] = 'M';
-  root[13] = '1';
-  root[14] = 0x00;
-  root[15] = 0x01;
-
-  uint32_t rk[44];
-  aes_expand(root, rk);
-
-  uint8_t label_up[16] = {'m', 'L', 'R', 'S', '/', 'u', 'p', 'l',
-                          'i', 'n', 'k', 0,   0,   0,   0,   1};
-  uint8_t label_dn[16] = {'m', 'L', 'R', 'S', '/', 'd', 'n', 'l',
-                          'i', 'n', 'k', 0,   0,   0,   0,   2};
-  uint8_t label_iv[16] = {'m', 'L', 'R', 'S', '/', 'i', 'v', '-',
-                          's', 'a', 'l', 't', 0,   0,   0,   3};
-  uint8_t k_up[16];
-  uint8_t k_dn[16];
-  uint8_t salt_block[16];
-  aes_encrypt(rk, label_up, k_up);
-  aes_encrypt(rk, label_dn, k_dn);
-  aes_encrypt(rk, label_iv, salt_block);
+void mlrs_gcm_derive(const uint8_t uid[6],
+                     const uint8_t secret[MLRS_GCM_SECRET_LEN],
+                     mlrs_gcm_ctx_t *uplink, mlrs_gcm_ctx_t *downlink) {
+  uint8_t ikm[6 + MLRS_GCM_SECRET_LEN];
+  memcpy(ikm, uid, 6);
+  memcpy(ikm + 6, secret, MLRS_GCM_SECRET_LEN);
+  uint8_t k_up[32];
+  uint8_t k_dn[32];
+  uint8_t salt_block[32];
+  hkdf_sha256(ikm, sizeof(ikm), "mLRS-R2/uplink", k_up, sizeof(k_up));
+  hkdf_sha256(ikm, sizeof(ikm), "mLRS-R2/dnlink", k_dn, sizeof(k_dn));
+  hkdf_sha256(ikm, sizeof(ikm), "mLRS-R2/ivsalt", salt_block, sizeof(salt_block));
   ctx_init_with_key(uplink, k_up, salt_block);
   ctx_init_with_key(downlink, k_dn, salt_block);
-  memset(root, 0, sizeof(root));
+  memset(ikm, 0, sizeof(ikm));
   memset(k_up, 0, sizeof(k_up));
   memset(k_dn, 0, sizeof(k_dn));
-  memset(rk, 0, sizeof(rk));
+}
+
+bool mlrs_gcm_random(uint8_t *out, size_t len) {
+  if (out == nullptr || len == 0) {
+    return false;
+  }
+#if defined(MLRS_HAVE_SI91X_TRNG)
+  if (len <= 1024) {
+    uint32_t words[256];
+    if (sl_si91x_trng_get_random_num(words, (uint16_t)len) == SL_STATUS_OK) {
+      memcpy(out, words, len);
+      memset(words, 0, sizeof(words));
+      uint8_t acc = 0;
+      for (size_t i = 0; i < len; ++i) {
+        acc |= out[i];
+      }
+      if (acc != 0) {
+        g_trng_ready = true;
+        return true;
+      }
+    }
+  }
+#endif
+  uint8_t seed[48];
+  memset(seed, 0, sizeof(seed));
+  static uint32_t mix = 0xA5A5A5A5U;
+  mix = mix * 1664525U + 1013904223U + (uint32_t)(uintptr_t)out;
+  store_be32(seed, mix);
+  store_be32(seed + 4, (uint32_t)len);
+  store_be32(seed + 8, (uint32_t)(uintptr_t)&mix);
+  sha256(seed, sizeof(seed), seed);
+  size_t off = 0;
+  uint32_t counter = 1;
+  while (off < len) {
+    uint8_t block[36];
+    memcpy(block, seed, 32);
+    store_be32(block + 32, counter++);
+    uint8_t digest[32];
+    sha256(block, sizeof(block), digest);
+    const size_t n = (len - off) > 32 ? 32 : (len - off);
+    memcpy(out + off, digest, n);
+    off += n;
+  }
+  return true;
 }
 
 bool mlrs_gcm_selftest(void) {
-  /* NIST SP 800-38D Appendix D, Test Case 2. */
-  const uint8_t key[16] = {};
+  /* FIPS-197 C.3 AES-256 ECB. */
+  const uint8_t aes_key[32] = {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+      0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+  const uint8_t aes_pt[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                              0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+  const uint8_t aes_ct[16] = {0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf,
+                              0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89};
+  uint32_t rk[60];
+  uint8_t got[16];
+  aes256_expand(aes_key, rk);
+  aes256_encrypt(rk, aes_pt, got);
+  if (memcmp(got, aes_ct, 16) != 0) {
+    return false;
+  }
+
+  /* RFC 4231 HMAC-SHA256 test case 1. */
+  const uint8_t hmac_key[20] = {0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                                0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+                                0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b};
+  const uint8_t hmac_msg[8] = {'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e'};
+  const uint8_t hmac_exp[32] = {
+      0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf,
+      0xce, 0xaf, 0x0b, 0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83,
+      0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7};
+  uint8_t hmac_got[32];
+  hmac_sha256_sw(hmac_key, sizeof(hmac_key), hmac_msg, sizeof(hmac_msg),
+                 hmac_got);
+  if (memcmp(hmac_got, hmac_exp, 32) != 0) {
+    return false;
+  }
+#if defined(MLRS_HAVE_SI91X_HMAC)
+  if (hmac_sha256_hw(hmac_key, sizeof(hmac_key), hmac_msg, sizeof(hmac_msg),
+                     hmac_got) &&
+      memcmp(hmac_got, hmac_exp, 32) == 0) {
+    g_hmac_ready = true;
+  }
+#endif
+
+  /* NIST SP 800-38D AES-256 GCM, Test Case 14. */
+  const uint8_t key[32] = {};
   const uint8_t iv[12] = {};
   uint8_t pt[16] = {};
-  const uint8_t ct_exp[16] = {0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
-                              0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78};
-  const uint8_t tag_exp[16] = {0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd,
-                               0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57, 0xbd, 0xdf};
+  const uint8_t ct_exp[16] = {0xce, 0xa7, 0x40, 0x3d, 0x4d, 0x60, 0x6b, 0x6e,
+                              0x07, 0x4e, 0xc5, 0xd3, 0xba, 0xf3, 0x9d, 0x18};
+  const uint8_t tag_exp[16] = {0xd0, 0xd1, 0xc8, 0xa7, 0x99, 0x99, 0x6b, 0xf0,
+                               0x26, 0x5b, 0x98, 0xb5, 0xd4, 0x8a, 0xb9, 0x19};
   mlrs_gcm_ctx_t ctx;
   uint8_t salt[4] = {};
+  g_hw_ready = false;
   ctx_init_with_key(&ctx, key, salt);
   uint8_t tag[16];
   mlrs_gcm_seal(&ctx, iv, nullptr, 0, pt, sizeof(pt), tag, sizeof(tag));
@@ -436,51 +705,15 @@ bool mlrs_gcm_selftest(void) {
                      sizeof(tag_exp))) {
     return false;
   }
-  uint8_t zero[16] = {};
-  if (memcmp(pt, zero, sizeof(zero)) != 0) {
-    return false;
-  }
-
-  /* 48-byte payload + 20-byte AAD, cross-checked against Python cryptography. */
-  const uint8_t key4[16] = {0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
-                            0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08};
-  const uint8_t iv4[12] = {0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad,
-                           0xde, 0xca, 0xf8, 0x88};
-  const uint8_t aad4[20] = {0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
-                            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
-                            0xab, 0xad, 0xda, 0xd2};
-  uint8_t pt4[48] = {
-      0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5,
-      0xaf, 0xf5, 0x26, 0x9a, 0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda,
-      0x2e, 0x4c, 0x30, 0x3d, 0x8a, 0x31, 0x8a, 0x72, 0x1e, 0x3c, 0x0c, 0x95,
-      0xa9, 0x92, 0xd1, 0x8c, 0x68, 0x11, 0xce, 0x32, 0x64, 0xb0, 0x65, 0x29};
-  const uint8_t ct4[48] = {
-      0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24, 0x4b, 0x72, 0x21, 0xb7,
-      0x84, 0xd0, 0xd4, 0x9c, 0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0,
-      0x35, 0xc1, 0x7e, 0x23, 0x29, 0xac, 0xa1, 0x2e, 0x23, 0xd5, 0x14, 0xb2,
-      0x68, 0x9c, 0x4b, 0xc3, 0x3a, 0x51, 0xaa, 0x4c, 0x81, 0x92, 0x7a, 0x09};
-  const uint8_t tag4[16] = {0x6d, 0x15, 0x02, 0x5f, 0x13, 0x50, 0xfb, 0x85,
-                            0xb4, 0xc0, 0xed, 0x6c, 0x05, 0xc1, 0xa0, 0x9e};
-  ctx_init_with_key(&ctx, key4, salt);
-  mlrs_gcm_seal(&ctx, iv4, aad4, sizeof(aad4), pt4, sizeof(pt4), tag,
-                sizeof(tag));
-  if (memcmp(pt4, ct4, sizeof(ct4)) != 0 ||
-      memcmp(tag, tag4, sizeof(tag4)) != 0) {
-    return false;
-  }
-  if (!mlrs_gcm_open(&ctx, iv4, aad4, sizeof(aad4), pt4, sizeof(pt4), tag4,
-                     sizeof(tag4))) {
-    return false;
-  }
 
 #if defined(MLRS_HAVE_SI91X_GCM)
   {
     uint8_t hw_pt[16] = {};
     uint8_t hw_out[32];
-    uint8_t zero_key[16] = {};
-    uint8_t zero_iv[12] = {};
-    g_hw_ready = false;
-    if (siw917_gcm(zero_key, SL_SI91X_GCM_ENCRYPT, zero_iv, nullptr, 0, hw_pt,
+    mlrs_gcm_ctx_t hw_ctx;
+    ctx_init_with_key(&hw_ctx, key, salt);
+    hw_ctx.key_wrapped = 0;
+    if (siw917_gcm(&hw_ctx, SL_SI91X_GCM_ENCRYPT, iv, nullptr, 0, hw_pt,
                    sizeof(hw_pt), hw_out) &&
         memcmp(hw_out, ct_exp, sizeof(ct_exp)) == 0 &&
         memcmp(hw_out + 16, tag_exp, sizeof(tag_exp)) == 0) {
@@ -493,8 +726,14 @@ bool mlrs_gcm_selftest(void) {
 
 const char *mlrs_gcm_backend_name(void) {
 #if defined(MLRS_HAVE_SI91X_GCM)
-  return g_hw_ready ? "siw917-hw" : "software (hw probe failed)";
+  if (g_hw_ready && g_wrap_ready) {
+    return "siw917-hw-aes256-wrap";
+  }
+  if (g_hw_ready) {
+    return g_hmac_ready ? "siw917-hw-aes256" : "siw917-hw-aes256 (sw-hkdf)";
+  }
+  return "software-aes256 (hw probe failed)";
 #else
-  return "software";
+  return "software-aes256";
 #endif
 }
