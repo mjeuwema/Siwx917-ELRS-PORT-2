@@ -37,6 +37,8 @@ bool mlrs_ota_is_active(void);
 bool mlrs_ota_is_connected(void);
 void mlrs_ota_hop_skip_info(uint8_t *skip_count, uint8_t *hop_count,
                             uint32_t *mask);
+void mlrs_ota_link_rate_info(uint8_t *rate, uint8_t *band, uint8_t *ul_plen,
+                             uint8_t *dl_plen);
 bool mlrs_ota_tlm_busy(void);
 uint32_t mlrs_ota_tlm_busy_timeout_ms(void);
 bool mlrs_ota_take_elrs_first_sync(void);

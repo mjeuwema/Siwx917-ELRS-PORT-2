@@ -321,6 +321,8 @@ static uint32_t g_recv_highest = 0;
 static uint8_t g_gcm_ready = 0;
 static uint8_t g_secret[MLRS_GCM_SECRET_LEN] = {};
 static uint8_t g_secret_ok = 0;
+static uint8_t g_last_ul_plen = 0;
+static uint8_t g_last_dl_plen = 0;
 #if MLRS_OTA_IS_TX
 static uint8_t g_ul_hold[64] = {};
 static uint8_t g_ul_hold_len = 0;
@@ -1201,6 +1203,7 @@ static void pack_tx_frame(tTxFrame *frame, const uint16_t rc[16],
   if (payload != nullptr && payload_len > 0) {
     memcpy(frame->payload, payload, payload_len);
   }
+  g_last_ul_plen = payload_len;
   uint16_t crc;
   crc_init(&crc);
   crc_accumulate_buf(&crc, (uint8_t *)frame, 11);
@@ -1290,6 +1293,7 @@ static void pack_rx_frame(tRxFrame *frame, uint8_t seq, uint8_t lq, bool ack,
   if (payload != nullptr && payload_len > 0) {
     memcpy(frame->payload, payload, payload_len);
   }
+  g_last_dl_plen = payload_len;
   uint8_t iv[MLRS_GCM_IV_LEN];
   mlrs_gcm_make_iv(&g_gcm_dn, MLRS_GCM_DIR_DOWNLINK, frame->pkt_counter, iv);
   mlrs_gcm_seal(&g_gcm_dn, iv, (uint8_t *)frame, FRAME_RX_AAD_LEN, frame->payload,
@@ -1914,6 +1918,7 @@ static void mlrs_rx_process_uplink() {
   }
   ++g_rx_ok;
   note_valid_rx();
+  g_last_ul_plen = (uint8_t)g_tx_frame.status.payload_len;
   hop_note((uint8_t)g_tx_frame.status.fhss_index, true);
   if ((g_tx_frame.status.fhss_index_band != g_band) &&
       (g_tx_frame.status.fhss_index_band < MLRS_BAND_COUNT)) {
@@ -2291,6 +2296,22 @@ extern "C" void mlrs_ota_hop_skip_info(uint8_t *skip_count, uint8_t *hop_count,
   }
   if (mask != nullptr) {
     *mask = g_hop_mask;
+  }
+}
+
+extern "C" void mlrs_ota_link_rate_info(uint8_t *rate, uint8_t *band,
+                                        uint8_t *ul_plen, uint8_t *dl_plen) {
+  if (rate != nullptr) {
+    *rate = sanitize_rate(g_rate);
+  }
+  if (band != nullptr) {
+    *band = sanitize_band(g_band);
+  }
+  if (ul_plen != nullptr) {
+    *ul_plen = g_last_ul_plen;
+  }
+  if (dl_plen != nullptr) {
+    *dl_plen = g_last_dl_plen;
   }
 }
 
