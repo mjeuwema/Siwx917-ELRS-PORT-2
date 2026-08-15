@@ -78,7 +78,7 @@ extern uint8_t uplinkLQ;
 #undef PACKED
 #define PACKED(__Declaration__) __Declaration__ __attribute__((packed))
 
-#define FRAME_TX_RX_LEN 91
+#define FRAME_TX_RX_LEN 99
 #define FRAME_TX_RCDATA1_LEN 6
 #define FRAME_TX_RCDATA2_LEN 10
 #define FRAME_TX_PAYLOAD_LEN 52
@@ -86,8 +86,8 @@ extern uint8_t uplinkLQ;
 #define FRAME_TX_AAD_LEN 13
 #define FRAME_RX_AAD_LEN 11
 #define FRAME_TX_SEAL_LEN (FRAME_TX_RCDATA1_LEN + FRAME_TX_RCDATA2_LEN + FRAME_TX_PAYLOAD_LEN)
-#define FRAME_GCM_TAG_LEN 8
-#define MLRS_OVERLAY_ID "20260813R"
+#define FRAME_GCM_TAG_LEN 16
+#define MLRS_OVERLAY_ID "20260813S"
 #define MLRS_MUX_MAGIC 0x5A
 #define MLRS_HOP_WIN 16
 #define MLRS_HOP_FAIL_PCT 75
@@ -2272,7 +2272,7 @@ extern "C" bool mlrs_ota_tlm_busy(void) {
 
 extern "C" uint32_t mlrs_ota_tlm_busy_timeout_ms(void) {
   /* Cap only. TXdone usually arrives in a few ms. 40 ms was sized for
-   * 31 Hz; 19 Hz LoRa SF6 91-byte frames are still on air past that. */
+   * 31 Hz; 19 Hz LoRa SF6 99-byte frames are still on air past that. */
   return current_rate_cfg()->interval_us / 1000U + 15U;
 }
 
