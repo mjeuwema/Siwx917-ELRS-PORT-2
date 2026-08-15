@@ -24,6 +24,16 @@ target_compile_definitions(slc PUBLIC
 # Standalone BLE probe support. This is intentionally wired as a branch-local
 # experiment and does not alter the WiFi HTTP server flow.
 set(WISECONNECT3_SDK_DIR "${SDK_PATH}/../../wisece6a05cd369ee2/p")
+set(SIW917_GCM_SRC
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/src/sl_si91x_gcm.c")
+if(EXISTS "${SIW917_GCM_SRC}")
+    target_sources(slc PRIVATE "${SIW917_GCM_SRC}")
+    target_include_directories(slc PUBLIC
+        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/inc"
+        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/inc"
+    )
+    target_compile_definitions(slc PUBLIC MLRS_HAVE_SI91X_GCM=1)
+endif()
 set(SIW917_BLE_SDK_SOURCES
     "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_ble_gap_apis.c"
     "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/ble/src/rsi_ble_gatt_apis.c"

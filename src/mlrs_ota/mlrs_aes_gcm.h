@@ -19,9 +19,11 @@ typedef struct {
   uint32_t round_key[44];
   uint8_t H[16];
   uint8_t salt[MLRS_GCM_SALT_LEN];
+  uint8_t key[MLRS_GCM_KEY_LEN];
 } mlrs_gcm_ctx_t;
 
 bool mlrs_gcm_selftest(void);
+const char *mlrs_gcm_backend_name(void);
 void mlrs_gcm_derive_from_uid(const uint8_t uid[6], mlrs_gcm_ctx_t *uplink,
                               mlrs_gcm_ctx_t *downlink);
 void mlrs_gcm_make_iv(const mlrs_gcm_ctx_t *ctx, uint8_t dir, uint32_t counter,
