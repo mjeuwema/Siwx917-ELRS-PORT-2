@@ -31,10 +31,14 @@ extern "C" {
 #define MLRS_OTA_RATE_OPTIONS MLRS_OTA_RATE_OPTIONS_915
 #define MLRS_AIR_MBRIDGE 0xA0
 #define MLRS_AIR_RX_STATE 0x20
+#define MLRS_AIR_HOPMASK 0x21
 
 bool mlrs_ota_is_active(void);
 bool mlrs_ota_is_connected(void);
+void mlrs_ota_hop_skip_info(uint8_t *skip_count, uint8_t *hop_count,
+                            uint32_t *mask);
 bool mlrs_ota_tlm_busy(void);
+uint32_t mlrs_ota_tlm_busy_timeout_ms(void);
 bool mlrs_ota_take_elrs_first_sync(void);
 uint8_t mlrs_ota_get_protocol(void);
 bool mlrs_ota_set_protocol(uint8_t protocol);

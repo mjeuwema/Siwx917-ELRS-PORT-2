@@ -51,6 +51,7 @@ extern "C" void siw917_tx_publish_mlrs_linkstats(void);
 extern volatile uint8_t syncSpamCounter;
 extern volatile uint8_t syncSpamCounterAfterRateChange;
 extern uint32_t SyncPacketLastSent;
+extern volatile bool busyTransmitting;
 #endif
 #else
 #define MLRS_OTA_IS_TX 0
@@ -86,9 +87,12 @@ extern uint8_t uplinkLQ;
 #define FRAME_RX_AAD_LEN 11
 #define FRAME_TX_SEAL_LEN (FRAME_TX_RCDATA1_LEN + FRAME_TX_RCDATA2_LEN + FRAME_TX_PAYLOAD_LEN)
 #define FRAME_GCM_TAG_LEN 8
-#define MLRS_TLM_BUSY_TIMEOUT_MS 40U
-#define MLRS_OVERLAY_ID "20260813O"
+#define MLRS_OVERLAY_ID "20260813Q"
 #define MLRS_MUX_MAGIC 0x5A
+#define MLRS_HOP_WIN 16
+#define MLRS_HOP_FAIL_PCT 75
+#define MLRS_HOP_CLEAR_OK 2
+#define MLRS_HOP_MAX_SKIP 6
 #define MLRS_GCM_CTR_BOOT_GAP 1024U
 #define MLRS_GCM_CTR_RESERVE (1U << 20)
 #define FHSS_MAX_HOPS 25
@@ -259,6 +263,18 @@ static uint32_t g_fhss_list[FHSS_MAX_HOPS] = {};
 static uint8_t g_fhss_ch[FHSS_MAX_HOPS] = {};
 static uint8_t g_fhss_count = FHSS_NUM_915;
 static uint8_t g_fhss_i = 0;
+static uint32_t g_hop_mask = 0;
+static uint8_t g_hop_gen = 0;
+#if !MLRS_OTA_IS_TX
+typedef struct {
+  uint8_t vis;
+  uint8_t fail;
+  uint8_t probe_ok;
+} hop_stat_t;
+static hop_stat_t g_hop_stat[FHSS_MAX_HOPS] = {};
+static uint32_t g_hop_proposed_mask = 0;
+static uint8_t g_hop_proposed_gen = 0;
+#endif
 #if MLRS_OTA_IS_TX
 static bool g_fhss_need_hop = false;
 static bool g_logged_switch_cmd = false;
@@ -506,11 +522,11 @@ static const mlrs_rate_cfg_t *current_rate_cfg() {
 #if MLRS_OTA_IS_TX
 #define MLRS_DYN_LQ_BOOST_DIFF 20
 #define MLRS_DYN_LQ_BOOST_MIN 50
+#define MLRS_DYN_LQ_THRESH_UP 85
+#define MLRS_DYN_LQ_THRESH_DN 95
 #define MLRS_DYN_RSSI_CNT 5
 #define MLRS_DYN_RSSI_THRESH_UP 15
 #define MLRS_DYN_RSSI_THRESH_DN 21
-#define MLRS_DYN_LQ_THRESH_UP 85
-#define MLRS_DYN_LQ_THRESH_DN 95
 
 static uint8_t g_dyn_lq_avg = 100;
 static int16_t g_dyn_rssi_acc = 0;
@@ -788,6 +804,13 @@ static void fhss_generate() {
     g_fhss_count = k;
   }
   g_fhss_i = 0;
+  g_hop_mask = 0;
+  g_hop_gen = 0;
+#if !MLRS_OTA_IS_TX
+  memset(g_hop_stat, 0, sizeof(g_hop_stat));
+  g_hop_proposed_mask = 0;
+  g_hop_proposed_gen = 0;
+#endif
 #if MLRS_OTA_IS_TX
   g_fhss_need_hop = false;
 #else
@@ -803,11 +826,147 @@ static void fhss_generate() {
 
 static uint32_t fhss_curr() { return g_fhss_list[g_fhss_i]; }
 
+static uint8_t hop_bitcount(uint32_t mask) {
+  uint8_t n = 0;
+  while (mask != 0) {
+    mask &= mask - 1U;
+    ++n;
+  }
+  return n;
+}
+
+static uint8_t hop_max_skip() {
+  if (g_fhss_count < 8) {
+    return 0;
+  }
+  uint8_t n = (uint8_t)(g_fhss_count / 4U);
+  if (n > MLRS_HOP_MAX_SKIP) {
+    n = MLRS_HOP_MAX_SKIP;
+  }
+  return n;
+}
+
+static uint32_t hop_sanitize_mask(uint32_t mask) {
+  mask &= ~1U;
+  if (g_fhss_count == 0) {
+    return 0;
+  }
+  if (g_fhss_count < 32) {
+    mask &= ((1UL << g_fhss_count) - 1UL);
+  }
+  const uint8_t max_skip = hop_max_skip();
+  while (hop_bitcount(mask) > max_skip) {
+    for (int i = (int)g_fhss_count - 1; i > 0; --i) {
+      const uint32_t bit = 1UL << i;
+      if ((mask & bit) != 0) {
+        mask &= ~bit;
+        break;
+      }
+    }
+  }
+  return mask;
+}
+
+static bool hop_is_skipped(uint8_t i) {
+  if (i == 0 || i >= g_fhss_count) {
+    return false;
+  }
+  return (g_hop_mask & (1UL << i)) != 0;
+}
+
+static uint8_t hop_probe_pick() {
+  uint8_t skipped = 0;
+  for (uint8_t i = 1; i < g_fhss_count; ++i) {
+    if (hop_is_skipped(i)) {
+      ++skipped;
+    }
+  }
+  if (skipped == 0) {
+    return 0xFF;
+  }
+#if MLRS_OTA_IS_TX
+  const uint32_t ctr = (g_send_counter > 1) ? (g_send_counter - 1U) : 1U;
+#else
+  const uint32_t ctr = g_recv_highest;
+#endif
+  uint8_t n = (uint8_t)(ctr % skipped);
+  for (uint8_t i = 1; i < g_fhss_count; ++i) {
+    if (hop_is_skipped(i)) {
+      if (n == 0) {
+        return i;
+      }
+      --n;
+    }
+  }
+  return 0xFF;
+}
+
+static void hopmask_apply(uint8_t gen, uint32_t mask) {
+  mask = hop_sanitize_mask(mask);
+  if (mask == g_hop_mask && gen == g_hop_gen) {
+    return;
+  }
+  g_hop_mask = mask;
+  g_hop_gen = gen;
+  printf("[mLRS] hopmask gen=%u skip=%u/%u bits=0x%08lx\n", (unsigned)gen,
+         (unsigned)hop_bitcount(mask), (unsigned)g_fhss_count,
+         (unsigned long)mask);
+}
+
+static uint8_t hopmask_pack(uint8_t *dst, uint8_t gen, uint32_t mask) {
+  dst[0] = MLRS_AIR_HOPMASK;
+  dst[1] = gen;
+  dst[2] = (uint8_t)mask;
+  dst[3] = (uint8_t)(mask >> 8);
+  dst[4] = (uint8_t)(mask >> 16);
+  dst[5] = (uint8_t)(mask >> 24);
+  return 6;
+}
+
+static bool hopmask_parse(const uint8_t *f, uint8_t n, uint8_t *gen,
+                          uint32_t *mask) {
+  if (f == nullptr || n < 6 || f[0] != MLRS_AIR_HOPMASK || gen == nullptr ||
+      mask == nullptr) {
+    return false;
+  }
+  *gen = f[1];
+  *mask = (uint32_t)f[2] | ((uint32_t)f[3] << 8) | ((uint32_t)f[4] << 16) |
+          ((uint32_t)f[5] << 24);
+  return true;
+}
+
 static void fhss_hop() {
   if (g_fhss_count == 0) {
     return;
   }
-  g_fhss_i = (uint8_t)((g_fhss_i + 1) % g_fhss_count);
+  if (hop_is_skipped(g_fhss_i)) {
+    uint8_t i = 0;
+    for (uint8_t n = 0; n < g_fhss_count; ++n) {
+      i = (uint8_t)((i + 1) % g_fhss_count);
+      if (!hop_is_skipped(i)) {
+        g_fhss_i = i;
+        return;
+      }
+    }
+    g_fhss_i = 0;
+    return;
+  }
+  if (g_fhss_i == 0) {
+    const uint8_t probe = hop_probe_pick();
+    if (probe < g_fhss_count) {
+      g_fhss_i = probe;
+      return;
+    }
+  }
+  uint8_t i = g_fhss_i;
+  for (uint8_t n = 0; n < g_fhss_count; ++n) {
+    i = (uint8_t)((i + 1) % g_fhss_count);
+    if (!hop_is_skipped(i)) {
+      g_fhss_i = i;
+      return;
+    }
+  }
+  g_fhss_i = 0;
 }
 
 #if !MLRS_OTA_IS_TX
@@ -815,6 +974,69 @@ static void fhss_set_index(uint8_t index) {
   if (index < g_fhss_count) {
     g_fhss_i = index;
   }
+}
+
+static void hop_note(uint8_t idx, bool ok) {
+  if (idx >= g_fhss_count || idx >= FHSS_MAX_HOPS) {
+    return;
+  }
+  hop_stat_t *s = &g_hop_stat[idx];
+  if (s->vis < 254) {
+    ++s->vis;
+  }
+  if (!ok && s->fail < 254) {
+    ++s->fail;
+  }
+  if (ok && (g_hop_proposed_mask & (1UL << idx)) != 0) {
+    if (s->probe_ok < 4) {
+      ++s->probe_ok;
+    }
+  } else if (!ok) {
+    s->probe_ok = 0;
+  }
+}
+
+static void hop_rebuild_mask() {
+  if (!g_connected || g_fhss_count < 8) {
+    return;
+  }
+  uint32_t mask = g_hop_proposed_mask;
+  const uint8_t max_skip = hop_max_skip();
+  for (uint8_t i = 1; i < g_fhss_count; ++i) {
+    hop_stat_t *s = &g_hop_stat[i];
+    if (s->vis >= MLRS_HOP_WIN) {
+      s->vis = (uint8_t)(s->vis / 2);
+      s->fail = (uint8_t)(s->fail / 2);
+    }
+    if (s->vis < 8) {
+      continue;
+    }
+    const uint16_t fail_pct = (uint16_t)((uint16_t)s->fail * 100U / s->vis);
+    if ((mask & (1UL << i)) != 0) {
+      if (s->probe_ok >= MLRS_HOP_CLEAR_OK) {
+        mask &= ~(1UL << i);
+        s->probe_ok = 0;
+        s->vis = 0;
+        s->fail = 0;
+      }
+    } else if (fail_pct >= MLRS_HOP_FAIL_PCT &&
+               hop_bitcount(mask) < max_skip) {
+      mask |= (1UL << i);
+      s->probe_ok = 0;
+    }
+  }
+  mask = hop_sanitize_mask(mask);
+  if (mask == g_hop_proposed_mask) {
+    return;
+  }
+  g_hop_proposed_mask = mask;
+  g_hop_proposed_gen = (uint8_t)(g_hop_proposed_gen + 1U);
+  if (g_hop_proposed_gen == 0) {
+    g_hop_proposed_gen = 1;
+  }
+  printf("[mLRS] rx hopmask gen=%u skip=%u/%u bits=0x%08lx\n",
+         (unsigned)g_hop_proposed_gen, (unsigned)hop_bitcount(mask),
+         (unsigned)g_fhss_count, (unsigned long)mask);
 }
 #endif
 
@@ -1240,8 +1462,13 @@ static void mlrs_tx_send_frame() {
     g_fhss_need_hop = false;
   }
   const uint32_t interval_ms = current_rate_cfg()->interval_us / 1000U;
-  if (g_last_rx_ms != 0 &&
-      (millis() - g_last_rx_ms) > (interval_ms + 8U)) {
+  /* FSK50 / 2.4 50Hz send tlm every other slot. Scoring the skip
+   * slot as a miss pins TX LQ at 50 with a perfect uplink. */
+  uint32_t miss_ms = interval_ms + 8U;
+  if (tight_slot()) {
+    miss_ms = (interval_ms * 2U) + 8U;
+  }
+  if (g_last_rx_ms != 0 && (millis() - g_last_rx_ms) > miss_ms) {
     note_missed_rx();
   }
   uint16_t rc[16];
@@ -1261,6 +1488,12 @@ static void mlrs_tx_send_frame() {
     payload[1] = sanitize_rate(g_pending_rate);
     payload_len = 2;
   } else {
+    {
+      uint8_t hm[6];
+      hopmask_pack(hm, g_hop_gen, g_hop_mask);
+      payload_len =
+          mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, hm, 6);
+    }
     for (;;) {
       uint8_t tmp[64];
       uint8_t n = g_ul_hold_len;
@@ -1354,7 +1587,13 @@ static void mlrs_tx_process_downlink() {
       if (f == nullptr || n == 0) {
         return;
       }
-      if (f[0] == MLRS_AIR_MBRIDGE) {
+      if (f[0] == MLRS_AIR_HOPMASK) {
+        uint8_t gen = 0;
+        uint32_t mask = 0;
+        if (hopmask_parse(f, n, &gen, &mask)) {
+          hopmask_apply(gen, mask);
+        }
+      } else if (f[0] == MLRS_AIR_MBRIDGE) {
         mlrs_mbridge_accept_downlink(f, n);
       } else if (f[0] == 0xFD || f[0] == 0xFE) {
         (void)siw917_mavlink_wifi_enqueue_downlink(f, n);
@@ -1466,6 +1705,12 @@ static void mlrs_rx_prepare_tlm() {
   }
   uint8_t payload[FRAME_RX_PAYLOAD_LEN] = {};
   uint8_t payload_len = 0;
+  hop_rebuild_mask();
+  {
+    uint8_t hm[6];
+    hopmask_pack(hm, g_hop_proposed_gen, g_hop_proposed_mask);
+    payload_len = mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, hm, 6);
+  }
   uint8_t st[32];
   const uint8_t sn = mlrs_rx_pack_state(st, sizeof(st));
   if (sn != 0) {
@@ -1634,10 +1879,12 @@ static void mlrs_rx_process_uplink() {
   if (fail != 0) {
     g_last_rx_fail = fail;
     ++g_rx_fail;
+    hop_note((uint8_t)g_tx_frame.status.fhss_index, false);
     return;
   }
   ++g_rx_ok;
   note_valid_rx();
+  hop_note((uint8_t)g_tx_frame.status.fhss_index, true);
   if ((g_tx_frame.status.fhss_index_band != g_band) &&
       (g_tx_frame.status.fhss_index_band < MLRS_BAND_COUNT)) {
     g_pending_band = (uint8_t)g_tx_frame.status.fhss_index_band;
@@ -1704,6 +1951,14 @@ static void mlrs_rx_process_uplink() {
       if (f == nullptr || n == 0) {
         return;
       }
+      if (f[0] == MLRS_AIR_HOPMASK) {
+        uint8_t gen = 0;
+        uint32_t mask = 0;
+        if (hopmask_parse(f, n, &gen, &mask)) {
+          hopmask_apply(gen, mask);
+        }
+        return;
+      }
       if (f[0] == MLRS_AIR_MBRIDGE) {
         mlrs_rx_apply_mbridge(f, n);
         return;
@@ -1737,6 +1992,9 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
       ++g_rx_junk;
     } else {
       ++g_rx_fail;
+      if (g_fhss_follow) {
+        hop_note(g_fhss_i, false);
+      }
     }
     g_rx_need_rearm = 1;
     return false;
@@ -1783,6 +2041,7 @@ static void mlrs_rx_tock() {
     }
   } else {
     note_missed_rx();
+    hop_note(g_fhss_i, false);
     if (g_miss_streak < 255) {
       ++g_miss_streak;
     }
@@ -1833,11 +2092,13 @@ static void start_mlrs() {
   Radio.TXdoneCallback = mlrs_tx_done;
   Radio.RXdoneCallback = mlrs_tx_rx_done;
   hwTimer::callbackTock = mlrs_tx_tock;
+  busyTransmitting = false;
 #else
   Radio.TXdoneCallback = mlrs_rx_done_tx;
   Radio.RXdoneCallback = mlrs_rx_rx_done;
   hwTimer::callbackTock = mlrs_rx_tock;
 #endif
+  hwTimer::callbackTick = nullptr;
   hwTimer::updateInterval(current_rate_cfg()->interval_us);
   g_seq = 0;
   g_valid_window = 0;
@@ -1972,6 +2233,12 @@ extern "C" bool mlrs_ota_tlm_busy(void) {
 #endif
 }
 
+extern "C" uint32_t mlrs_ota_tlm_busy_timeout_ms(void) {
+  /* Cap only. TXdone usually arrives in a few ms. 40 ms was sized for
+   * 31 Hz; 19 Hz LoRa SF6 91-byte frames are still on air past that. */
+  return current_rate_cfg()->interval_us / 1000U + 15U;
+}
+
 extern "C" bool mlrs_ota_take_elrs_first_sync(void) {
   if (!g_lock_first_elrs_sync) {
     return false;
@@ -1981,6 +2248,19 @@ extern "C" bool mlrs_ota_take_elrs_first_sync(void) {
 }
 
 extern "C" bool mlrs_ota_is_connected(void) { return g_active && g_connected; }
+
+extern "C" void mlrs_ota_hop_skip_info(uint8_t *skip_count, uint8_t *hop_count,
+                                       uint32_t *mask) {
+  if (skip_count != nullptr) {
+    *skip_count = hop_bitcount(g_hop_mask);
+  }
+  if (hop_count != nullptr) {
+    *hop_count = g_fhss_count;
+  }
+  if (mask != nullptr) {
+    *mask = g_hop_mask;
+  }
+}
 
 extern "C" uint8_t mlrs_ota_get_protocol(void) {
   if (g_pending_protocol != 0xFF) {
@@ -2185,7 +2465,8 @@ extern "C" void mlrs_ota_loop(void) {
     mlrs_rx_process_uplink();
   }
   if (g_active && g_tlm_busy && g_tlm_busy_ms != 0 &&
-      (int32_t)(millis() - g_tlm_busy_ms) >= (int32_t)MLRS_TLM_BUSY_TIMEOUT_MS) {
+      (int32_t)(millis() - g_tlm_busy_ms) >=
+          (int32_t)mlrs_ota_tlm_busy_timeout_ms()) {
     printf("[mLRS] tlm TX watchdog, re-arm RX\n");
     g_tlm_busy = 0;
     g_tlm_busy_ms = 0;
@@ -2309,7 +2590,8 @@ extern "C" void mlrs_ota_loop(void) {
     const int pwr_dbm = 0;
 #endif
     printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxcrc=%u "
-           "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u pwr=%d\n",
+           "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u "
+           "pwr=%d skip=%u/%u\n",
            (unsigned)g_lq, (unsigned)g_connected, (unsigned)g_tx_sent,
            (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_rx_junk,
            (unsigned)g_last_rx_fail,
@@ -2317,7 +2599,8 @@ extern "C" void mlrs_ota_loop(void) {
            kRates[advertised_band()][advertised_rate()].name,
            (unsigned long)fhss_curr(), (unsigned)g_fhss_i,
            (int)(int8_t)linkStats.uplink_RSSI_1,
-           (unsigned)linkStats.uplink_Link_quality, pwr_dbm);
+           (unsigned)linkStats.uplink_Link_quality, pwr_dbm,
+           (unsigned)hop_bitcount(g_hop_mask), (unsigned)g_fhss_count);
   }
   flush_mlrs_config();
 }

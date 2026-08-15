@@ -5127,6 +5127,9 @@ void elrs_loop(void) {
   // CRITICAL: Process deferred DIO1 interrupts in main-loop context.
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
+  if (mlrs_ota_is_active()) {
+    hwTimer::service();
+  }
   mlrs_ota_loop();
   if (mlrs_ota_is_active()) {
     hwTimer::service();
@@ -5137,8 +5140,10 @@ void elrs_loop(void) {
      * replies, which made the handset retry the whole dump. */
     if (mlrs_ota_tlm_busy()) {
       const uint32_t t0 = millis();
+      const int32_t wait_ms =
+          (int32_t)mlrs_ota_tlm_busy_timeout_ms();
       while (mlrs_ota_tlm_busy() &&
-             (int32_t)(millis() - t0) < 20) {
+             (int32_t)(millis() - t0) < wait_ms) {
         LR1121Hal::handleDeferredISR();
       }
     }
