@@ -1,5 +1,6 @@
 #include "mlrs_ota.h"
 #include "mlrs_aes_gcm.h"
+#include "mlrs_mavlinkx.h"
 
 #include "Arduino.h"
 #include "FHSS.h"
@@ -516,6 +517,38 @@ static uint8_t sanitize_rate(uint8_t rate) {
     return MLRS_RATE_31HZ;
   }
   return rate;
+}
+
+static void mavlinkx_sync_compression() {
+  /* Stock mLRS enables X4 payload compression only in 19 Hz mode. */
+  mlrs_mavlinkx_set_compression(sanitize_rate(g_rate) == MLRS_RATE_19HZ);
+}
+
+static uint8_t mavlinkx_fill_mux(uint8_t *payload, uint8_t payload_len,
+                                 uint8_t max) {
+  for (;;) {
+    const uint8_t hdr = (payload_len == 0) ? 2 : 0;
+    if ((uint16_t)payload_len + hdr + 1U + 2U > max) {
+      break;
+    }
+    uint8_t tmp[64];
+    tmp[0] = MLRS_AIR_MAVLINKX;
+    uint8_t room = (uint8_t)(max - payload_len - hdr - 2U);
+    if (room > 62U) {
+      room = 62U;
+    }
+    const uint8_t n = mlrs_mavlinkx_take_air(tmp + 1, room);
+    if (n == 0) {
+      break;
+    }
+    const uint8_t next =
+        mux_append(payload, payload_len, max, tmp, (uint8_t)(n + 1U));
+    if (next == payload_len) {
+      break;
+    }
+    payload_len = next;
+  }
+  return payload_len;
 }
 
 static uint8_t advertised_rate() {
@@ -1395,6 +1428,9 @@ static void apply_mlrs_rate() {
          g_band == MLRS_BAND_24 ? "2.4GHz" : "915MHz", current_rate_cfg()->name,
          (unsigned)current_rate_cfg()->interval_us, (unsigned)g_fhss_count,
          tight_slot() ? ", tlm/2" : "");
+  mavlinkx_sync_compression();
+  printf("[mLRS] mavlinkx compress=%s\n",
+         sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
 }
 
 static void restore_elrs_radio() {
@@ -1542,18 +1578,19 @@ static void mlrs_tx_send_frame() {
       }
       payload_len = next;
     }
-    const uint8_t overhead = (payload_len == 0) ? 3 : 1;
-    if (payload_len + overhead + 8U <= FRAME_TX_PAYLOAD_LEN) {
+    {
       uint8_t mav[64];
-      const uint8_t room =
-          (uint8_t)(FRAME_TX_PAYLOAD_LEN - payload_len - overhead);
-      const uint8_t n =
-          (uint8_t)siw917_mavlink_wifi_uplink_read_bytes(mav, room);
-      if (n != 0) {
-        payload_len =
-            mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, mav, n);
+      for (;;) {
+        const uint8_t n =
+            (uint8_t)siw917_mavlink_wifi_uplink_read_bytes(mav, sizeof(mav));
+        if (n == 0) {
+          break;
+        }
+        mlrs_mavlinkx_ingest_mav(mav, n);
       }
     }
+    payload_len =
+        mavlinkx_fill_mux(payload, payload_len, FRAME_TX_PAYLOAD_LEN);
   }
   pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq, false, payload,
                 payload_len);
@@ -1621,6 +1658,13 @@ static void mlrs_tx_process_downlink() {
         }
       } else if (f[0] == MLRS_AIR_MBRIDGE) {
         mlrs_mbridge_accept_downlink(f, n);
+      } else if (f[0] == MLRS_AIR_MAVLINKX) {
+        mlrs_mavlinkx_ingest_air(f + 1, (uint8_t)(n - 1U));
+        uint8_t mav[64];
+        uint8_t k;
+        while ((k = mlrs_mavlinkx_take_mav(mav, sizeof(mav))) != 0) {
+          (void)siw917_mavlink_wifi_enqueue_downlink(mav, k);
+        }
       } else if (f[0] == 0xFD || f[0] == 0xFE) {
         (void)siw917_mavlink_wifi_enqueue_downlink(f, n);
       } else {
@@ -1734,6 +1778,26 @@ static uint8_t mlrs_rx_pack_state(uint8_t *dst, uint8_t max) {
   return n;
 }
 
+static bool rx_serial_is_mavlink() {
+  elrs_config_t *cfg = elrs_config_get();
+  return cfg != nullptr &&
+         elrs_serial_protocol_to_lua_selection(cfg->serial_protocol) ==
+             ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK;
+}
+
+static bool mavlinkx_try_mux_item(uint8_t *payload, uint8_t *payload_len,
+                                  const uint8_t *tmp, uint8_t n) {
+  const uint8_t next =
+      mux_append(payload, *payload_len, FRAME_RX_PAYLOAD_LEN, tmp, n);
+  if (next == *payload_len) {
+    memcpy(g_dn_hold, tmp, n);
+    g_dn_hold_len = n;
+    return false;
+  }
+  *payload_len = next;
+  return true;
+}
+
 static void mlrs_rx_prepare_tlm() {
   if (g_tlm_ready || g_tlm_busy) {
     return;
@@ -1751,27 +1815,53 @@ static void mlrs_rx_prepare_tlm() {
   if (sn != 0) {
     payload_len = mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, st, sn);
   }
+  const bool mavlink_uart = rx_serial_is_mavlink();
+  /* Held leftover is always a mux candidate (CRSF), never mid-MAVLink. */
+  if (g_dn_hold_len != 0) {
+    uint8_t tmp[64];
+    const uint8_t n = g_dn_hold_len;
+    memcpy(tmp, g_dn_hold, n);
+    g_dn_hold_len = 0;
+    if (tmp[0] == 0xFD || tmp[0] == 0xFE) {
+      mlrs_mavlinkx_ingest_mav(tmp, n);
+    } else if (!mavlinkx_try_mux_item(payload, &payload_len, tmp, n)) {
+      payload_len =
+          mavlinkx_fill_mux(payload, payload_len, FRAME_RX_PAYLOAD_LEN);
+      pack_rx_frame(&g_rx_frame, g_seq++, g_lq, false, payload, payload_len);
+      g_tlm_ready = 1;
+      return;
+    }
+  }
   for (;;) {
     uint8_t tmp[64];
-    uint8_t n = g_dn_hold_len;
-    if (n != 0) {
-      memcpy(tmp, g_dn_hold, n);
-      g_dn_hold_len = 0;
-    } else {
-      n = mlrs_elrs_rx_take_downlink(tmp, sizeof(tmp));
-      if (n == 0) {
-        break;
-      }
-    }
-    const uint8_t next =
-        mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, tmp, n);
-    if (next == payload_len) {
-      memcpy(g_dn_hold, tmp, n);
-      g_dn_hold_len = n;
+    const uint8_t n = mlrs_elrs_rx_take_downlink(tmp, sizeof(tmp));
+    if (n == 0) {
       break;
     }
-    payload_len = next;
+    if (tmp[0] == 0xFD || tmp[0] == 0xFE) {
+      mlrs_mavlinkx_ingest_mav(tmp, n);
+      continue;
+    }
+    if (!mavlinkx_try_mux_item(payload, &payload_len, tmp, n)) {
+      break;
+    }
   }
+  for (;;) {
+    uint8_t tmp[64];
+    const uint8_t n = mlrs_elrs_rx_take_serial(tmp, sizeof(tmp));
+    if (n == 0) {
+      break;
+    }
+    if (mavlink_uart || tmp[0] == 0xFD || tmp[0] == 0xFE) {
+      mlrs_mavlinkx_ingest_mav(tmp, n);
+      continue;
+    }
+    if (!mavlinkx_try_mux_item(payload, &payload_len, tmp, n)) {
+      break;
+    }
+  }
+  payload_len =
+      mavlinkx_fill_mux(payload, payload_len, FRAME_RX_PAYLOAD_LEN);
   pack_rx_frame(&g_rx_frame, g_seq++, g_lq, false, payload, payload_len);
   g_tlm_ready = 1;
 }
@@ -1998,6 +2088,15 @@ static void mlrs_rx_process_uplink() {
         mlrs_rx_apply_mbridge(f, n);
         return;
       }
+      if (f[0] == MLRS_AIR_MAVLINKX) {
+        mlrs_mavlinkx_ingest_air(f + 1, (uint8_t)(n - 1U));
+        uint8_t mav[64];
+        uint8_t k;
+        while ((k = mlrs_mavlinkx_take_mav(mav, sizeof(mav))) != 0) {
+          mlrs_elrs_rx_write_serial(mav, k);
+        }
+        return;
+      }
       mlrs_elrs_rx_accept_uplink(f, n);
     };
     if (len >= 2 && p[0] == MLRS_MUX_MAGIC) {
@@ -2164,6 +2263,8 @@ static void start_mlrs() {
 #endif
   g_active = true;
   g_protocol = ELRS_AIR_PROTOCOL_MLRS;
+  mlrs_mavlinkx_init();
+  mavlinkx_sync_compression();
 #if MLRS_OTA_IS_TX
   mlrs_dynpower_begin();
   /* Keep the last ELRS RQly during the first grace window. If no mLRS
@@ -2193,14 +2294,17 @@ static void start_mlrs() {
          (unsigned long)g_send_counter);
   printf("[mLRS] AES-GCM backend=%s secret=%s\n", mlrs_gcm_backend_name(),
          g_secret_ok ? "ok" : "MISSING");
-  printf("[mLRS] mux MBridge Lua + CRSF + MAVLink in %u/%u-byte payloads\n",
+  printf("[mLRS] mux MBridge Lua + CRSF + MAVLinkX in %u/%u-byte payloads\n",
          (unsigned)FRAME_TX_PAYLOAD_LEN, (unsigned)FRAME_RX_PAYLOAD_LEN);
+  printf("[mLRS] mavlinkx compress=%s (19Hz only, stock X4)\n",
+         sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
 }
 
 static void stop_mlrs() {
   if (!g_active) {
     return;
   }
+  mlrs_mavlinkx_reset();
   hwTimer::stop();
   persist_gcm_counters();
   Radio.SetTxIdleMode();

@@ -32,6 +32,10 @@ extern "C" {
 #define MLRS_AIR_MBRIDGE 0xA0
 #define MLRS_AIR_RX_STATE 0x20
 #define MLRS_AIR_HOPMASK 0x21
+#define MLRS_AIR_MAVLINKX 0x22
+#ifndef ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK
+#define ELRS_SERIAL_PROTOCOL_LUA_SELECTION_MAVLINK 3
+#endif
 
 bool mlrs_ota_is_active(void);
 bool mlrs_ota_is_connected(void);
@@ -60,5 +64,7 @@ bool mlrs_ota_handle_msp(const uint8_t *data, uint8_t len);
 
 #ifdef __cplusplus
 void mlrs_elrs_rx_accept_uplink(const uint8_t *payload, uint8_t len);
+void mlrs_elrs_rx_write_serial(const uint8_t *payload, uint8_t len);
 uint8_t mlrs_elrs_rx_take_downlink(uint8_t *payload, uint8_t maxLen);
+uint8_t mlrs_elrs_rx_take_serial(uint8_t *payload, uint8_t maxLen);
 #endif

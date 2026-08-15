@@ -799,6 +799,7 @@ set(ELRS_PLATFORM_SOURCES
     "../src/siw917_mavlink_wifi.c"
     "../src/mlrs_ota/mlrs_ota.cpp"
     "../src/mlrs_ota/mlrs_aes_gcm.cpp"
+    "../src/mlrs_ota/mlrs_mavlinkx.cpp"
     ${ELRS_MAIN_SOURCE}
     ${ELRS_RXTX_COMMON_SOURCE}
     ${ELRS_COMMON_SOURCE}
