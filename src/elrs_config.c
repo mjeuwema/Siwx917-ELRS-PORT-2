@@ -866,12 +866,21 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
   }
   
   elrs_config_t* cfg = &g_config;
-  
+  char wifi_interval_json[16];
+  int32_t wifi_interval = elrs_config_get_wifi_on_interval();
+
+  if (wifi_interval < 0) {
+    snprintf(wifi_interval_json, sizeof(wifi_interval_json), "null");
+  } else {
+    snprintf(wifi_interval_json, sizeof(wifi_interval_json), "%ld", (long)wifi_interval);
+  }
+
   /* Generate ELRS-compatible JSON
    * 
    * Citation: ExpressLRS devWIFI.cpp GetConfiguration()
    * - config: runtime binding/serial settings
    * - settings: device info and capabilities
+   * - options: same object as GET /options.json
    * 
    * Note: Added nvm3_debug section for diagnosing NVM read issues
    */
@@ -919,7 +928,19 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
         "\"stored_crc\":\"0x%04X\","
         "\"calc_crc\":\"0x%04X\""
       "},"
-      "\"options\":{}"
+      "\"options\":{"
+        "\"domain\":%u,"
+        "\"uid\":[%u,%u,%u,%u,%u,%u],"
+        "\"flash-discriminator\":0,"
+        "\"wifi-on-interval\":%s,"
+        "\"wifi-ssid\":\"%s\","
+        "\"wifi-password\":\"%s\","
+        "\"rcvr-uart-baud\":%lu,"
+        "\"lock-on-first-connection\":%s,"
+        "\"dji-permanently-armed\":%s,"
+        "\"is-airport\":%s,"
+        "\"customised\":%s"
+      "}"
     "}",
     cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3], cfg->uid[4], cfg->uid[5],
     cfg->serial_protocol,
@@ -941,7 +962,17 @@ int elrs_config_to_json(char* buffer, size_t buffer_size)
     (unsigned long)g_nvm3_obj_len,
     (unsigned int)sizeof(elrs_config_t),
     g_nvm3_stored_crc,
-    g_nvm3_calc_crc
+    g_nvm3_calc_crc,
+    elrs_config_get_web_domain(),
+    cfg->uid[0], cfg->uid[1], cfg->uid[2], cfg->uid[3], cfg->uid[4], cfg->uid[5],
+    wifi_interval_json,
+    cfg->wifi_ssid,
+    cfg->wifi_password,
+    (unsigned long)elrs_config_get_uart_baud(),
+    elrs_config_get_lock_on_first_connection() ? "true" : "false",
+    elrs_config_get_dji_permanently_armed() ? "true" : "false",
+    elrs_config_get_is_airport() ? "true" : "false",
+    elrs_config_web_options_customised() ? "true" : "false"
   );
   
   return len;

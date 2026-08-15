@@ -886,10 +886,15 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
 {
   sl_http_server_response_t response = { 0 };
   
-  /* Headers for gzip-compressed content */
-  sl_http_header_t headers[2] = {
-    { .key = "Content-Encoding", .value = "gzip" },
-    { .key = "Cache-Control",    .value = "no-cache" }
+  /* Gzip + CORS. index.html loads JS/CSS with the crossorigin attribute,
+   * so the browser treats those as CORS fetches even on the same origin.
+   */
+  sl_http_header_t headers[5] = {
+    { .key = "Content-Encoding",          .value = "gzip" },
+    { .key = "Cache-Control",             .value = "no-cache" },
+    { .key = CORS_HEADER_ALLOW_ORIGIN,    .value = CORS_VALUE_ALLOW_ORIGIN },
+    { .key = CORS_HEADER_ALLOW_METHODS,   .value = CORS_VALUE_ALLOW_METHODS },
+    { .key = CORS_HEADER_ALLOW_HEADERS,   .value = CORS_VALUE_ALLOW_HEADERS }
   };
 
   /* Search for asset in ELRS web content */
@@ -913,10 +918,13 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
 
       response.response_code        = SL_HTTP_RESPONSE_OK;
       response.headers              = headers;
-      response.header_count         = 2;
-      response.data                 = NULL;
-      response.current_data_length  = 0;
+      response.header_count         = 5;
+      response.data                 = (uint8_t *)WEB_ASSETS[i].data;
       response.expected_data_length = WEB_ASSETS[i].size;
+      response.current_data_length  =
+        response.expected_data_length > WEB_ASSET_CHUNK_SIZE
+          ? WEB_ASSET_CHUNK_SIZE
+          : response.expected_data_length;
 
       sl_status_t status = sl_http_server_send_response(handle, &response);
       if (status != SL_STATUS_OK) {
@@ -924,21 +932,23 @@ static sl_status_t serve_web_asset(sl_http_server_t *handle,
         return status;
       }
 
-      const unsigned char *data = WEB_ASSETS[i].data;
-      size_t remaining = WEB_ASSETS[i].size;
-      while (remaining > 0) {
-        uint32_t chunk_len = (remaining > WEB_ASSET_CHUNK_SIZE)
-                             ? WEB_ASSET_CHUNK_SIZE
-                             : (uint32_t)remaining;
-        status = sl_http_server_write_data(handle, (uint8_t *)data, chunk_len);
+      uint32_t sent = response.current_data_length;
+      while (sent < response.expected_data_length) {
+        const uint32_t remaining = response.expected_data_length - sent;
+        const uint32_t chunk_len =
+          remaining > WEB_ASSET_CHUNK_SIZE ? WEB_ASSET_CHUNK_SIZE : remaining;
+        status = sl_http_server_write_data(
+          handle, (uint8_t *)&WEB_ASSETS[i].data[sent], chunk_len);
         if (status != SL_STATUS_OK) {
-          DEBUGOUT("[HTTP] ERROR: asset chunk send failed: 0x%lX\n", (unsigned long)status);
+          DEBUGOUT("[HTTP] ERROR: asset chunk send failed: 0x%lX offset=%lu\n",
+                   (unsigned long)status, (unsigned long)sent);
           return status;
         }
-        data += chunk_len;
-        remaining -= chunk_len;
+        sent += chunk_len;
       }
 
+      DEBUGOUT("[HTTP] Asset complete: %s (%lu bytes)\n",
+               path, (unsigned long)sent);
       return SL_STATUS_OK;
     }
   }
@@ -1008,14 +1018,17 @@ static sl_status_t handle_config_get(sl_http_server_t *handle, sl_http_server_re
   }
 
   response.response_code        = SL_HTTP_RESPONSE_OK;
-  response.content_type         = SL_HTTP_CONTENT_TYPE_TEXT_PLAIN;
+  response.content_type         = SL_HTTP_CONTENT_TYPE_APPLICATION_JSON;
   response.headers              = headers;
   response.header_count         = 5;  /* Include CORS headers */
   response.data                 = (uint8_t *)response_buffer;
   response.current_data_length  = len;
   response.expected_data_length = len;
 
-  return sl_http_server_send_response(handle, &response);
+  sl_status_t send_status = sl_http_server_send_response(handle, &response);
+  DEBUGOUT("[HTTP] GET /config send %d bytes status=0x%lX\n",
+           len, (unsigned long)send_status);
+  return send_status;
 }
 
 /**
