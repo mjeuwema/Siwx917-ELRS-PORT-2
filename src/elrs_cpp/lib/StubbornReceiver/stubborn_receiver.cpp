@@ -23,6 +23,7 @@ void StubbornReceiver::ResetState()
 {
     currentPackage = 1;
     currentOffset = 0;
+    receivedLength = 0;
     telemetryConfirm = false;
     finishedData = false;
 }
@@ -81,6 +82,9 @@ void StubbornReceiver::ReceiveData(uint8_t const packageIndex, uint8_t const * c
         currentPackage++;
         currentOffset += len;
         telemetryConfirm = !telemetryConfirm;
+        if (finishedData) {
+            receivedLength = currentOffset;
+        }
     }
 }
 

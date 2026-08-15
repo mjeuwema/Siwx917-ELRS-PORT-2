@@ -4600,7 +4600,13 @@ static void DataUlReceiveComplete() {
 
   switch (DataUlBuffer[0]) {
   case MSP_ELRS_SET_AIR_PROTOCOL:
-    mlrs_ota_handle_msp(DataUlBuffer, 4);
+    {
+      uint8_t n = DataUlReceiver.GetReceivedLength();
+      if (n < 4) {
+        n = 4;
+      }
+      mlrs_ota_handle_msp(DataUlBuffer, n);
+    }
     break;
   case MSP_ELRS_SET_RX_WIFI_MODE:
     elrs_cpp_request_wifi_mode();

@@ -51,6 +51,8 @@ extern "C" {
 #define NVM3_KEY_ELRS_UID        0x00002   /* Binding UID (6 bytes) */
 #define NVM3_KEY_ELRS_WIFI       0x00003   /* WiFi settings */
 #define NVM3_KEY_ELRS_RADIO      0x00004   /* Radio parameters */
+#define NVM3_KEY_MLRS_SECRET     0x00005   /* 32-byte mLRS TRNG bind secret */
+#define MLRS_CONFIG_SECRET_LEN   32
 
 /*******************************************************************************
  * Serial Protocol Options
@@ -264,6 +266,9 @@ int elrs_config_set_uid(const uint8_t uid[6]);
  * @return 0 on success, negative error code on failure
  */
 int elrs_config_get_uid(uint8_t uid_out[6]);
+int elrs_config_get_mlrs_secret(uint8_t out[MLRS_CONFIG_SECRET_LEN]);
+int elrs_config_set_mlrs_secret(const uint8_t in[MLRS_CONFIG_SECRET_LEN]);
+int elrs_config_clear_mlrs_secret(void);
 
 /**
  * @brief Check if device is bound

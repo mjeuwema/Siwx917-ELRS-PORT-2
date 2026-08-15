@@ -567,6 +567,7 @@ int elrs_config_reset(void)
   DEBUGOUT("[Config] Resetting to factory defaults...\n");
   
   /* Delete existing config */
+  (void)elrs_config_clear_mlrs_secret();
   status = nvm3_deleteObject(nvm3_defaultHandle, NVM3_KEY_ELRS_CONFIG);
   if (status != ECODE_NVM3_OK && status != ECODE_NVM3_ERR_KEY_NOT_FOUND) {
     DEBUGOUT("[Config] WARNING: Failed to delete old config: 0x%lX\n", (unsigned long)status);
@@ -584,6 +585,10 @@ int elrs_config_set_uid(const uint8_t uid[6])
 {
   if (uid == NULL) {
     return -1;
+  }
+
+  if (memcmp(g_config.uid, uid, 6) != 0) {
+    (void)elrs_config_clear_mlrs_secret();
   }
   
   memcpy(g_config.uid, uid, 6);
@@ -609,6 +614,58 @@ int elrs_config_get_uid(uint8_t uid_out[6])
   }
   
   memcpy(uid_out, g_config.uid, 6);
+  return 0;
+}
+
+int elrs_config_get_mlrs_secret(uint8_t out[MLRS_CONFIG_SECRET_LEN])
+{
+  uint32_t obj_type = 0;
+  size_t obj_len = 0;
+  if (out == NULL) {
+    return -1;
+  }
+  if (nvm3_getObjectInfo(nvm3_defaultHandle, NVM3_KEY_MLRS_SECRET, &obj_type,
+                         &obj_len) != ECODE_NVM3_OK ||
+      obj_len != MLRS_CONFIG_SECRET_LEN) {
+    return -1;
+  }
+  if (nvm3_readData(nvm3_defaultHandle, NVM3_KEY_MLRS_SECRET, out,
+                    MLRS_CONFIG_SECRET_LEN) != ECODE_NVM3_OK) {
+    return -1;
+  }
+  uint8_t acc = 0;
+  for (size_t i = 0; i < MLRS_CONFIG_SECRET_LEN; ++i) {
+    acc |= out[i];
+  }
+  return acc != 0 ? 0 : -1;
+}
+
+int elrs_config_set_mlrs_secret(const uint8_t in[MLRS_CONFIG_SECRET_LEN])
+{
+  uint8_t acc = 0;
+  if (in == NULL) {
+    return -1;
+  }
+  for (size_t i = 0; i < MLRS_CONFIG_SECRET_LEN; ++i) {
+    acc |= in[i];
+  }
+  if (acc == 0) {
+    return -1;
+  }
+  if (nvm3_writeData(nvm3_defaultHandle, NVM3_KEY_MLRS_SECRET, in,
+                     MLRS_CONFIG_SECRET_LEN) != ECODE_NVM3_OK) {
+    return -1;
+  }
+  return 0;
+}
+
+int elrs_config_clear_mlrs_secret(void)
+{
+  Ecode_t status =
+      nvm3_deleteObject(nvm3_defaultHandle, NVM3_KEY_MLRS_SECRET);
+  if (status != ECODE_NVM3_OK && status != ECODE_NVM3_ERR_KEY_NOT_FOUND) {
+    return -1;
+  }
   return 0;
 }
 

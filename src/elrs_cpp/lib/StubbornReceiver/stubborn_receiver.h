@@ -13,11 +13,13 @@ public:
     bool HasFinishedData();
     void Unlock();
     bool GetCurrentConfirm();
+    uint8_t GetReceivedLength() const { return receivedLength; }
 private:
     uint8_t *data;
     bool finishedData;
     uint8_t length;
     uint8_t currentOffset;
+    uint8_t receivedLength;
     uint8_t currentPackage;
     bool telemetryConfirm;
     uint8_t maxPackageIndex;
