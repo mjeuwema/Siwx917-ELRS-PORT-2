@@ -2,6 +2,43 @@
 
 #include <string.h>
 
+#if defined(MLRS_HAVE_SI91X_GCM)
+extern "C" {
+#include "sl_si91x_gcm.h"
+#include "sl_status.h"
+}
+#endif
+
+static bool g_hw_ready = false;
+
+#if defined(MLRS_HAVE_SI91X_GCM)
+/* NWP AES-GCM. Output is ciphertext||tag (encrypt) or plaintext||tag (decrypt). */
+static bool siw917_gcm(const uint8_t key[16], sl_si91x_gcm_type_t op,
+                       const uint8_t iv[12], const uint8_t *aad, size_t aad_len,
+                       const uint8_t *msg, size_t msg_len, uint8_t *out) {
+  static const uint8_t kEmpty[1] = {0};
+  sl_si91x_gcm_config_t cfg;
+  if (msg_len > SL_SI91X_MAX_DATA_SIZE_IN_BYTES) {
+    return false;
+  }
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.encrypt_decrypt = op;
+  cfg.gcm_mode = SL_SI91X_GCM_MODE;
+  cfg.dma_use = SL_SI91X_GCM_DMA_ENABLE;
+  cfg.msg = msg;
+  cfg.msg_length = (uint16_t)msg_len;
+  cfg.nonce = iv;
+  cfg.nonce_length = 12;
+  cfg.ad = (aad != nullptr && aad_len != 0) ? aad : kEmpty;
+  cfg.ad_length = (uint16_t)aad_len;
+  cfg.key_config.b0.key_type = SL_SI91X_TRANSPARENT_KEY;
+  cfg.key_config.b0.key_size = SL_SI91X_GCM_KEY_SIZE_128;
+  cfg.key_config.b0.key_slot = (sl_si91x_crypto_key_slot_t)0;
+  memcpy(cfg.key_config.b0.key_buffer, key, MLRS_GCM_KEY_LEN);
+  return sl_si91x_gcm(&cfg, out) == SL_STATUS_OK;
+}
+#endif
+
 static const uint8_t kSbox[256] = {
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
     0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
@@ -261,6 +298,7 @@ static void gcm_crypt(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[12],
 static void ctx_init_with_key(mlrs_gcm_ctx_t *ctx, const uint8_t key[16],
                               const uint8_t salt[4]) {
   memset(ctx, 0, sizeof(*ctx));
+  memcpy(ctx->key, key, MLRS_GCM_KEY_LEN);
   aes_expand(key, ctx->round_key);
   uint8_t zero[16] = {};
   aes_encrypt(ctx->round_key, zero, ctx->H);
@@ -287,6 +325,16 @@ void mlrs_gcm_seal(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[MLRS_GCM_IV_LEN],
   if (tag_len == 0 || tag_len > 16) {
     tag_len = 16;
   }
+#if defined(MLRS_HAVE_SI91X_GCM)
+  uint8_t hw_out[96];
+  if (g_hw_ready && data_len + 16 <= sizeof(hw_out) &&
+      siw917_gcm(ctx->key, SL_SI91X_GCM_ENCRYPT, iv, aad, aad_len, data,
+                 data_len, hw_out)) {
+    memcpy(data, hw_out, data_len);
+    memcpy(tag, hw_out + data_len, tag_len);
+    return;
+  }
+#endif
   gcm_crypt(ctx, iv, aad, aad_len, data, data_len, full, true);
   memcpy(tag, full, tag_len);
 }
@@ -298,6 +346,23 @@ bool mlrs_gcm_open(const mlrs_gcm_ctx_t *ctx, const uint8_t iv[MLRS_GCM_IV_LEN],
   if (tag_len == 0 || tag_len > 16) {
     tag_len = 16;
   }
+#if defined(MLRS_HAVE_SI91X_GCM)
+  uint8_t hw_out[96];
+  if (g_hw_ready && data_len + 16 <= sizeof(hw_out) &&
+      siw917_gcm(ctx->key, SL_SI91X_GCM_DECRYPT, iv, aad, aad_len, data,
+                 data_len, hw_out)) {
+    uint8_t hw_diff = 0;
+    for (size_t i = 0; i < tag_len; ++i) {
+      hw_diff |= (uint8_t)(hw_out[data_len + i] ^ tag[i]);
+    }
+    if (hw_diff != 0) {
+      memset(data, 0, data_len);
+      return false;
+    }
+    memcpy(data, hw_out, data_len);
+    return true;
+  }
+#endif
   gcm_crypt(ctx, iv, aad, aad_len, data, data_len, got, false);
   uint8_t diff = 0;
   for (size_t i = 0; i < tag_len; ++i) {
@@ -403,6 +468,33 @@ bool mlrs_gcm_selftest(void) {
       memcmp(tag, tag4, sizeof(tag4)) != 0) {
     return false;
   }
-  return mlrs_gcm_open(&ctx, iv4, aad4, sizeof(aad4), pt4, sizeof(pt4), tag4,
-                       sizeof(tag4));
+  if (!mlrs_gcm_open(&ctx, iv4, aad4, sizeof(aad4), pt4, sizeof(pt4), tag4,
+                     sizeof(tag4))) {
+    return false;
+  }
+
+#if defined(MLRS_HAVE_SI91X_GCM)
+  {
+    uint8_t hw_pt[16] = {};
+    uint8_t hw_out[32];
+    uint8_t zero_key[16] = {};
+    uint8_t zero_iv[12] = {};
+    g_hw_ready = false;
+    if (siw917_gcm(zero_key, SL_SI91X_GCM_ENCRYPT, zero_iv, nullptr, 0, hw_pt,
+                   sizeof(hw_pt), hw_out) &&
+        memcmp(hw_out, ct_exp, sizeof(ct_exp)) == 0 &&
+        memcmp(hw_out + 16, tag_exp, sizeof(tag_exp)) == 0) {
+      g_hw_ready = true;
+    }
+  }
+#endif
+  return true;
+}
+
+const char *mlrs_gcm_backend_name(void) {
+#if defined(MLRS_HAVE_SI91X_GCM)
+  return g_hw_ready ? "siw917-hw" : "software (hw probe failed)";
+#else
+  return "software";
+#endif
 }

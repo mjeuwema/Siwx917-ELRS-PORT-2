@@ -44,6 +44,20 @@ set(SIW917_ELRS_MAVLINK_DIR
 # which contains the content of the SLC project
 include(wifi_gspi_merged.cmake)
 
+if(NOT WISECONNECT3_SDK_DIR)
+    set(WISECONNECT3_SDK_DIR "${SDK_PATH}/../../wisece6a05cd369ee2/p")
+endif()
+set(SIW917_GCM_SRC
+    "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/src/sl_si91x_gcm.c")
+if(EXISTS "${SIW917_GCM_SRC}")
+    target_sources(slc PRIVATE "${SIW917_GCM_SRC}")
+    target_include_directories(slc PUBLIC
+        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/gcm/inc"
+        "${WISECONNECT3_SDK_DIR}/components/device/silabs/si91x/wireless/crypto/inc"
+    )
+    target_compile_definitions(slc PUBLIC MLRS_HAVE_SI91X_GCM=1)
+endif()
+
 #=============================================================================
 # ELRS C++ Platform Abstraction Layer for SiW917
 #=============================================================================

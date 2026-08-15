@@ -2156,6 +2156,7 @@ static void start_mlrs() {
          MLRS_OVERLAY_ID, (unsigned)FRAME_TX_PAYLOAD_LEN,
          (unsigned)FRAME_RX_PAYLOAD_LEN, (unsigned)FRAME_GCM_TAG_LEN,
          (unsigned long)g_send_counter);
+  printf("[mLRS] AES-GCM backend=%s\n", mlrs_gcm_backend_name());
   printf("[mLRS] mux MBridge Lua + CRSF + MAVLink in %u/%u-byte payloads\n",
          (unsigned)FRAME_TX_PAYLOAD_LEN, (unsigned)FRAME_RX_PAYLOAD_LEN);
 }
