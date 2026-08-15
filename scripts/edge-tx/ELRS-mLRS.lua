@@ -669,8 +669,11 @@ local function tlm_text()
     return string.format("%s %s %s%% %sdB %s", proto, rssi_s, lq_s, snr_s, pwr_s), lq
   end
   local extra = ""
+  if MB.info ~= nil and (MB.info.hop_count or 0) > 0 then
+    extra = string.format("  skip %d/%d", MB.info.hop_skip or 0, MB.info.hop_count)
+  end
   if rfmd ~= nil and LCD_W ~= nil and LCD_W >= 480 then
-    extra = string.format("  RFMD %d", rfmd)
+    extra = extra .. string.format("  RFMD %d", rfmd)
   end
   return string.format("%s  RSSI %s  LQ %s  SNR %s  %s%s", proto, rssi_s, lq_s, snr_s, pwr_s, extra), lq
 end
@@ -1176,6 +1179,13 @@ function MB.build_rows()
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Save", act = "save" }
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Reload", act = "reload" }
     MB.rows[#MB.rows+1] = { kind = "cmd", name = "Back to ELRS", act = "back" }
+    if MB.info ~= nil and (MB.info.hop_count or 0) > 0 then
+      MB.rows[#MB.rows+1] = {
+        kind = "info",
+        name = string.format("Hop skip %d/%d", MB.info.hop_skip or 0,
+                             MB.info.hop_count)
+      }
+    end
   else
     for pidx = 2, 255 do
       local p = MB.plist[pidx]
@@ -1271,6 +1281,15 @@ function MB.handle_cmd(cmd)
     if rxb > 127 then rxb = rxb - 256 end
     MB.info.tx_dbm = txb
     MB.info.rx_dbm = rxb
+    MB.info.hop_skip = cmd.payload[9] or 0
+    MB.info.hop_count = cmd.payload[10] or 0
+    MB.info.hop_mask = (cmd.payload[11] or 0)
+      + (cmd.payload[12] or 0) * 256
+      + (cmd.payload[13] or 0) * 65536
+      + (cmd.payload[14] or 0) * 16777216
+    if MB.complete and MB.page == 0 then
+      MB.build_rows()
+    end
   elseif cmd.cmd == MBCMD.PARAM_ITEM then
     local index = cmd.payload[0]
     if MB.complete and index ~= 255 and MB.plist and MB.plist[index] then

@@ -315,6 +315,19 @@ static void queue_info() {
   info[6] = 0;    /* tx_config_id */
   info[7] = 0x11; /* tx/rx diversity = antenna1 */
   info[8] = MLRS_P_COUNT;
+  {
+    uint8_t skip = 0;
+    uint8_t hops = 0;
+    uint32_t mask = 0;
+    mlrs_ota_hop_skip_info(&skip, &hops, &mask);
+    info[9] = skip;
+    info[10] = hops;
+    info[11] = (uint8_t)mask;
+    info[12] = (uint8_t)(mask >> 8);
+    info[13] = (uint8_t)(mask >> 16);
+    info[14] = (uint8_t)(mask >> 24);
+    info[15] = 0;
+  }
   queue_cmd(MBRIDGE_CMD_INFO, info);
 }
 

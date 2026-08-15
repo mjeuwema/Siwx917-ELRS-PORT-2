@@ -406,6 +406,29 @@ static void UpdateConnectDisconnectStatus()
     string(REPLACE "${old_dynpower_update}" "${new_dynpower_update}"
         source_text "${source_text}")
 
+    set(old_config_change
+"static void CheckConfigChangePending()
+{
+  if (config.IsModified() || ModelUpdatePending)
+")
+    set(new_config_change
+"static void CheckConfigChangePending()
+{
+  if (mlrs_ota_is_active())
+  {
+    return;
+  }
+  if (config.IsModified() || ModelUpdatePending)
+")
+    string(FIND "${source_text}" "${old_config_change}" config_change_offset)
+    if(config_change_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 TX mLRS CheckConfigChangePending patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_config_change}" "${new_config_change}"
+        source_text "${source_text}")
+
     set(old_linkstats_send
 "static void checkSendLinkStatsToHandset(uint32_t now)
 {

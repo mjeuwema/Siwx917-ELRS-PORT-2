@@ -173,10 +173,13 @@ extern "C" void elrs_tx_loop(void)
     }
 
     siw917_lr1121_handle_deferred_isr();
-    loop();
+    hwTimer::service();
     mlrs_ota_loop();
+    siw917_lr1121_handle_deferred_isr();
+    loop();
     siw917_mavlink_backpack_service();
     siw917_lr1121_handle_deferred_isr();
+    mlrs_ota_loop();
     if (!mlrs_ota_is_active()) {
         siw917_report_link_transition();
     }
