@@ -5145,6 +5145,7 @@ void elrs_loop(void) {
   // The ISR only sets a flag (no SPI). We process it here where SPI is safe.
   LR1121Hal::handleDeferredISR();
   if (mlrs_ota_is_active()) {
+    mlrs_ota_rx_send_slot();
     hwTimer::service();
   }
   mlrs_ota_loop();
@@ -5162,9 +5163,11 @@ void elrs_loop(void) {
       while (mlrs_ota_tlm_busy() &&
              (int32_t)(millis() - t0) < wait_ms) {
         LR1121Hal::handleDeferredISR();
+        mlrs_ota_rx_send_slot();
       }
     }
     LR1121Hal::handleDeferredISR();
+    mlrs_ota_rx_send_slot();
     mlrs_ota_loop();
     serviceMlrsHostBridge(millis());
     return;
