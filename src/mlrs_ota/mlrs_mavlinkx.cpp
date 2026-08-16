@@ -696,6 +696,8 @@ void mlrs_mavlinkx_init(void) {
 
 void mlrs_mavlinkx_reset(void) { mlrs_mavlinkx_init(); }
 
+void mlrs_mavlinkx_air_lost(void) { x_reset(); }
+
 void mlrs_mavlinkx_set_compression(bool enabled) { g_compress = enabled; }
 
 void mlrs_mavlinkx_ingest_mav(const uint8_t *data, uint16_t len) {

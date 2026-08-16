@@ -291,12 +291,14 @@ static bool g_had_link = false;
 static uint32_t g_last_rf_ms = 0;
 static uint8_t g_last_rx_spare = 0xFF;
 #endif
+#if MLRS_OTA_IS_TX
 static uint8_t g_seq = 0;
+#endif
 static uint8_t g_lq = 0;
-static uint8_t g_valid_window = 0;
-static uint32_t g_last_rx_ms = 0;
+static volatile uint8_t g_valid_window = 0;
+static volatile uint32_t g_last_rx_ms = 0;
 static uint32_t g_last_hb_ms = 0;
-static bool g_connected = false;
+static volatile uint8_t g_connected = 0;
 static volatile uint8_t g_print_connected = 0;
 static volatile uint8_t g_print_disconnected = 0;
 static uint32_t g_tx_sent = 0;
@@ -330,6 +332,135 @@ static uint8_t g_ul_hold_len = 0;
 #else
 static uint8_t g_dn_hold[64] = {};
 static uint8_t g_dn_hold_len = 0;
+static uint8_t g_rx_frame_valid = 0;
+static tRxFrame g_rx_sent = {};
+static uint8_t g_rx_sent_valid = 0;
+static volatile uint8_t g_tlm_slot_pending = 0;
+static volatile uint8_t g_tlm_slot_skip = 0;
+#endif
+static uint32_t g_arq_retry = 0;
+static uint32_t g_arq_drop = 0;
+
+/* Stock mLRS ARQ: downlink serial only. 3-bit seq, 1-bit ack, 1 retry
+ * (live stock SetRetryCntAuto always ends at 1). Not compiled from Common/. */
+#if MLRS_OTA_IS_TX
+enum { ARQ_R_IDLE = 0, ARQ_R_MISSED, ARQ_R_WAS_IDLE, ARQ_R_RXED };
+static uint8_t g_rarq_st;
+static uint8_t g_rarq_seq;
+static uint8_t g_rarq_last;
+static uint8_t g_rarq_ack;
+static uint8_t g_rarq_accept;
+static uint8_t g_rarq_lost;
+
+static void arq_init() {
+  g_rarq_st = ARQ_R_IDLE;
+  g_rarq_seq = 0;
+  g_rarq_last = 0;
+  g_rarq_ack = 0;
+  g_rarq_accept = 0;
+  g_rarq_lost = 0;
+  g_arq_retry = 0;
+  g_arq_drop = 0;
+}
+
+static void rarq_disconnected() { g_rarq_st = ARQ_R_IDLE; }
+
+static void rarq_spin() {
+  g_rarq_lost = 0;
+  if (g_rarq_st == ARQ_R_WAS_IDLE) {
+    g_rarq_accept = 1;
+    g_rarq_lost = 1;
+    g_rarq_last = g_rarq_seq;
+    g_rarq_ack = g_rarq_seq;
+  } else if (g_rarq_st == ARQ_R_RXED) {
+    g_rarq_accept = (g_rarq_seq != g_rarq_last) ? 1 : 0;
+    if (((g_rarq_seq - g_rarq_last) & 7U) > 1U) {
+      g_rarq_lost = 1;
+    }
+    g_rarq_last = g_rarq_seq;
+    g_rarq_ack = g_rarq_seq;
+  } else {
+    g_rarq_accept = 0;
+  }
+  if (g_rarq_lost) {
+    ++g_arq_drop;
+  }
+}
+
+static void rarq_missed() {
+  g_rarq_st = ARQ_R_MISSED;
+  rarq_spin();
+}
+
+static void rarq_received(uint8_t seq) {
+  g_rarq_seq = seq & 7U;
+  g_rarq_st = (g_rarq_st == ARQ_R_IDLE) ? ARQ_R_WAS_IDLE : ARQ_R_RXED;
+  rarq_spin();
+}
+#else
+enum { ARQ_T_IDLE = 0, ARQ_T_MISSED, ARQ_T_RXED };
+static uint8_t g_tarq_st;
+static uint8_t g_tarq_ack_bit;
+static uint8_t g_tarq_seq;
+static uint8_t g_tarq_retries;
+
+static void arq_init() {
+  g_tarq_st = ARQ_T_IDLE;
+  g_tarq_ack_bit = 0;
+  g_tarq_seq = 0;
+  g_tarq_retries = 0;
+  g_rx_sent_valid = 0;
+  g_tlm_slot_pending = 0;
+  g_tlm_slot_skip = 0;
+  g_arq_retry = 0;
+  g_arq_drop = 0;
+}
+
+static void tarq_disconnected() { g_tarq_st = ARQ_T_IDLE; }
+static void tarq_missed() { g_tarq_st = ARQ_T_MISSED; }
+static void tarq_ack(uint8_t ack_bit) {
+  g_tarq_ack_bit = ack_bit & 1U;
+  g_tarq_st = ARQ_T_RXED;
+}
+
+/* Compare ACK against last *sent* seq. Overlay sends in the RX ISR
+ * before the next payload is packed, so ACK in this uplink is for the
+ * previous downlink, not a not-yet-incremented next seq. */
+static bool tarq_should_retry() {
+  if (g_rx_sent_valid == 0) {
+    return false;
+  }
+  const uint8_t lim = 1;
+  bool nack = false;
+  switch (g_tarq_st) {
+  case ARQ_T_RXED:
+    nack = ((g_tarq_ack_bit & 1U) != (g_tarq_seq & 1U));
+    break;
+  case ARQ_T_MISSED:
+    nack = true;
+    break;
+  default:
+    return false;
+  }
+  if (!nack) {
+    return false;
+  }
+  if (g_tarq_retries >= lim) {
+    return false;
+  }
+  ++g_tarq_retries;
+  ++g_arq_retry;
+  return true;
+}
+
+static uint8_t tarq_next_seq() {
+  return (uint8_t)((g_tarq_seq + 1U) & 7U);
+}
+
+static void tarq_note_sent(uint8_t seq) {
+  g_tarq_seq = seq & 7U;
+  g_tarq_retries = 0;
+}
 #endif
 
 static uint8_t mux_append(uint8_t *dst, uint8_t used, uint8_t max,
@@ -423,7 +554,16 @@ static void load_gcm_counters() {
   g_recv_highest = recv;
 }
 
-static bool replay_ok(uint32_t counter) {
+static bool replay_ok(uint32_t counter, bool allow_last) {
+  if (allow_last) {
+    if (counter < g_recv_highest) {
+      return false;
+    }
+    if (counter > g_recv_highest) {
+      g_recv_highest = counter;
+    }
+    return true;
+  }
   if (counter <= g_recv_highest) {
     return false;
   }
@@ -1281,7 +1421,7 @@ static uint8_t open_tx_gcm(tTxFrame *frame) {
                      FRAME_GCM_TAG_LEN)) {
     return 5;
   }
-  if (!replay_ok(frame->pkt_counter)) {
+  if (!replay_ok(frame->pkt_counter, false)) {
     return 6;
   }
   return 0;
@@ -1336,6 +1476,21 @@ static void pack_rx_frame(tRxFrame *frame, uint8_t seq, uint8_t lq, bool ack,
   crc_accumulate_buf(&crc, (uint8_t *)frame, FRAME_TX_RX_LEN - 2);
   frame->crc = crc;
 }
+
+static void refresh_rx_frame(tRxFrame *frame, uint8_t lq) {
+  frame->pkt_counter = next_send_counter();
+  frame->status.rssi_u7 = rssi_u7_from_i8(Radio.LastPacketRSSI);
+  frame->status.LQ_rc = lq;
+  frame->status.LQ_serial = lq;
+  uint8_t iv[MLRS_GCM_IV_LEN];
+  mlrs_gcm_make_iv(&g_gcm_dn, MLRS_GCM_DIR_DOWNLINK, frame->pkt_counter, iv);
+  mlrs_gcm_seal(&g_gcm_dn, iv, (uint8_t *)frame, FRAME_RX_AAD_LEN, frame->payload,
+                FRAME_RX_PAYLOAD_LEN, frame->tag, FRAME_GCM_TAG_LEN);
+  uint16_t crc;
+  crc_init(&crc);
+  crc_accumulate_buf(&crc, (uint8_t *)frame, FRAME_TX_RX_LEN - 2);
+  frame->crc = crc;
+}
 #endif
 
 #if MLRS_OTA_IS_TX
@@ -1363,7 +1518,7 @@ static uint8_t open_rx_gcm(tRxFrame *frame) {
                      FRAME_GCM_TAG_LEN)) {
     return 5;
   }
-  if (!replay_ok(frame->pkt_counter)) {
+  if (!replay_ok(frame->pkt_counter, true)) {
     return 6;
   }
   return 0;
@@ -1419,7 +1574,7 @@ static void apply_mlrs_rate() {
 #if !MLRS_OTA_IS_TX
   g_valid_window = 0;
   g_lq = 0;
-  g_connected = false;
+  g_connected = 0;
   g_miss_streak = 0;
   g_fhss_pending_hops = 0;
   Radio.RXnb();
@@ -1458,6 +1613,28 @@ static void restore_elrs_radio() {
   Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false, 0);
 }
 
+static bool mlrs_rx_age_lost(uint32_t then_ms) {
+  if (then_ms == 0) {
+    return false;
+  }
+  return (int32_t)(millis() - then_ms) > (int32_t)MLRS_LOST_MS;
+}
+
+static void mlrs_declare_lost() {
+  if (!g_connected) {
+    return;
+  }
+  g_connected = 0;
+  setConnectionState(disconnected);
+  g_print_disconnected = 1;
+#if MLRS_OTA_IS_TX
+  rarq_disconnected();
+  siw917_tx_note_mlrs_link_lost();
+#else
+  tarq_disconnected();
+#endif
+}
+
 static void note_valid_rx() {
   g_last_rx_ms = millis();
   if (g_valid_window < 250) {
@@ -1476,7 +1653,7 @@ static void note_valid_rx() {
   g_rate_scan_ms = g_last_rx_ms;
 #endif
   if (!g_connected && g_valid_window >= 3) {
-    g_connected = true;
+    g_connected = 1;
     setConnectionState(connected);
     g_print_connected = 1;
 #if !MLRS_OTA_IS_TX
@@ -1495,16 +1672,8 @@ static void note_missed_rx() {
 #if MLRS_OTA_IS_TX
   mlrs_dynpower_on_event(false, g_lq, 0);
 #endif
-  /* Keep hopping. Resetting hop/follow here desyncs 50 Hz FSK after a
-   * short downlink gap and causes connect/disconnect flaps. */
-  if (g_connected && (millis() - g_last_rx_ms) > MLRS_LOST_MS) {
-    g_connected = false;
-    setConnectionState(disconnected);
-    g_print_disconnected = 1;
-#if MLRS_OTA_IS_TX
-    siw917_tx_note_mlrs_link_lost();
-#endif
-  }
+  /* LQ only. Declaring lost from the timer tock races millis() against
+   * the last CRC and flaps connected while the RF path is still fine. */
 }
 
 #if MLRS_OTA_IS_TX
@@ -1531,6 +1700,7 @@ static void mlrs_tx_send_frame() {
   }
   if (g_last_rx_ms != 0 && (millis() - g_last_rx_ms) > miss_ms) {
     note_missed_rx();
+    rarq_missed();
   }
   uint16_t rc[16];
   fill_rc_from_handset(rc);
@@ -1592,8 +1762,8 @@ static void mlrs_tx_send_frame() {
     payload_len =
         mavlinkx_fill_mux(payload, payload_len, FRAME_TX_PAYLOAD_LEN);
   }
-  pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq, false, payload,
-                payload_len);
+  pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq,
+                (g_rarq_ack & 1U) != 0U, payload, payload_len);
   Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, false, 0);
   Radio.TXnb((uint8_t *)&g_tx_frame, false, nullptr, SX12XX_Radio_All);
   ++g_tx_sent;
@@ -1623,6 +1793,7 @@ static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
     } else {
       ++g_rx_fail;
       note_missed_rx();
+      rarq_missed();
     }
     return true;
   }
@@ -1636,14 +1807,19 @@ static void mlrs_tx_process_downlink() {
     g_last_rx_fail = fail;
     ++g_rx_fail;
     note_missed_rx();
+    rarq_missed();
     return;
   }
   ++g_rx_ok;
   note_valid_rx();
+  rarq_received((uint8_t)g_rx_frame.status.seq_no);
+  if (g_rarq_lost) {
+    mlrs_mavlinkx_air_lost();
+  }
   g_last_dl_plen = (uint8_t)g_rx_frame.status.payload_len;
   mlrs_dynpower_on_event(true, (uint8_t)g_rx_frame.status.LQ_rc,
                          rssi_i8_from_u7((uint8_t)g_rx_frame.status.rssi_u7));
-  if (g_rx_frame.status.payload_len > 0) {
+  if (g_rarq_accept && g_rx_frame.status.payload_len > 0) {
     const uint8_t *p = g_rx_frame.payload;
     uint8_t len = (uint8_t)g_rx_frame.status.payload_len;
     auto deliver = [](const uint8_t *f, uint8_t n) {
@@ -1802,6 +1978,7 @@ static void mlrs_rx_prepare_tlm() {
   if (g_tlm_ready || g_tlm_busy) {
     return;
   }
+  const uint8_t seq = tarq_next_seq();
   uint8_t payload[FRAME_RX_PAYLOAD_LEN] = {};
   uint8_t payload_len = 0;
   hop_rebuild_mask();
@@ -1827,7 +2004,8 @@ static void mlrs_rx_prepare_tlm() {
     } else if (!mavlinkx_try_mux_item(payload, &payload_len, tmp, n)) {
       payload_len =
           mavlinkx_fill_mux(payload, payload_len, FRAME_RX_PAYLOAD_LEN);
-      pack_rx_frame(&g_rx_frame, g_seq++, g_lq, false, payload, payload_len);
+      pack_rx_frame(&g_rx_frame, seq, g_lq, false, payload, payload_len);
+      g_rx_frame_valid = 1;
       g_tlm_ready = 1;
       return;
     }
@@ -1862,8 +2040,19 @@ static void mlrs_rx_prepare_tlm() {
   }
   payload_len =
       mavlinkx_fill_mux(payload, payload_len, FRAME_RX_PAYLOAD_LEN);
-  pack_rx_frame(&g_rx_frame, g_seq++, g_lq, false, payload, payload_len);
+  pack_rx_frame(&g_rx_frame, seq, g_lq, false, payload, payload_len);
+  g_rx_frame_valid = 1;
   g_tlm_ready = 1;
+}
+
+static void mlrs_rx_air_tx(tRxFrame *frame) {
+  if (g_tlm_busy) {
+    return;
+  }
+  g_tlm_busy = 1;
+  g_tlm_busy_ms = millis();
+  Radio.TXnb((uint8_t *)frame, false, nullptr, SX12XX_Radio_All);
+  ++g_tx_sent;
 }
 
 static void mlrs_rx_send_tlm() {
@@ -1872,15 +2061,23 @@ static void mlrs_rx_send_tlm() {
      * radio before TXdone, so g_tlm_busy never clears. */
     return;
   }
+  if (tarq_should_retry()) {
+    /* Stock update_rxframe_stats: same seq/payload, refresh LQ/CRC.
+     * New pkt_counter is overlay GCM; run here after DIO/SPI finishes. */
+    refresh_rx_frame(&g_rx_sent, g_lq);
+    mlrs_rx_air_tx(&g_rx_sent);
+    return;
+  }
+  mlrs_rx_prepare_tlm();
   if (!g_tlm_ready) {
     mlrs_rx_hop_listen();
     return;
   }
+  memcpy(&g_rx_sent, &g_rx_frame, sizeof(g_rx_sent));
+  g_rx_sent_valid = 1;
+  tarq_note_sent((uint8_t)g_rx_frame.status.seq_no);
   g_tlm_ready = 0;
-  g_tlm_busy = 1;
-  g_tlm_busy_ms = millis();
-  Radio.TXnb((uint8_t *)&g_rx_frame, false, nullptr, SX12XX_Radio_All);
-  ++g_tx_sent;
+  mlrs_rx_air_tx(&g_rx_frame);
 }
 
 static void mlrs_rx_done_tx() {
@@ -2119,7 +2316,7 @@ static void mlrs_rx_process_uplink() {
 static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
   memcpy(&g_tx_frame, Radio.RXdataBuffer, sizeof(g_tx_frame));
   const uint8_t fail = check_tx_crc(&g_tx_frame);
-  if (fail != 0) {
+  if (fail != 0 && fail != 4) {
     g_last_rf_ms = millis();
     g_last_rx_fail = fail;
     if (fail == 1) {
@@ -2129,32 +2326,38 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
       if (g_fhss_follow) {
         hop_note(g_fhss_i, false);
       }
+      tarq_missed();
     }
     g_rx_need_rearm = 1;
     return false;
   }
+  /* fail 0 = full frame, fail 4 = CRC1 ok / payload CRC bad (stock CRC1_VALID). */
   g_last_rf_ms = millis();
+  g_last_rx_ms = millis();
   g_slot_rx = 1;
-  g_rx_need_rearm = 0;
+  g_rx_need_rearm = (fail == 4) ? 1 : 0;
   g_miss_streak = 0;
   fhss_set_index(g_tx_frame.status.fhss_index);
   g_fhss_follow = true;
-  if (tight_slot() && ((g_rx_ok & 1U) != 0U)) {
-    if (!g_tlm_busy) {
-      mlrs_rx_hop_listen();
-    }
+  tarq_ack((uint8_t)g_tx_frame.status.ack);
+  g_tlm_slot_skip =
+      (tight_slot() && ((g_rx_ok & 1U) != 0U)) ? 1 : 0;
+  g_tlm_slot_pending = 1;
+  if (fail == 0) {
+    g_last_rx_fail = 0;
+    g_uplink_pending = 1;
   } else {
-    mlrs_rx_send_tlm();
+    g_last_rx_fail = fail;
+    ++g_rx_fail;
   }
-  g_uplink_pending = 1;
-  return true;
+  return fail == 0;
 }
 
 static void mlrs_rx_tock() {
   if (g_tlm_busy) {
     /* Downlink TX occupies this slot. Lua/CRSF can delay TXdone past the
-     * 32 ms interval; those tocks are not missed RX hops. */
-    g_slot_rx = 0;
+     * 32 ms interval; those tocks are not missed RX hops. Keep slot_rx
+     * so the next tock does not count the packet we already got. */
     return;
   }
   if (!g_fhss_follow) {
@@ -2175,6 +2378,7 @@ static void mlrs_rx_tock() {
     }
   } else {
     note_missed_rx();
+    tarq_missed();
     hop_note(g_fhss_i, false);
     if (g_miss_streak < 255) {
       ++g_miss_streak;
@@ -2234,9 +2438,11 @@ static void start_mlrs() {
 #endif
   hwTimer::callbackTick = nullptr;
   hwTimer::updateInterval(current_rate_cfg()->interval_us);
+#if MLRS_OTA_IS_TX
   g_seq = 0;
+#endif
   g_valid_window = 0;
-  g_connected = false;
+  g_connected = 0;
   g_tx_sent = 0;
   g_rx_ok = 0;
   g_rx_fail = 0;
@@ -2265,6 +2471,7 @@ static void start_mlrs() {
   g_protocol = ELRS_AIR_PROTOCOL_MLRS;
   mlrs_mavlinkx_init();
   mavlinkx_sync_compression();
+  arq_init();
 #if MLRS_OTA_IS_TX
   mlrs_dynpower_begin();
   /* Keep the last ELRS RQly during the first grace window. If no mLRS
@@ -2281,7 +2488,8 @@ static void start_mlrs() {
   }
 #endif
 #if !MLRS_OTA_IS_TX
-  mlrs_rx_prepare_tlm();
+  g_rx_frame_valid = 0;
+  g_tlm_slot_pending = 0;
   Radio.RXnb();
 #endif
   printf("[mLRS] air protocol started (%s/%s, sync=0x%04X freq=%lu hop=0/%u)\n",
@@ -2298,6 +2506,7 @@ static void start_mlrs() {
          (unsigned)FRAME_TX_PAYLOAD_LEN, (unsigned)FRAME_RX_PAYLOAD_LEN);
   printf("[mLRS] mavlinkx compress=%s (19Hz only, stock X4)\n",
          sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
+  printf("[mLRS] arq downlink retry=1 (stock)\n");
 }
 
 static void stop_mlrs() {
@@ -2305,6 +2514,7 @@ static void stop_mlrs() {
     return;
   }
   mlrs_mavlinkx_reset();
+  arq_init();
   hwTimer::stop();
   persist_gcm_counters();
   Radio.SetTxIdleMode();
@@ -2378,6 +2588,24 @@ extern "C" uint32_t mlrs_ota_tlm_busy_timeout_ms(void) {
   /* Cap only. TXdone usually arrives in a few ms. 40 ms was sized for
    * 31 Hz; 19 Hz LoRa SF6 99-byte frames are still on air past that. */
   return current_rate_cfg()->interval_us / 1000U + 15U;
+}
+
+extern "C" void mlrs_ota_rx_send_slot(void) {
+#if !MLRS_OTA_IS_TX
+  if (!g_active || g_tlm_slot_pending == 0) {
+    return;
+  }
+  g_tlm_slot_pending = 0;
+  if (g_tlm_slot_skip) {
+    if (!g_tlm_busy) {
+      mlrs_rx_hop_listen();
+    }
+    return;
+  }
+  /* Stock order: ACK already applied in RXdone, then GetFreshPayload,
+   * pack or update last frame, send. GCM runs after DIO/SPI returns. */
+  mlrs_rx_send_tlm();
+#endif
 }
 
 extern "C" bool mlrs_ota_take_elrs_first_sync(void) {
@@ -2630,9 +2858,6 @@ extern "C" void mlrs_ota_loop(void) {
     g_tlm_ready = 0;
     g_fhss_arm_rx = 1;
   }
-  if (g_active) {
-    mlrs_rx_prepare_tlm();
-  }
   if (g_active && g_fhss_arm_rx && !g_tlm_busy) {
     g_fhss_arm_rx = 0;
     g_rx_need_rearm = 0;
@@ -2736,8 +2961,8 @@ extern "C" void mlrs_ota_loop(void) {
     g_rate_scan_ms = 0;
   }
 #endif
-  if (g_active && g_connected && (millis() - g_last_rx_ms) > MLRS_LOST_MS) {
-    note_missed_rx();
+  if (g_active && g_connected && mlrs_rx_age_lost(g_last_rx_ms)) {
+    mlrs_declare_lost();
   }
   if (g_active && (millis() - g_last_hb_ms) > 2000) {
     g_last_hb_ms = millis();
@@ -2748,7 +2973,7 @@ extern "C" void mlrs_ota_loop(void) {
 #endif
     printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxcrc=%u "
            "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u "
-           "pwr=%d skip=%u/%u\n",
+           "pwr=%d skip=%u/%u arq r=%lu d=%lu\n",
            (unsigned)g_lq, (unsigned)g_connected, (unsigned)g_tx_sent,
            (unsigned)g_rx_ok, (unsigned)g_rx_fail, (unsigned)g_rx_junk,
            (unsigned)g_last_rx_fail,
@@ -2757,7 +2982,10 @@ extern "C" void mlrs_ota_loop(void) {
            (unsigned long)fhss_curr(), (unsigned)g_fhss_i,
            (int)(int8_t)linkStats.uplink_RSSI_1,
            (unsigned)linkStats.uplink_Link_quality, pwr_dbm,
-           (unsigned)hop_bitcount(g_hop_mask), (unsigned)g_fhss_count);
+           (unsigned)hop_bitcount(g_hop_mask), (unsigned)g_fhss_count,
+           (unsigned long)g_arq_retry, (unsigned long)g_arq_drop);
+    g_arq_retry = 0;
+    g_arq_drop = 0;
   }
   flush_mlrs_config();
 }

@@ -13,6 +13,7 @@ extern "C" {
 
 void mlrs_mavlinkx_init(void);
 void mlrs_mavlinkx_reset(void);
+void mlrs_mavlinkx_air_lost(void);
 void mlrs_mavlinkx_set_compression(bool enabled);
 
 void mlrs_mavlinkx_ingest_mav(const uint8_t *data, uint16_t len);
