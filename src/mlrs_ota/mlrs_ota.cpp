@@ -337,6 +337,8 @@ static tRxFrame g_rx_sent = {};
 static uint8_t g_rx_sent_valid = 0;
 static volatile uint8_t g_tlm_slot_pending = 0;
 static volatile uint8_t g_tlm_slot_skip = 0;
+static int8_t g_rx_tlm_dbm = ELRS_TX_POWER_DEFAULT_DBM;
+static void mlrs_rx_apply_tlm_power(bool commit);
 #endif
 static uint32_t g_arq_retry = 0;
 static uint32_t g_arq_drop = 0;
@@ -1753,6 +1755,9 @@ static void apply_mlrs_rate() {
   delay(5);
   fhss_generate();
   configure_mlrs_radio();
+#if !MLRS_OTA_IS_TX
+  mlrs_rx_apply_tlm_power(true);
+#endif
   hwTimer::updateInterval(current_rate_cfg()->interval_us);
   hwTimer::resume();
 #if !MLRS_OTA_IS_TX
@@ -2237,9 +2242,46 @@ static void mlrs_rx_prepare_tlm() {
   g_tlm_ready = 1;
 }
 
+static int8_t mlrs_rx_clamp_tlm_dbm(int8_t dbm, bool subghz) {
+  const int8_t max_dbm =
+      subghz ? ELRS_TX_POWER_SUBGHZ_MAX_DBM : ELRS_TX_POWER_2G4_MAX_DBM;
+  if (dbm < ELRS_TX_POWER_MIN_DBM) {
+    return ELRS_TX_POWER_MIN_DBM;
+  }
+  if (dbm > max_dbm) {
+    return max_dbm;
+  }
+  return dbm;
+}
+
+static int8_t mlrs_rx_desired_tlm_dbm() {
+  elrs_config_t *cfg = elrs_config_get();
+  int8_t dbm = (cfg != nullptr) ? cfg->tx_power : ELRS_TX_POWER_DEFAULT_DBM;
+  if (dbm == ELRS_TX_POWER_MATCH_TX_DBM) {
+    /* Overlay frames do not carry TX dBm. MatchTX uses the 20 dBm default. */
+    dbm = ELRS_TX_POWER_DEFAULT_DBM;
+  }
+  return dbm;
+}
+
+static void mlrs_rx_apply_tlm_power(bool commit) {
+  const int8_t want = mlrs_rx_desired_tlm_dbm();
+  const int8_t lf = mlrs_rx_clamp_tlm_dbm(want, true);
+  const int8_t hf = mlrs_rx_clamp_tlm_dbm(want, false);
+  Radio.SetOutputPower(lf, true);
+  Radio.SetOutputPower(hf, false);
+  g_rx_tlm_dbm = (sanitize_band(g_band) == MLRS_BAND_24) ? hf : lf;
+  if (commit && !g_tlm_busy) {
+    Radio.CommitOutputPowerForNextTx();
+  }
+}
+
 static void mlrs_rx_air_tx(tRxFrame *frame) {
   if (g_tlm_busy) {
     return;
+  }
+  if (Radio.HasPendingOutputPower()) {
+    Radio.CommitOutputPowerForNextTx();
   }
   g_tlm_busy = 1;
   g_tlm_busy_ms = millis();
@@ -2361,6 +2403,8 @@ static void mlrs_rx_apply_mbridge(const uint8_t *f, uint8_t n) {
     break;
   case MLRS_P_RX_TLM_PWR:
     cfg->tx_power = mlrs_tlm_power_to_dbm(val);
+    mlrs_rx_apply_tlm_power(!g_tlm_busy);
+    printf("[mLRS] rx tlm power -> %d dBm\n", (int)g_rx_tlm_dbm);
     break;
   case MLRS_P_RX_BLE_RID: {
     const bool enabled = val != 0;
@@ -2628,6 +2672,9 @@ static void start_mlrs() {
   delay(5);
   Radio.ClearIrqStatus(SX12XX_Radio_All);
   configure_mlrs_radio();
+#if !MLRS_OTA_IS_TX
+  mlrs_rx_apply_tlm_power(true);
+#endif
   delay(5);
 
 #if MLRS_OTA_IS_TX
@@ -2712,6 +2759,15 @@ static void start_mlrs() {
          sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
   printf("[mLRS] arq downlink retry=1 (stock), prep-ahead\n");
   printf("[mLRS] radio_status 1Hz (stock #109, local inject)\n");
+#if !MLRS_OTA_IS_TX
+  {
+    elrs_config_t *cfg = elrs_config_get();
+    const bool match = cfg != nullptr &&
+                       cfg->tx_power == ELRS_TX_POWER_MATCH_TX_DBM;
+    printf("[mLRS] tlm power=%d dBm%s\n", (int)g_rx_tlm_dbm,
+           match ? " (match-tx)" : "");
+  }
+#endif
   g_rs_last_ms = millis();
   g_rs_have_local = false;
   g_rs_have_rem = false;
@@ -3182,7 +3238,11 @@ extern "C" void mlrs_ota_loop(void) {
     g_rate_scan_ms = 0;
   }
 #endif
-  if (g_active && g_connected && mlrs_rx_age_lost(g_last_rx_ms)) {
+  /* Window can sit at 250, so a 2 s downlink hole still prints lq=100.
+   * Requiring lq < 3 (the connect bar) stops TX/RX hop-0 flaps.
+   * Real loss still trips after the window decays. */
+  if (g_active && g_connected && mlrs_rx_age_lost(g_last_rx_ms) &&
+      g_lq < 3) {
     mlrs_declare_lost();
   }
   if (g_active && (millis() - g_last_hb_ms) > 2000) {
@@ -3190,7 +3250,7 @@ extern "C" void mlrs_ota_loop(void) {
 #if MLRS_OTA_IS_TX
     const int pwr_dbm = POWERMGNT::getPowerIndBm();
 #else
-    const int pwr_dbm = 0;
+    const int pwr_dbm = (int)g_rx_tlm_dbm;
 #endif
     printf("[mLRS] waiting lq=%u connected=%u sent=%u rxok=%u rxcrc=%u "
            "junk=%u last=%u rate=%s adv=%s freq=%lu hop=%u rssi=%d rqly=%u "
