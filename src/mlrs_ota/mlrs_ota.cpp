@@ -623,6 +623,190 @@ static uint16_t rc_to_crsf(uint16_t rc_ch) {
 }
 #endif
 
+static int8_t rssi_i8_from_u7(uint8_t u7);
+static const mlrs_rate_cfg_t *current_rate_cfg();
+#if !MLRS_OTA_IS_TX
+static bool rx_serial_is_mavlink();
+#endif
+
+static int8_t g_rs_local_rssi = 0;
+static int8_t g_rs_local_snr = 0;
+static int8_t g_rs_rem_rssi = 0;
+static bool g_rs_have_local = false;
+static bool g_rs_have_rem = false;
+static uint32_t g_rs_last_ms = 0;
+#if !MLRS_OTA_IS_TX
+static uint32_t g_rs_bytes_link_out = 0;
+static uint8_t g_rs_txbuf_state = 0;
+enum { RS_TXBUF_NORMAL = 0, RS_TXBUF_BURST = 1, RS_TXBUF_BURST_HIGH = 2 };
+extern "C" uint32_t crsf_serial_rx_available(void);
+#endif
+
+static uint8_t rssi_i8_to_ap(int8_t rssi_i8, bool have) {
+  if (!have) {
+    return 255;
+  }
+  if (rssi_i8 > -50) {
+    return 254;
+  }
+  if (rssi_i8 < -120) {
+    return 0;
+  }
+  const int32_t r = (int32_t)rssi_i8 + 120;
+  return (uint8_t)((r * 254 + 35) / 70);
+}
+
+static uint8_t snr_to_noise(int8_t snr, bool have) {
+  if (!have) {
+    return 255;
+  }
+  int16_t n = (int16_t)(-snr) + 10;
+  if (n < 0) {
+    return 0;
+  }
+  if (n > 127) {
+    return 127;
+  }
+  return (uint8_t)n;
+}
+
+static void radio_status_note_local(void) {
+  g_rs_local_rssi = Radio.LastPacketRSSI;
+  g_rs_local_snr = (int8_t)SNR_DESCALE(Radio.LastPacketSNRRaw);
+  g_rs_have_local = true;
+}
+
+static void radio_status_note_rem(uint8_t rssi_u7) {
+  g_rs_rem_rssi = rssi_i8_from_u7(rssi_u7);
+  g_rs_have_rem = true;
+}
+
+#if !MLRS_OTA_IS_TX
+static uint8_t radio_status_txbuf_ardupilot(uint32_t tnow_ms, bool *inject) {
+  uint8_t last = g_rs_txbuf_state;
+  uint32_t avail = mlrs_mavlinkx_air_pending() + crsf_serial_rx_available();
+  *inject = false;
+  if ((tnow_ms - g_rs_last_ms) >= 1000U) {
+    g_rs_last_ms = tnow_ms;
+    *inject = true;
+  } else if ((tnow_ms - g_rs_last_ms) >= 100U) {
+    if (g_rs_txbuf_state == RS_TXBUF_NORMAL && avail > 256U) {
+      g_rs_txbuf_state = RS_TXBUF_BURST;
+      g_rs_last_ms = tnow_ms;
+      *inject = true;
+    } else if (g_rs_txbuf_state == RS_TXBUF_BURST && avail > 256U) {
+      g_rs_txbuf_state = RS_TXBUF_BURST_HIGH;
+      g_rs_last_ms = tnow_ms;
+      *inject = true;
+    } else if (g_rs_txbuf_state == RS_TXBUF_BURST && avail < 96U) {
+      g_rs_txbuf_state = RS_TXBUF_NORMAL;
+      g_rs_last_ms = tnow_ms;
+      *inject = true;
+    } else if (g_rs_txbuf_state == RS_TXBUF_BURST_HIGH) {
+      if (avail < 256U) {
+        g_rs_txbuf_state = RS_TXBUF_BURST;
+      }
+      g_rs_last_ms = tnow_ms;
+      *inject = true;
+    }
+  }
+  if (!*inject) {
+    return 50;
+  }
+  uint32_t interval_ms = current_rate_cfg()->interval_us / 1000U;
+  if (interval_ms == 0) {
+    interval_ms = 52;
+  }
+  uint32_t frame_cnt = (uint32_t)g_lq * 10U;
+  if (frame_cnt < 500U) {
+    frame_cnt = 500U;
+  }
+  uint32_t rate_max = (frame_cnt * FRAME_RX_PAYLOAD_LEN) / interval_ms;
+  if (rate_max == 0) {
+    rate_max = 1;
+  }
+  uint32_t pct = (g_rs_bytes_link_out * 100U) / rate_max;
+  uint8_t txbuf = 50;
+  if (pct > 95U) {
+    txbuf = 0;
+  } else if (pct > 85U) {
+    txbuf = 30;
+  } else if (pct < 60U) {
+    txbuf = 100;
+  } else if (pct < 75U) {
+    txbuf = 91;
+  }
+  if (g_rs_txbuf_state == RS_TXBUF_BURST_HIGH) {
+    txbuf = 0;
+  } else if (g_rs_txbuf_state == RS_TXBUF_BURST) {
+    txbuf = 50;
+  } else if (g_rs_txbuf_state == RS_TXBUF_NORMAL && last > RS_TXBUF_NORMAL) {
+    txbuf = 51;
+  }
+  if (g_rs_txbuf_state == RS_TXBUF_NORMAL && txbuf == 100) {
+    g_rs_last_ms -= 800U;
+    g_rs_bytes_link_out = (g_rs_bytes_link_out * 4U) / 5U;
+  } else {
+    g_rs_bytes_link_out = 0;
+  }
+  return txbuf;
+}
+#endif
+
+static void radio_status_service(void) {
+  if (!g_active) {
+    return;
+  }
+#if MLRS_OTA_IS_TX
+  if (!siw917_mavlink_wifi_is_enabled()) {
+    return;
+  }
+#else
+  if (!rx_serial_is_mavlink()) {
+    return;
+  }
+#endif
+  const uint32_t now = millis();
+  uint8_t txbuf = 100;
+  bool inject = false;
+#if MLRS_OTA_IS_TX
+  if (!g_connected) {
+    g_rs_last_ms = now;
+    return;
+  }
+  if ((now - g_rs_last_ms) >= 1000U) {
+    g_rs_last_ms = now;
+    inject = true;
+  }
+#else
+  if (!g_connected) {
+    if ((now - g_rs_last_ms) >= 1000U) {
+      g_rs_last_ms = now;
+      inject = true;
+      txbuf = 50;
+    }
+  } else {
+    txbuf = radio_status_txbuf_ardupilot(now, &inject);
+  }
+#endif
+  if (!inject) {
+    return;
+  }
+  uint8_t buf[21];
+  const uint8_t n = mlrs_pack_radio_status(
+      buf, sizeof(buf), rssi_i8_to_ap(g_rs_local_rssi, g_rs_have_local),
+      rssi_i8_to_ap(g_rs_rem_rssi, g_rs_have_rem), txbuf,
+      snr_to_noise(g_rs_local_snr, g_rs_have_local));
+  if (n == 0) {
+    return;
+  }
+#if MLRS_OTA_IS_TX
+  (void)siw917_mavlink_wifi_enqueue_downlink(buf, n);
+#else
+  mlrs_elrs_rx_write_serial(buf, n);
+#endif
+}
+
 static uint8_t rssi_u7_from_i8(int8_t rssi_i8) {
   if (rssi_i8 > -1) {
     return 1;
@@ -715,6 +899,13 @@ static const mlrs_rate_cfg_t *current_rate_cfg() {
   return &kRates[sanitize_band(g_band)][sanitize_rate(g_rate)];
 }
 
+static int8_t rssi_i8_from_u7(uint8_t u7) {
+  if (u7 == 0) {
+    return -1;
+  }
+  return (int8_t)(-(int)u7);
+}
+
 #if MLRS_OTA_IS_TX
 #define MLRS_DYN_LQ_BOOST_DIFF 20
 #define MLRS_DYN_LQ_BOOST_MIN 50
@@ -729,13 +920,6 @@ static int16_t g_dyn_rssi_acc = 0;
 static uint8_t g_dyn_rssi_n = 0;
 static uint32_t g_dyn_last_tlm_ms = 0;
 static uint8_t g_dyn_rate = 0xFF;
-
-static int8_t rssi_i8_from_u7(uint8_t u7) {
-  if (u7 == 0) {
-    return -1;
-  }
-  return (int8_t)(-(int)u7);
-}
 
 static int8_t mlrs_rx_sensitivity() {
   const mlrs_rate_cfg_t *rate = current_rate_cfg();
@@ -1641,6 +1825,7 @@ static void note_valid_rx() {
     ++g_valid_window;
   }
   g_lq = (uint8_t)((g_valid_window > 100) ? 100 : g_valid_window);
+  radio_status_note_local();
 #if MLRS_OTA_IS_TX
   siw917_tx_note_mlrs_downlink(
       g_lq, Radio.LastPacketRSSI, (int8_t)SNR_DESCALE(Radio.LastPacketSNRRaw));
@@ -1797,6 +1982,10 @@ static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
     }
     return true;
   }
+  /* Seq is in the CRC'd header. Apply ACK here so the next uplink
+   * (often packed in this same task pass after deferred ISR) is not
+   * one seq late — that was 50% arq r at 31 Hz. Do not GCM here. */
+  rarq_received((uint8_t)g_rx_frame.status.seq_no);
   g_downlink_pending = 1;
   return true;
 }
@@ -1812,11 +2001,11 @@ static void mlrs_tx_process_downlink() {
   }
   ++g_rx_ok;
   note_valid_rx();
-  rarq_received((uint8_t)g_rx_frame.status.seq_no);
   if (g_rarq_lost) {
     mlrs_mavlinkx_air_lost();
   }
   g_last_dl_plen = (uint8_t)g_rx_frame.status.payload_len;
+  radio_status_note_rem((uint8_t)g_rx_frame.status.rssi_u7);
   mlrs_dynpower_on_event(true, (uint8_t)g_rx_frame.status.LQ_rc,
                          rssi_i8_from_u7((uint8_t)g_rx_frame.status.rssi_u7));
   if (g_rarq_accept && g_rx_frame.status.payload_len > 0) {
@@ -1975,7 +2164,9 @@ static bool mavlinkx_try_mux_item(uint8_t *payload, uint8_t *payload_len,
 }
 
 static void mlrs_rx_prepare_tlm() {
-  if (g_tlm_ready || g_tlm_busy) {
+  /* May run while g_tlm_busy: TXnb copies the buffer onto the chip
+   * before returning, so g_rx_frame is free for the next seq. */
+  if (g_tlm_ready) {
     return;
   }
   const uint8_t seq = tarq_next_seq();
@@ -2031,6 +2222,7 @@ static void mlrs_rx_prepare_tlm() {
       break;
     }
     if (mavlink_uart || tmp[0] == 0xFD || tmp[0] == 0xFE) {
+      g_rs_bytes_link_out += n;
       mlrs_mavlinkx_ingest_mav(tmp, n);
       continue;
     }
@@ -2066,9 +2258,19 @@ static void mlrs_rx_send_tlm() {
      * New pkt_counter is overlay GCM; run here after DIO/SPI finishes. */
     refresh_rx_frame(&g_rx_sent, g_lq);
     mlrs_rx_air_tx(&g_rx_sent);
+    /* Drop the speculative next-seq seal and rebuild after this retry
+     * so hopmask/serial/LQ are current when the ACK finally lands. */
+    g_tlm_ready = 0;
+    mlrs_rx_prepare_tlm();
     return;
   }
-  mlrs_rx_prepare_tlm();
+  /* 31 Hz / 99-byte SF5 leaves ~3 ms after the uplink before TX hops.
+   * A first-time GCM seal in this function misses that window, so the
+   * next uplink still NACKs and every new seq is sent twice. Use the
+   * frame sealed after the previous TXnb when we have one. */
+  if (!g_tlm_ready) {
+    mlrs_rx_prepare_tlm();
+  }
   if (!g_tlm_ready) {
     mlrs_rx_hop_listen();
     return;
@@ -2078,6 +2280,7 @@ static void mlrs_rx_send_tlm() {
   tarq_note_sent((uint8_t)g_rx_frame.status.seq_no);
   g_tlm_ready = 0;
   mlrs_rx_air_tx(&g_rx_frame);
+  mlrs_rx_prepare_tlm();
 }
 
 static void mlrs_rx_done_tx() {
@@ -2206,6 +2409,7 @@ static void mlrs_rx_process_uplink() {
   }
   ++g_rx_ok;
   note_valid_rx();
+  radio_status_note_rem((uint8_t)g_tx_frame.status.rssi_u7);
   hop_note((uint8_t)g_tx_frame.status.fhss_index, true);
   if ((g_tx_frame.status.fhss_index_band != g_band) &&
       (g_tx_frame.status.fhss_index_band < MLRS_BAND_COUNT)) {
@@ -2506,7 +2710,15 @@ static void start_mlrs() {
          (unsigned)FRAME_TX_PAYLOAD_LEN, (unsigned)FRAME_RX_PAYLOAD_LEN);
   printf("[mLRS] mavlinkx compress=%s (19Hz only, stock X4)\n",
          sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
-  printf("[mLRS] arq downlink retry=1 (stock)\n");
+  printf("[mLRS] arq downlink retry=1 (stock), prep-ahead\n");
+  printf("[mLRS] radio_status 1Hz (stock #109, local inject)\n");
+  g_rs_last_ms = millis();
+  g_rs_have_local = false;
+  g_rs_have_rem = false;
+#if !MLRS_OTA_IS_TX
+  g_rs_bytes_link_out = 0;
+  g_rs_txbuf_state = RS_TXBUF_NORMAL;
+#endif
 }
 
 static void stop_mlrs() {
@@ -2806,6 +3018,7 @@ extern "C" void mlrs_ota_loop(void) {
 #if MLRS_OTA_IS_TX
   mlrs_mbridge_poll();
 #endif
+  radio_status_service();
   if (g_print_connected) {
     g_print_connected = 0;
     printf("[mLRS] connected lq=%u\n", (unsigned)g_lq);
@@ -2822,13 +3035,16 @@ extern "C" void mlrs_ota_loop(void) {
 #endif
   }
 #if MLRS_OTA_IS_TX
-  if (g_active && g_tx_send_pending) {
-    g_tx_send_pending = 0;
-    mlrs_tx_send_frame();
-  }
+  /* ACK bit is last received downlink seq. If that packet is already
+   * sitting in g_downlink_pending, pack it before the next uplink or
+   * every tlm is NACKed and resent (50% arq r at 31 Hz). */
   if (g_active && g_downlink_pending) {
     g_downlink_pending = 0;
     mlrs_tx_process_downlink();
+  }
+  if (g_active && g_tx_send_pending) {
+    g_tx_send_pending = 0;
+    mlrs_tx_send_frame();
   }
   if (g_active) {
     static uint32_t g_last_handset_tlm_ms = 0;
@@ -2872,6 +3088,11 @@ extern "C" void mlrs_ota_loop(void) {
     }
     g_fhss_do_hop = 0;
     Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
+  }
+  /* After TXdone the radio is listening. Seal the next downlink so
+   * send_slot is TXnb-only. Safe: not sending, and GCM is not in RXdone. */
+  if (g_active && g_fhss_follow && !g_tlm_busy && !g_tlm_ready) {
+    mlrs_rx_prepare_tlm();
   }
 #endif
   if (g_pending_protocol != 0xFF && g_apply_at_ms != 0 &&

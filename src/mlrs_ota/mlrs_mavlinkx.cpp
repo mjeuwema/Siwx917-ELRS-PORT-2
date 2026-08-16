@@ -44,6 +44,13 @@ struct Fifo {
 static Fifo g_air_fifo;
 static Fifo g_mav_fifo;
 static bool g_compress;
+static uint32_t g_link_out_bytes;
+static uint8_t g_radio_seq;
+
+#define MAV_SYSID_RADIO 51
+#define MAV_COMPID_TELEMETRY_RADIO 68
+#define MAV_MSG_RADIO_STATUS 109
+#define MAV_RADIO_STATUS_CRC_EXTRA 185
 
 static uint16_t fifo_count(const Fifo *f) {
   return (uint16_t)((f->w - f->r) & (X_FIFO_LEN - 1));
@@ -692,6 +699,8 @@ void mlrs_mavlinkx_init(void) {
   mav_parse_reset();
   x_reset();
   g_compress = false;
+  g_link_out_bytes = 0;
+  g_radio_seq = 0;
 }
 
 void mlrs_mavlinkx_reset(void) { mlrs_mavlinkx_init(); }
@@ -704,6 +713,7 @@ void mlrs_mavlinkx_ingest_mav(const uint8_t *data, uint16_t len) {
   if (data == nullptr || len == 0) {
     return;
   }
+  g_link_out_bytes += len;
   for (uint16_t i = 0; i < len; ++i) {
     if (g_mav_parse.st == MAV_IDLE && fifo_free(&g_air_fifo) < 290) {
       break;
@@ -733,4 +743,53 @@ uint8_t mlrs_mavlinkx_take_mav(uint8_t *dst, uint8_t max) {
     return 0;
   }
   return fifo_take(&g_mav_fifo, dst, max);
+}
+
+uint16_t mlrs_mavlinkx_air_pending(void) { return fifo_count(&g_air_fifo); }
+
+uint32_t mlrs_mavlinkx_take_link_out_bytes(void) {
+  const uint32_t n = g_link_out_bytes;
+  g_link_out_bytes = 0;
+  return n;
+}
+
+uint8_t mlrs_pack_radio_status(uint8_t *dst, uint8_t max, uint8_t rssi,
+                               uint8_t remrssi, uint8_t txbuf, uint8_t noise) {
+  const uint8_t kLen = 21;
+  if (dst == nullptr || max < kLen) {
+    return 0;
+  }
+  dst[0] = MAV_MAGIC_V2;
+  dst[1] = 9;
+  dst[2] = 0;
+  dst[3] = 0;
+  dst[4] = g_radio_seq++;
+  dst[5] = MAV_SYSID_RADIO;
+  dst[6] = MAV_COMPID_TELEMETRY_RADIO;
+  dst[7] = (uint8_t)MAV_MSG_RADIO_STATUS;
+  dst[8] = 0;
+  dst[9] = 0;
+  dst[10] = 0;
+  dst[11] = 0;
+  dst[12] = 0;
+  dst[13] = 0;
+  dst[14] = rssi;
+  dst[15] = remrssi;
+  dst[16] = txbuf;
+  dst[17] = noise;
+  dst[18] = 0xFF;
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 1; i <= 18; ++i) {
+    uint8_t tmp = dst[i] ^ (uint8_t)(crc & 0xFF);
+    tmp ^= (uint8_t)(tmp << 4);
+    crc = (uint16_t)((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4));
+  }
+  {
+    uint8_t tmp = (uint8_t)MAV_RADIO_STATUS_CRC_EXTRA ^ (uint8_t)(crc & 0xFF);
+    tmp ^= (uint8_t)(tmp << 4);
+    crc = (uint16_t)((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4));
+  }
+  dst[19] = (uint8_t)(crc & 0xFF);
+  dst[20] = (uint8_t)(crc >> 8);
+  return kLen;
 }
