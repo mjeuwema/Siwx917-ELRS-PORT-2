@@ -2354,10 +2354,13 @@ static void mlrs_rx_send_tlm() {
     refresh_rx_frame(&g_rx_sent, g_lq);
     mlrs_rx_air_tx(&g_rx_sent);
     g_tlm_ready = 0;
+    /* TXnb already copied g_rx_sent. Seal the following seq on the
+     * ~24 ms airtime so the next send_slot stays TXnb-only. */
+    mlrs_rx_prepare_tlm();
     return;
   }
-  /* Do not GCM-seal here. A late first-time seal misses the TX RX
-   * window. Skip this slot if the next frame is not already packed. */
+  /* Do not GCM-seal the current seq here. A late first-time seal
+   * misses the TX RX window. Skip this slot if it is not packed. */
   if (!g_tlm_ready) {
     mlrs_rx_hop_listen();
     return;
@@ -2367,6 +2370,7 @@ static void mlrs_rx_send_tlm() {
   tarq_note_sent((uint8_t)g_rx_frame.status.seq_no);
   g_tlm_ready = 0;
   mlrs_rx_air_tx(&g_rx_frame);
+  mlrs_rx_prepare_tlm();
 }
 
 static void mlrs_rx_done_tx() {
@@ -3216,9 +3220,9 @@ extern "C" void mlrs_ota_loop(void) {
     g_fhss_do_hop = 0;
     Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, true, 0);
   }
-  /* After TXdone the radio is listening. Seal the next downlink so
-   * send_slot is TXnb-only. Safe: not sending, and GCM is not in RXdone. */
-  if (g_active && g_fhss_follow && !g_tlm_busy && !g_tlm_ready) {
+  /* Seal the next downlink while this one is on air (g_tlm_busy) or
+   * after TXdone. send_slot stays TXnb-only. Not in RXdone. */
+  if (g_active && g_fhss_follow && !g_tlm_ready) {
     mlrs_rx_prepare_tlm();
   }
 #endif
