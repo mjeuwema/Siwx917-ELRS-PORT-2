@@ -178,6 +178,15 @@ extern "C" void elrs_tx_loop(void)
     hwTimer::service();
     mlrs_ota_loop();
     siw917_lr1121_handle_deferred_isr();
+    /* 19 Hz SF6 UL is ~24 ms. loop() after TXnb delayed TXdone/RXnb
+     * and clipped the downlink. Wait for air-done first. */
+    if (mlrs_ota_is_active() && mlrs_ota_tx_air()) {
+        const uint32_t t0 = millis();
+        while (mlrs_ota_tx_air() &&
+               (int32_t)(millis() - t0) < 40) {
+            siw917_lr1121_handle_deferred_isr();
+        }
+    }
     loop();
     siw917_mavlink_backpack_service();
     siw917_lr1121_handle_deferred_isr();
