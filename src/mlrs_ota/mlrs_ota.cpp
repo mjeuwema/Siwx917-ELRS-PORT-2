@@ -329,6 +329,13 @@ static uint8_t g_last_dl_plen = 0;
 #if MLRS_OTA_IS_TX
 static uint8_t g_ul_hold[64] = {};
 static uint8_t g_ul_hold_len = 0;
+static uint8_t g_ul_prep[FRAME_TX_PAYLOAD_LEN] = {};
+static uint8_t g_ul_prep_len = 0;
+static uint8_t g_ul_prep_valid = 0;
+static uint32_t g_tx_tuned_freq = 0;
+static uint32_t g_tock_us_last = 0;
+static uint32_t g_tock_us_max = 0;
+static volatile uint8_t g_tx_air = 0;
 #else
 static uint8_t g_dn_hold[64] = {};
 static uint8_t g_dn_hold_len = 0;
@@ -1873,7 +1880,68 @@ static void fill_rc_from_handset(uint16_t rc[16]) {
   }
 }
 
+static bool mlrs_tx_cmd_pending() {
+  return g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS ||
+         g_pending_band != 0xFF || g_pending_rate != 0xFF;
+}
+
+/* Mux + X4 off the tock. 19 Hz SF6 99-byte UL+DL leaves ~5 ms; doing
+ * this on the tock delayed TXnb so the downlink missed the RX window. */
+static uint8_t mlrs_tx_fill_uplink(uint8_t *payload) {
+  uint8_t payload_len = 0;
+  {
+    uint8_t hm[6];
+    hopmask_pack(hm, g_hop_gen, g_hop_mask);
+    payload_len = mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, hm, 6);
+  }
+  for (;;) {
+    uint8_t tmp[64];
+    uint8_t n = g_ul_hold_len;
+    if (n != 0) {
+      memcpy(tmp, g_ul_hold, n);
+      g_ul_hold_len = 0;
+    } else if (mlrs_mbridge_take_air(
+                   tmp, &n, (uint8_t)(FRAME_TX_PAYLOAD_LEN - 3U))) {
+      /* native mLRS Lua / MBridge, ahead of leftover ELRS CRSF */
+    } else if (!otaConnector.takeQueuedPayload(
+                   tmp, &n, (uint8_t)(FRAME_TX_PAYLOAD_LEN - 3U)) ||
+               n == 0) {
+      break;
+    }
+    const uint8_t next =
+        mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, tmp, n);
+    if (next == payload_len) {
+      memcpy(g_ul_hold, tmp, n);
+      g_ul_hold_len = n;
+      break;
+    }
+    payload_len = next;
+  }
+  {
+    uint8_t mav[64];
+    for (;;) {
+      const uint8_t n =
+          (uint8_t)siw917_mavlink_wifi_uplink_read_bytes(mav, sizeof(mav));
+      if (n == 0) {
+        break;
+      }
+      mlrs_mavlinkx_ingest_mav(mav, n);
+    }
+  }
+  return mavlinkx_fill_mux(payload, payload_len, FRAME_TX_PAYLOAD_LEN);
+}
+
+static void mlrs_tx_prepare_uplink() {
+  if (g_ul_prep_valid || mlrs_tx_cmd_pending()) {
+    return;
+  }
+  memset(g_ul_prep, 0, sizeof(g_ul_prep));
+  g_ul_prep_len = mlrs_tx_fill_uplink(g_ul_prep);
+  g_ul_prep_valid = 1;
+}
+
 static void mlrs_tx_send_frame() {
+  const uint32_t tock_t0 = micros();
   if (announcing()) {
     g_fhss_i = 0;
     g_fhss_need_hop = false;
@@ -1899,62 +1967,36 @@ static void mlrs_tx_send_frame() {
   if (g_pending_protocol == ELRS_AIR_PROTOCOL_ELRS) {
     payload[0] = MLRS_SWITCH_CMD;
     payload_len = 1;
+    g_ul_prep_valid = 0;
   } else if (g_pending_band != 0xFF) {
     payload[0] = MLRS_BAND_CMD;
     payload[1] = sanitize_band(g_pending_band);
     payload[2] = sanitize_rate(g_pending_rate != 0xFF ? g_pending_rate : g_rate);
     payload_len = 3;
+    g_ul_prep_valid = 0;
   } else if (g_pending_rate != 0xFF) {
     payload[0] = MLRS_RATE_CMD;
     payload[1] = sanitize_rate(g_pending_rate);
     payload_len = 2;
+    g_ul_prep_valid = 0;
+  } else if (g_ul_prep_valid) {
+    memcpy(payload, g_ul_prep, g_ul_prep_len);
+    payload_len = g_ul_prep_len;
+    g_ul_prep_valid = 0;
+    g_ul_prep_len = 0;
   } else {
-    {
-      uint8_t hm[6];
-      hopmask_pack(hm, g_hop_gen, g_hop_mask);
-      payload_len =
-          mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, hm, 6);
-    }
-    for (;;) {
-      uint8_t tmp[64];
-      uint8_t n = g_ul_hold_len;
-      if (n != 0) {
-        memcpy(tmp, g_ul_hold, n);
-        g_ul_hold_len = 0;
-      } else if (mlrs_mbridge_take_air(
-                     tmp, &n, (uint8_t)(FRAME_TX_PAYLOAD_LEN - 3U))) {
-        /* native mLRS Lua / MBridge, ahead of leftover ELRS CRSF */
-      } else if (!otaConnector.takeQueuedPayload(
-                     tmp, &n, (uint8_t)(FRAME_TX_PAYLOAD_LEN - 3U)) ||
-                 n == 0) {
-        break;
-      }
-      const uint8_t next =
-          mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, tmp, n);
-      if (next == payload_len) {
-        memcpy(g_ul_hold, tmp, n);
-        g_ul_hold_len = n;
-        break;
-      }
-      payload_len = next;
-    }
-    {
-      uint8_t mav[64];
-      for (;;) {
-        const uint8_t n =
-            (uint8_t)siw917_mavlink_wifi_uplink_read_bytes(mav, sizeof(mav));
-        if (n == 0) {
-          break;
-        }
-        mlrs_mavlinkx_ingest_mav(mav, n);
-      }
-    }
-    payload_len =
-        mavlinkx_fill_mux(payload, payload_len, FRAME_TX_PAYLOAD_LEN);
+    payload_len = mlrs_tx_fill_uplink(payload);
   }
   pack_tx_frame(&g_tx_frame, rc, g_fhss_i, g_seq++, g_lq,
                 (g_rarq_ack & 1U) != 0U, payload, payload_len);
-  Radio.SetFrequencyReg(fhss_curr(), SX12XX_Radio_All, false, 0);
+  {
+    const uint32_t freq = fhss_curr();
+    if (freq != g_tx_tuned_freq) {
+      Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false, 0);
+      g_tx_tuned_freq = freq;
+    }
+  }
+  g_tx_air = 1;
   Radio.TXnb((uint8_t *)&g_tx_frame, false, nullptr, SX12XX_Radio_All);
   ++g_tx_sent;
   g_fhss_need_hop = true;
@@ -1967,11 +2009,21 @@ static void mlrs_tx_send_frame() {
     printf("[mLRS] first TX hop=%u freq=%lu Hz plen=%u\n", (unsigned)g_fhss_i,
            (unsigned long)fhss_curr(), (unsigned)FRAME_TX_RX_LEN);
   }
+  {
+    const uint32_t dt = micros() - tock_t0;
+    g_tock_us_last = dt;
+    if (dt > g_tock_us_max) {
+      g_tock_us_max = dt;
+    }
+  }
 }
 
 static void mlrs_tx_tock() { g_tx_send_pending = 1; }
 
-static void mlrs_tx_done() { Radio.RXnb(); }
+static void mlrs_tx_done() {
+  g_tx_air = 0;
+  Radio.RXnb();
+}
 
 static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
   memcpy(&g_rx_frame, Radio.RXdataBuffer, sizeof(g_rx_frame));
@@ -1990,6 +2042,7 @@ static bool mlrs_tx_rx_done(SX12xxDriverCommon::rx_status) {
   /* Seq is in the CRC'd header. Apply ACK here so the next uplink
    * (often packed in this same task pass after deferred ISR) is not
    * one seq late — that was 50% arq r at 31 Hz. Do not GCM here. */
+  g_last_rx_ms = millis();
   rarq_received((uint8_t)g_rx_frame.status.seq_no);
   g_downlink_pending = 1;
   return true;
@@ -2300,19 +2353,11 @@ static void mlrs_rx_send_tlm() {
      * New pkt_counter is overlay GCM; run here after DIO/SPI finishes. */
     refresh_rx_frame(&g_rx_sent, g_lq);
     mlrs_rx_air_tx(&g_rx_sent);
-    /* Drop the speculative next-seq seal and rebuild after this retry
-     * so hopmask/serial/LQ are current when the ACK finally lands. */
     g_tlm_ready = 0;
-    mlrs_rx_prepare_tlm();
     return;
   }
-  /* 31 Hz / 99-byte SF5 leaves ~3 ms after the uplink before TX hops.
-   * A first-time GCM seal in this function misses that window, so the
-   * next uplink still NACKs and every new seq is sent twice. Use the
-   * frame sealed after the previous TXnb when we have one. */
-  if (!g_tlm_ready) {
-    mlrs_rx_prepare_tlm();
-  }
+  /* Do not GCM-seal here. A late first-time seal misses the TX RX
+   * window. Skip this slot if the next frame is not already packed. */
   if (!g_tlm_ready) {
     mlrs_rx_hop_listen();
     return;
@@ -2322,7 +2367,6 @@ static void mlrs_rx_send_tlm() {
   tarq_note_sent((uint8_t)g_rx_frame.status.seq_no);
   g_tlm_ready = 0;
   mlrs_rx_air_tx(&g_rx_frame);
-  mlrs_rx_prepare_tlm();
 }
 
 static void mlrs_rx_done_tx() {
@@ -2705,6 +2749,12 @@ static void start_mlrs() {
   g_tx_send_pending = 0;
   g_downlink_pending = 0;
   g_logged_switch_cmd = false;
+  g_ul_prep_valid = 0;
+  g_ul_prep_len = 0;
+  g_tx_tuned_freq = 0;
+  g_tock_us_last = 0;
+  g_tock_us_max = 0;
+  g_tx_air = 0;
 #else
   g_uplink_pending = 0;
   g_tlm_ready = 0;
@@ -2758,6 +2808,9 @@ static void start_mlrs() {
   printf("[mLRS] mavlinkx compress=%s (19Hz only, stock X4)\n",
          sanitize_rate(g_rate) == MLRS_RATE_19HZ ? "on" : "off");
   printf("[mLRS] arq downlink retry=1 (stock), prep-ahead\n");
+#if MLRS_OTA_IS_TX
+  printf("[mLRS] ul prep-ahead (19Hz slot)\n");
+#endif
   printf("[mLRS] radio_status 1Hz (stock #109, local inject)\n");
 #if !MLRS_OTA_IS_TX
   {
@@ -2849,6 +2902,14 @@ extern "C" bool mlrs_ota_tlm_busy(void) {
   return false;
 #else
   return g_tlm_busy != 0;
+#endif
+}
+
+extern "C" bool mlrs_ota_tx_air(void) {
+#if MLRS_OTA_IS_TX
+  return g_tx_air != 0;
+#else
+  return false;
 #endif
 }
 
@@ -3072,9 +3133,13 @@ extern "C" void mlrs_ota_on_elrs_ready(void) {
 
 extern "C" void mlrs_ota_loop(void) {
 #if MLRS_OTA_IS_TX
-  mlrs_mbridge_poll();
-#endif
+  if (!(g_active && g_tx_send_pending)) {
+    mlrs_mbridge_poll();
+    radio_status_service();
+  }
+#else
   radio_status_service();
+#endif
   if (g_print_connected) {
     g_print_connected = 0;
     printf("[mLRS] connected lq=%u\n", (unsigned)g_lq);
@@ -3091,18 +3156,24 @@ extern "C" void mlrs_ota_loop(void) {
 #endif
   }
 #if MLRS_OTA_IS_TX
-  /* ACK bit is last received downlink seq. If that packet is already
-   * sitting in g_downlink_pending, pack it before the next uplink or
-   * every tlm is NACKed and resent (50% arq r at 31 Hz). */
-  if (g_active && g_downlink_pending) {
-    g_downlink_pending = 0;
-    mlrs_tx_process_downlink();
-  }
+  /* last_rx is stamped in RXdone. Send first so GCM-open is not on the
+   * tock; decrypt on the next pass while listening. */
+  uint8_t sent_this_pass = 0;
   if (g_active && g_tx_send_pending) {
     g_tx_send_pending = 0;
     mlrs_tx_send_frame();
+    sent_this_pass = 1;
   }
-  if (g_active) {
+  if (g_active && sent_this_pass == 0) {
+    if (g_downlink_pending) {
+      g_downlink_pending = 0;
+      mlrs_tx_process_downlink();
+    }
+    if (!g_ul_prep_valid) {
+      mlrs_tx_prepare_uplink();
+    }
+  }
+  if (g_active && sent_this_pass == 0) {
     static uint32_t g_last_handset_tlm_ms = 0;
     if (g_last_handset_tlm_ms == 0 ||
         (int32_t)(millis() - g_last_handset_tlm_ms) >= 200) {
@@ -3238,13 +3309,20 @@ extern "C" void mlrs_ota_loop(void) {
     g_rate_scan_ms = 0;
   }
 #endif
-  /* Window can sit at 250, so a 2 s downlink hole still prints lq=100.
-   * Requiring lq < 3 (the connect bar) stops TX/RX hop-0 flaps.
-   * Real loss still trips after the window decays. */
+#if MLRS_OTA_IS_TX
+  /* Window can sit at 250, so a 2 s downlink hole still prints lq=100. */
   if (g_active && g_connected && mlrs_rx_age_lost(g_last_rx_ms) &&
       g_lq < 3) {
     mlrs_declare_lost();
   }
+#else
+  /* Valid-CRC silence for 2 s, and no RF at all (including hop-0 junk).
+   * A live TX on hop 0 keeps last_rf fresh. A flashed/off TX does not. */
+  if (g_active && g_connected && mlrs_rx_age_lost(g_last_rx_ms) &&
+      (g_last_rf_ms == 0 || mlrs_rx_age_lost(g_last_rf_ms))) {
+    mlrs_declare_lost();
+  }
+#endif
   if (g_active && (millis() - g_last_hb_ms) > 2000) {
     g_last_hb_ms = millis();
 #if MLRS_OTA_IS_TX
@@ -3267,6 +3345,11 @@ extern "C" void mlrs_ota_loop(void) {
            (unsigned long)g_arq_retry, (unsigned long)g_arq_drop);
     g_arq_retry = 0;
     g_arq_drop = 0;
+#if MLRS_OTA_IS_TX
+    printf("[mLRS] tock %lu/%lu us\n", (unsigned long)g_tock_us_last,
+           (unsigned long)g_tock_us_max);
+    g_tock_us_max = 0;
+#endif
   }
   flush_mlrs_config();
 }

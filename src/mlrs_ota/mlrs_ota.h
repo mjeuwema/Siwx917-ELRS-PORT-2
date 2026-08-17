@@ -44,6 +44,7 @@ void mlrs_ota_hop_skip_info(uint8_t *skip_count, uint8_t *hop_count,
 void mlrs_ota_link_rate_info(uint8_t *rate, uint8_t *band, uint8_t *ul_plen,
                              uint8_t *dl_plen);
 bool mlrs_ota_tlm_busy(void);
+bool mlrs_ota_tx_air(void);
 uint32_t mlrs_ota_tlm_busy_timeout_ms(void);
 void mlrs_ota_rx_send_slot(void);
 bool mlrs_ota_take_elrs_first_sync(void);
