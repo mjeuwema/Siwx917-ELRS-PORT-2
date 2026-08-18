@@ -52,7 +52,9 @@ extern "C" {
 #define NVM3_KEY_ELRS_WIFI       0x00003   /* WiFi settings */
 #define NVM3_KEY_ELRS_RADIO      0x00004   /* Radio parameters */
 #define NVM3_KEY_MLRS_SECRET     0x00005   /* 32-byte mLRS TRNG bind secret */
+#define NVM3_KEY_ELRS_BIND_PHRASE 0x00006  /* Full ELRS bind phrase string */
 #define MLRS_CONFIG_SECRET_LEN   32
+#define ELRS_BIND_PHRASE_MAX     63
 
 /*******************************************************************************
  * Serial Protocol Options
@@ -269,6 +271,8 @@ int elrs_config_get_uid(uint8_t uid_out[6]);
 int elrs_config_get_mlrs_secret(uint8_t out[MLRS_CONFIG_SECRET_LEN]);
 int elrs_config_set_mlrs_secret(const uint8_t in[MLRS_CONFIG_SECRET_LEN]);
 int elrs_config_clear_mlrs_secret(void);
+int elrs_config_set_bind_phrase(const char *phrase);
+int elrs_config_get_bind_phrase(char *out, size_t max);
 
 /**
  * @brief Check if device is bound

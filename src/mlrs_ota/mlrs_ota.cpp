@@ -1,5 +1,7 @@
 #include "mlrs_ota.h"
 #include "mlrs_aes_gcm.h"
+#include "mlrs_bind.h"
+#include "mlrs_mbridge_params.h"
 #include "mlrs_mavlinkx.h"
 
 #include "Arduino.h"
@@ -30,6 +32,7 @@ extern expresslrs_mod_settings_s *ExpressLRS_currAirRate_Modparams;
 #include "CRSFRouter.h"
 #include "TXOTAConnector.h"
 #include "mlrs_mbridge.h"
+#include "mlrs_tx_mav_component.h"
 #ifndef MinPower
 #define MinPower PWR_10mW
 #define MaxPower PWR_100mW
@@ -88,12 +91,15 @@ extern uint8_t uplinkLQ;
 #define FRAME_RX_AAD_LEN 11
 #define FRAME_TX_SEAL_LEN (FRAME_TX_RCDATA1_LEN + FRAME_TX_RCDATA2_LEN + FRAME_TX_PAYLOAD_LEN)
 #define FRAME_GCM_TAG_LEN 16
+#define MLRS_CTRL_REFRESH_MS 1000
 #define MLRS_OVERLAY_ID "20260813S"
 #define MLRS_MUX_MAGIC 0x5A
-#define MLRS_HOP_WIN 16
-#define MLRS_HOP_FAIL_PCT 75
+#define MLRS_HOP_WIN 32
+#define MLRS_HOP_MIN_VIS 16
+#define MLRS_HOP_FAIL_PCT 80
 #define MLRS_HOP_CLEAR_OK 2
 #define MLRS_HOP_MAX_SKIP 6
+#define MLRS_HOP_SCORE_LQ 90
 #define MLRS_GCM_CTR_BOOT_GAP 1024U
 #define MLRS_GCM_CTR_RESERVE (1U << 20)
 #define FHSS_MAX_HOPS 25
@@ -265,6 +271,7 @@ static uint8_t g_fhss_ch[FHSS_MAX_HOPS] = {};
 static uint8_t g_fhss_count = FHSS_NUM_915;
 static uint8_t g_fhss_i = 0;
 static uint32_t g_hop_mask = 0;
+static uint32_t g_hop_live = 0;
 static uint8_t g_hop_gen = 0;
 #if !MLRS_OTA_IS_TX
 typedef struct {
@@ -336,9 +343,19 @@ static uint32_t g_tx_tuned_freq = 0;
 static uint32_t g_tock_us_last = 0;
 static uint32_t g_tock_us_max = 0;
 static volatile uint8_t g_tx_air = 0;
+static uint8_t g_dl_miss_run = 0;
+static uint8_t g_ul_hm_sent_gen = 0xFF;
+static uint32_t g_ul_hm_sent_mask = 0;
+static uint32_t g_ul_hm_sent_ms = 0;
 #else
 static uint8_t g_dn_hold[64] = {};
 static uint8_t g_dn_hold_len = 0;
+static uint8_t g_hm_sent_gen = 0xFF;
+static uint32_t g_hm_sent_mask = 0;
+static uint32_t g_hm_sent_ms = 0;
+static uint8_t g_st_sent[32] = {};
+static uint8_t g_st_sent_len = 0;
+static uint32_t g_st_sent_ms = 0;
 static uint8_t g_rx_frame_valid = 0;
 static tRxFrame g_rx_sent = {};
 static uint8_t g_rx_sent_valid = 0;
@@ -982,15 +999,11 @@ static void mlrs_dynpower_on_event(bool tlm_ok, uint8_t rx_lq, int8_t rx_rssi) {
   const PowerLevels_e before = POWERMGNT::currPower();
   const char *why = nullptr;
 
+  /* Official DynamicPower_Update is already skipped while mLRS is up.
+   * The stock "restore" fights MBridge Tx Power and only changed the
+   * POWERMGNT enum: TXnb does not CommitOutputPower. Do not touch PA
+   * from the downlink handler. */
   if (!config.GetDynamicPower()) {
-    if (tlm_ok && rx_rssi <= -20 && before < (PowerLevels_e)config.GetPower()) {
-      mlrs_dynpower_set_config();
-      why = "restore";
-    }
-    if (why != nullptr && POWERMGNT::currPower() != before) {
-      printf("[mLRS] dynpower %s -> %d dBm\n", why,
-             (int)POWERMGNT::getPowerIndBm());
-    }
     return;
   }
 
@@ -1131,6 +1144,24 @@ static void calib_image_for_freq(uint32_t freq) {
   (void)lr1121_elrs_calib_image(lo, hi);
 }
 
+static void hop_reset_adapt() {
+  g_hop_mask = 0;
+  g_hop_live = 0;
+  g_hop_gen = 0;
+#if MLRS_OTA_IS_TX
+  g_ul_hm_sent_gen = 0xFF;
+  g_ul_hm_sent_mask = 0;
+  g_ul_hm_sent_ms = 0;
+#else
+  memset(g_hop_stat, 0, sizeof(g_hop_stat));
+  g_hop_proposed_mask = 0;
+  g_hop_proposed_gen = 0;
+  g_hm_sent_gen = 0xFF;
+  g_hm_sent_mask = 0;
+  g_hm_sent_ms = 0;
+#endif
+}
+
 static void fhss_generate() {
   const uint8_t list_len =
       (g_band == MLRS_BAND_24) ? FHSS_LIST_24_LEN : kFhssListLen;
@@ -1193,13 +1224,7 @@ static void fhss_generate() {
     g_fhss_count = k;
   }
   g_fhss_i = 0;
-  g_hop_mask = 0;
-  g_hop_gen = 0;
-#if !MLRS_OTA_IS_TX
-  memset(g_hop_stat, 0, sizeof(g_hop_stat));
-  g_hop_proposed_mask = 0;
-  g_hop_proposed_gen = 0;
-#endif
+  hop_reset_adapt();
 #if MLRS_OTA_IS_TX
   g_fhss_need_hop = false;
 #else
@@ -1260,31 +1285,15 @@ static bool hop_is_skipped(uint8_t i) {
   if (i == 0 || i >= g_fhss_count) {
     return false;
   }
-  return (g_hop_mask & (1UL << i)) != 0;
+  return (g_hop_live & (1UL << i)) != 0;
 }
 
 static uint8_t hop_probe_pick() {
-  uint8_t skipped = 0;
+  /* Same skipped hop on both ends. send_counter vs recv_highest
+   * picked different probes and desynced as soon as any bit was set. */
   for (uint8_t i = 1; i < g_fhss_count; ++i) {
     if (hop_is_skipped(i)) {
-      ++skipped;
-    }
-  }
-  if (skipped == 0) {
-    return 0xFF;
-  }
-#if MLRS_OTA_IS_TX
-  const uint32_t ctr = (g_send_counter > 1) ? (g_send_counter - 1U) : 1U;
-#else
-  const uint32_t ctr = g_recv_highest;
-#endif
-  uint8_t n = (uint8_t)(ctr % skipped);
-  for (uint8_t i = 1; i < g_fhss_count; ++i) {
-    if (hop_is_skipped(i)) {
-      if (n == 0) {
-        return i;
-      }
-      --n;
+      return i;
     }
   }
   return 0xFF;
@@ -1297,9 +1306,17 @@ static void hopmask_apply(uint8_t gen, uint32_t mask) {
   }
   g_hop_mask = mask;
   g_hop_gen = gen;
-  printf("[mLRS] hopmask gen=%u skip=%u/%u bits=0x%08lx\n", (unsigned)gen,
+  if (g_fhss_i == 0) {
+    g_hop_live = mask;
+  }
+  printf("[mLRS] hopmask gen=%u skip=%u/%u bits=0x%08lx%s\n", (unsigned)gen,
          (unsigned)hop_bitcount(mask), (unsigned)g_fhss_count,
-         (unsigned long)mask);
+         (unsigned long)mask, (g_hop_live == mask) ? "" : " (at hop 0)");
+}
+
+static bool ctrl_refresh_due(uint32_t last_ms, uint32_t now) {
+  return last_ms == 0 ||
+         (int32_t)(now - last_ms) >= (int32_t)MLRS_CTRL_REFRESH_MS;
 }
 
 static uint8_t hopmask_pack(uint8_t *dst, uint8_t gen, uint32_t mask) {
@@ -1327,6 +1344,12 @@ static bool hopmask_parse(const uint8_t *f, uint8_t n, uint8_t *gen,
 static void fhss_hop() {
   if (g_fhss_count == 0) {
     return;
+  }
+  if (g_fhss_i == 0 && g_hop_live != g_hop_mask) {
+    g_hop_live = g_hop_mask;
+    printf("[mLRS] hop live skip=%u/%u bits=0x%08lx\n",
+           (unsigned)hop_bitcount(g_hop_live), (unsigned)g_fhss_count,
+           (unsigned long)g_hop_live);
   }
   if (hop_is_skipped(g_fhss_i)) {
     uint8_t i = 0;
@@ -1365,8 +1388,16 @@ static void fhss_set_index(uint8_t index) {
   }
 }
 
+static bool hop_scoring_ok() {
+  return g_connected && !tight_slot() && g_lq >= MLRS_HOP_SCORE_LQ &&
+         g_valid_window >= 50 && g_hop_live == g_hop_mask;
+}
+
 static void hop_note(uint8_t idx, bool ok) {
   if (idx >= g_fhss_count || idx >= FHSS_MAX_HOPS) {
+    return;
+  }
+  if (!hop_scoring_ok()) {
     return;
   }
   hop_stat_t *s = &g_hop_stat[idx];
@@ -1386,18 +1417,19 @@ static void hop_note(uint8_t idx, bool ok) {
 }
 
 static void hop_rebuild_mask() {
-  if (!g_connected || g_fhss_count < 8) {
+  if (!hop_scoring_ok() || g_fhss_count < 8) {
     return;
   }
   uint32_t mask = g_hop_proposed_mask;
   const uint8_t max_skip = hop_max_skip();
+  uint8_t added = 0;
   for (uint8_t i = 1; i < g_fhss_count; ++i) {
     hop_stat_t *s = &g_hop_stat[i];
     if (s->vis >= MLRS_HOP_WIN) {
       s->vis = (uint8_t)(s->vis / 2);
       s->fail = (uint8_t)(s->fail / 2);
     }
-    if (s->vis < 8) {
+    if (s->vis < MLRS_HOP_MIN_VIS) {
       continue;
     }
     const uint16_t fail_pct = (uint16_t)((uint16_t)s->fail * 100U / s->vis);
@@ -1408,10 +1440,11 @@ static void hop_rebuild_mask() {
         s->vis = 0;
         s->fail = 0;
       }
-    } else if (fail_pct >= MLRS_HOP_FAIL_PCT &&
+    } else if (added == 0 && fail_pct >= MLRS_HOP_FAIL_PCT &&
                hop_bitcount(mask) < max_skip) {
       mask |= (1UL << i);
       s->probe_ok = 0;
+      added = 1;
     }
   }
   mask = hop_sanitize_mask(mask);
@@ -1821,6 +1854,7 @@ static void mlrs_declare_lost() {
     return;
   }
   g_connected = 0;
+  hop_reset_adapt();
   setConnectionState(disconnected);
   g_print_disconnected = 1;
 #if MLRS_OTA_IS_TX
@@ -1833,6 +1867,13 @@ static void mlrs_declare_lost() {
 
 static void note_valid_rx() {
   g_last_rx_ms = millis();
+#if MLRS_OTA_IS_TX
+  /* Search/connect accumulates tock-misses; only report mid-link holes. */
+  if (g_connected && g_dl_miss_run >= 4) {
+    printf("[mLRS] dl hole %u\n", (unsigned)g_dl_miss_run);
+  }
+  g_dl_miss_run = 0;
+#endif
   if (g_valid_window < 250) {
     ++g_valid_window;
   }
@@ -1862,6 +1903,11 @@ static void note_valid_rx() {
 }
 
 static void note_missed_rx() {
+#if MLRS_OTA_IS_TX
+  if (g_connected && g_dl_miss_run < 255) {
+    ++g_dl_miss_run;
+  }
+#endif
   if (g_valid_window > 0) {
     --g_valid_window;
   }
@@ -1890,9 +1936,23 @@ static bool mlrs_tx_cmd_pending() {
 static uint8_t mlrs_tx_fill_uplink(uint8_t *payload) {
   uint8_t payload_len = 0;
   {
-    uint8_t hm[6];
-    hopmask_pack(hm, g_hop_gen, g_hop_mask);
-    payload_len = mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, hm, 6);
+    const uint32_t now = millis();
+    const bool hm_due = (g_ul_hm_sent_gen == 0xFF) ||
+                        (g_hop_gen != g_ul_hm_sent_gen) ||
+                        (g_hop_mask != g_ul_hm_sent_mask) ||
+                        ctrl_refresh_due(g_ul_hm_sent_ms, now);
+    if (hm_due) {
+      uint8_t hm[6];
+      hopmask_pack(hm, g_hop_gen, g_hop_mask);
+      const uint8_t next =
+          mux_append(payload, payload_len, FRAME_TX_PAYLOAD_LEN, hm, 6);
+      if (next != payload_len) {
+        payload_len = next;
+        g_ul_hm_sent_gen = g_hop_gen;
+        g_ul_hm_sent_mask = g_hop_mask;
+        g_ul_hm_sent_ms = now;
+      }
+    }
   }
   for (;;) {
     uint8_t tmp[64];
@@ -1925,7 +1985,7 @@ static uint8_t mlrs_tx_fill_uplink(uint8_t *payload) {
       if (n == 0) {
         break;
       }
-      mlrs_mavlinkx_ingest_mav(mav, n);
+      mlrs_tx_mavcomp_ingest_uplink(mav, n);
     }
   }
   return mavlinkx_fill_mux(payload, payload_len, FRAME_TX_PAYLOAD_LEN);
@@ -2231,15 +2291,41 @@ static void mlrs_rx_prepare_tlm() {
   uint8_t payload[FRAME_RX_PAYLOAD_LEN] = {};
   uint8_t payload_len = 0;
   hop_rebuild_mask();
+  const uint32_t now = millis();
   {
-    uint8_t hm[6];
-    hopmask_pack(hm, g_hop_proposed_gen, g_hop_proposed_mask);
-    payload_len = mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, hm, 6);
+    const bool hm_due = (g_hm_sent_gen == 0xFF) ||
+                        (g_hop_proposed_gen != g_hm_sent_gen) ||
+                        (g_hop_proposed_mask != g_hm_sent_mask) ||
+                        ctrl_refresh_due(g_hm_sent_ms, now);
+    if (hm_due) {
+      uint8_t hm[6];
+      hopmask_pack(hm, g_hop_proposed_gen, g_hop_proposed_mask);
+      const uint8_t next =
+          mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, hm, 6);
+      if (next != payload_len) {
+        payload_len = next;
+        g_hm_sent_gen = g_hop_proposed_gen;
+        g_hm_sent_mask = g_hop_proposed_mask;
+        g_hm_sent_ms = now;
+      }
+    }
   }
   uint8_t st[32];
   const uint8_t sn = mlrs_rx_pack_state(st, sizeof(st));
   if (sn != 0) {
-    payload_len = mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, st, sn);
+    const bool st_due =
+        (g_st_sent_len != sn) || (memcmp(g_st_sent, st, sn) != 0) ||
+        ctrl_refresh_due(g_st_sent_ms, now);
+    if (st_due) {
+      const uint8_t next =
+          mux_append(payload, payload_len, FRAME_RX_PAYLOAD_LEN, st, sn);
+      if (next != payload_len) {
+        payload_len = next;
+        memcpy(g_st_sent, st, sn);
+        g_st_sent_len = sn;
+        g_st_sent_ms = now;
+      }
+    }
   }
   const bool mavlink_uart = rx_serial_is_mavlink();
   /* Held leftover is always a mux candidate (CRSF), never mid-MAVLink. */
@@ -2408,6 +2494,10 @@ static void mlrs_rx_apply_mbridge(const uint8_t *f, uint8_t n) {
     printf("[mLRS] rx MBridge PARAM_STORE\n");
     return;
   }
+  if (cmd == 12 && n >= 8 && f[2] == MLRS_P_BIND) {
+    (void)mlrs_bind_apply((const char *)(f + 3), 6);
+    return;
+  }
   if (cmd != 12 || n < 4) {
     return;
   }
@@ -2496,7 +2586,6 @@ static void mlrs_rx_process_uplink() {
   if (fail != 0) {
     g_last_rx_fail = fail;
     ++g_rx_fail;
-    hop_note((uint8_t)g_tx_frame.status.fhss_index, false);
     return;
   }
   ++g_rx_ok;
@@ -2619,9 +2708,6 @@ static bool mlrs_rx_rx_done(SX12xxDriverCommon::rx_status) {
       ++g_rx_junk;
     } else {
       ++g_rx_fail;
-      if (g_fhss_follow) {
-        hop_note(g_fhss_i, false);
-      }
       tarq_missed();
     }
     g_rx_need_rearm = 1;
@@ -2759,8 +2845,17 @@ static void start_mlrs() {
   g_tock_us_last = 0;
   g_tock_us_max = 0;
   g_tx_air = 0;
+  g_dl_miss_run = 0;
+  g_ul_hm_sent_gen = 0xFF;
+  g_ul_hm_sent_mask = 0;
+  g_ul_hm_sent_ms = 0;
 #else
   g_uplink_pending = 0;
+  g_hm_sent_gen = 0xFF;
+  g_hm_sent_mask = 0;
+  g_hm_sent_ms = 0;
+  g_st_sent_len = 0;
+  g_st_sent_ms = 0;
   g_tlm_ready = 0;
   g_tlm_busy = 0;
   g_tlm_busy_ms = 0;
@@ -2816,6 +2911,12 @@ static void start_mlrs() {
   printf("[mLRS] ul prep-ahead (19Hz slot)\n");
 #endif
   printf("[mLRS] radio_status 1Hz (stock #109, local inject)\n");
+  printf("[mLRS] bind phrase Lua (ELRS UID + mLRS keys)\n");
+  printf("[mLRS] hopmask on change + %ums, apply at hop 0, off FSK50\n",
+         (unsigned)MLRS_CTRL_REFRESH_MS);
+#if MLRS_OTA_IS_TX
+  printf("[mLRS] mav component 51/68 (Lua Tx Mav Component, local)\n");
+#endif
 #if !MLRS_OTA_IS_TX
   {
     elrs_config_t *cfg = elrs_config_get();
@@ -3140,6 +3241,7 @@ extern "C" void mlrs_ota_loop(void) {
   if (!(g_active && g_tx_send_pending)) {
     mlrs_mbridge_poll();
     radio_status_service();
+    mlrs_tx_mavcomp_service();
   }
 #else
   radio_status_service();
@@ -3358,9 +3460,52 @@ extern "C" void mlrs_ota_loop(void) {
   flush_mlrs_config();
 }
 
+extern "C" void mlrs_ota_on_bind_changed(void) {
+  OtaUpdateCrcInitFromUid();
+#if MLRS_OTA_IS_TX
+  {
+    const uint32_t seed =
+        ((uint32_t)UID[2] << 24) | ((uint32_t)UID[3] << 16) |
+        ((uint32_t)UID[4] << 8) | (UID[5] ^ (uint8_t)OTA_VERSION_ID);
+    FHSSrandomiseFHSSsequence(seed);
+  }
+#else
+  FHSSrandomiseFHSSsequence(uidMacSeedGet());
+#endif
+  if (!g_active) {
+    return;
+  }
+  load_or_make_secret();
+  derive_sync_from_uid();
+  derive_crypto_from_uid();
+  fhss_generate();
+  configure_mlrs_radio();
+}
+
+extern "C" void mlrs_ota_push_elrs_bind_phrase(const char *phrase) {
+#if MLRS_OTA_IS_TX
+  if (g_active || phrase == nullptr) {
+    return;
+  }
+  uint8_t payload[8];
+  payload[0] = MSP_ELRS_RXTX_CONFIG;
+  payload[1] = MSP_ELRS_RXTX_SUBCMD_BIND_PHRASE;
+  memcpy(payload + 2, phrase, 6);
+  DataUlSender.SetDataToTransmit(payload, 8);
+#else
+  (void)phrase;
+#endif
+}
+
 extern "C" bool mlrs_ota_handle_msp(const uint8_t *data, uint8_t len) {
   if (data == nullptr || len < 2) {
     return false;
+  }
+  if (data[0] == MSP_ELRS_RXTX_CONFIG && len >= 3 &&
+      data[1] == MSP_ELRS_RXTX_SUBCMD_BIND_PHRASE) {
+    (void)mlrs_bind_apply((const char *)(data + 2),
+                          (uint8_t)(len - 2U));
+    return true;
   }
   if (data[0] != MSP_ELRS_SET_AIR_PROTOCOL) {
     return false;

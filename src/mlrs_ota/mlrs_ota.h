@@ -17,6 +17,13 @@ extern "C" {
 #define ELRS_RESERVED_MLRS_BAND_OFFSET 24
 #define ELRS_RESERVED_MLRS_GCM_SEND_OFFSET 16
 #define ELRS_RESERVED_MLRS_GCM_RECV_OFFSET 20
+#define ELRS_RESERVED_BIND_PHRASE_OFFSET 0
+
+#ifndef MSP_ELRS_RXTX_CONFIG
+#define MSP_ELRS_RXTX_CONFIG 0x2D
+#endif
+#define MSP_ELRS_RXTX_SUBCMD_UID 0x00
+#define MSP_ELRS_RXTX_SUBCMD_BIND_PHRASE 0x01
 
 #define MLRS_BAND_915 0
 #define MLRS_BAND_24 1
@@ -59,6 +66,8 @@ const char *mlrs_ota_rate_options(void);
 void mlrs_ota_on_elrs_ready(void);
 void mlrs_ota_loop(void);
 bool mlrs_ota_handle_msp(const uint8_t *data, uint8_t len);
+void mlrs_ota_on_bind_changed(void);
+void mlrs_ota_push_elrs_bind_phrase(const char *phrase);
 
 #ifdef __cplusplus
 }

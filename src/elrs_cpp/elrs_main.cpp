@@ -4600,6 +4600,7 @@ static void DataUlReceiveComplete() {
 
   switch (DataUlBuffer[0]) {
   case MSP_ELRS_SET_AIR_PROTOCOL:
+  case MSP_ELRS_RXTX_CONFIG:
     {
       uint8_t n = DataUlReceiver.GetReceivedLength();
       if (n < 4) {

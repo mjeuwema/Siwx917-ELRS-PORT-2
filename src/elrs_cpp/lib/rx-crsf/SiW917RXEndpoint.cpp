@@ -3,6 +3,8 @@
 #include "Arduino.h"
 #include "elrs_config.h"
 #include "logging.h"
+#include "mlrs_bind.h"
+#include "mlrs_ota.h"
 #include "options.h"
 
 #include <cstdio>
@@ -307,6 +309,14 @@ void SiW917RXEndpoint::handleMessage(const crsf_header_t *message) {
         extMessage->orig_addr, payloadLen > 0 ? payload[0] : 0,
         payloadLen > 1 ? payload[1] : 0);
 #endif
+
+  if (message->type == CRSF_FRAMETYPE_MSP_WRITE && payloadLen >= 4 &&
+      payload[2] == MSP_ELRS_RXTX_CONFIG &&
+      payload[3] == MSP_ELRS_RXTX_SUBCMD_BIND_PHRASE) {
+    const uint8_t plen = (payload[1] > 0) ? (uint8_t)(payload[1] - 1U) : 0;
+    (void)mlrs_bind_apply(reinterpret_cast<const char *>(payload + 4), plen);
+    return;
+  }
 
   if (message->type == CRSF_FRAMETYPE_COMMAND && payloadLen >= 2 &&
       payload[0] == CRSF_COMMAND_SUBCMD_RX &&
