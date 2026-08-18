@@ -9,6 +9,8 @@
 #include "POWERMGNT.h"
 #include "crsf_protocol.h"
 #include "siw917_mavlink_backpack.h"
+#include "mlrs_tx_mav_component.h"
+#include "mlrs_bind.h"
 
 #include <new>
 #include <stdio.h>
@@ -130,7 +132,7 @@ static const ParamDef kParams[MLRS_P_COUNT] = {
 static_assert(sizeof(kParams) / sizeof(kParams[0]) == MLRS_P_COUNT,
               "mLRS param table size");
 
-static char g_bind[7] = "mlrs91";
+static char g_bind[7] = "------";
 static int16_t g_val[MLRS_P_COUNT];
 static uint8_t g_out_cmd[MLRS_MB_OUT_Q];
 static uint8_t g_out_len[MLRS_MB_OUT_Q];
@@ -209,7 +211,7 @@ static uint8_t param_value(uint8_t idx) {
   case MLRS_P_TX_PROTO:
     return mlrs_ota_is_active() ? 0 : 1;
   case MLRS_P_TX_MAV_COMP:
-    return siw917_mavlink_backpack_get_lua_enabled() ? 1 : 0;
+    return mlrs_tx_mavcomp_get_enabled() ? 1 : 0;
   default:
     if (idx >= MLRS_P_COUNT) {
       return 0;
@@ -432,6 +434,12 @@ static void apply_param_set(const uint8_t *pl, uint8_t len) {
   if (idx == MLRS_P_BIND) {
     copy_pad(g_bind, reinterpret_cast<const char *>(pl + 1), 6);
     g_bind[6] = 0;
+    if (mlrs_bind_apply(g_bind, 6)) {
+      uint8_t air[7] = {MLRS_P_BIND};
+      memcpy(air + 1, g_bind, 6);
+      queue_air(MBRIDGE_CMD_PARAM_SET, air, 7);
+      mlrs_ota_push_elrs_bind_phrase(g_bind);
+    }
     return;
   }
   const uint8_t val = pl[1];
@@ -459,7 +467,7 @@ static void apply_param_set(const uint8_t *pl, uint8_t len) {
     }
     break;
   case MLRS_P_TX_MAV_COMP:
-    siw917_mavlink_backpack_set_lua_enabled(val != 0);
+    mlrs_tx_mavcomp_set_enabled(val != 0);
     break;
   case MLRS_P_RX_PROTOCOL:
     g_val[MLRS_P_RX_ACTIVE] = val;
@@ -474,6 +482,13 @@ static void apply_param_set(const uint8_t *pl, uint8_t len) {
       g_val[idx] = 0;
     }
   }
+}
+
+uint8_t mlrs_mbridge_param_get(uint8_t idx) { return param_value(idx); }
+
+void mlrs_mbridge_param_set(uint8_t idx, uint8_t val) {
+  uint8_t pl[2] = {idx, val};
+  apply_param_set(pl, 2);
 }
 
 static void handle_cmd(uint8_t cmd, const uint8_t *pl, uint8_t len) {
@@ -579,12 +594,13 @@ void mlrs_mbridge_init(void) {
   g_val[MLRS_P_TX_CH_SRC] = 1;
   g_val[MLRS_P_TX_SER_PORT] = 1;
   g_val[MLRS_P_TX_DIV] = 1;
+  mlrs_bind_get_phrase(g_bind);
   g_inited = true;
   printf("[mLRS] MBridge endpoint constructed\n");
 }
 
 void mlrs_mbridge_poll(void) {
-  if (g_ep != nullptr && !g_registered && mlrs_ota_is_active()) {
+  if (g_ep != nullptr && !g_registered) {
     crsfRouter.addEndpoint(g_ep);
     g_registered = true;
     printf("[mLRS] MBridge attached to CRSF router\n");

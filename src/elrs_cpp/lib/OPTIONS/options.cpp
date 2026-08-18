@@ -146,6 +146,11 @@ bool options_init()
     }
 #endif
     loadFlashedUid();
+    /* Runtime UID is the last Lua/WebUI bind phrase if one was saved. */
+    if (cfg != nullptr && elrs_config_is_bound()) {
+      memcpy(firmwareOptions.uid, cfg->uid, sizeof(firmwareOptions.uid));
+      firmwareOptions.hasUID = 1;
+    }
 
     // firmwareOptions.uid is the flashed/home UID. Runtime binding is loaded
     // from elrs_config by rx_main, matching upstream Returnable Bind Storage.

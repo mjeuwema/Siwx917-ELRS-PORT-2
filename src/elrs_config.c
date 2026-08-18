@@ -597,6 +597,50 @@ int elrs_config_clear_mlrs_secret(void)
   return 0;
 }
 
+int elrs_config_set_bind_phrase(const char *phrase)
+{
+  char buf[ELRS_BIND_PHRASE_MAX + 1];
+  size_t n = 0;
+  if (phrase == NULL) {
+    phrase = "";
+  }
+  while (phrase[n] != 0 && n < ELRS_BIND_PHRASE_MAX) {
+    buf[n] = phrase[n];
+    ++n;
+  }
+  buf[n] = 0;
+  if (nvm3_writeData(nvm3_defaultHandle, NVM3_KEY_ELRS_BIND_PHRASE, buf,
+                     n + 1) != ECODE_NVM3_OK) {
+    return -1;
+  }
+  return 0;
+}
+
+int elrs_config_get_bind_phrase(char *out, size_t max)
+{
+  uint32_t obj_type = 0;
+  size_t obj_len = 0;
+  if (out == NULL || max == 0) {
+    return -1;
+  }
+  out[0] = 0;
+  if (nvm3_getObjectInfo(nvm3_defaultHandle, NVM3_KEY_ELRS_BIND_PHRASE,
+                         &obj_type, &obj_len) != ECODE_NVM3_OK ||
+      obj_len == 0) {
+    return -1;
+  }
+  if (obj_len > max) {
+    obj_len = max;
+  }
+  if (nvm3_readData(nvm3_defaultHandle, NVM3_KEY_ELRS_BIND_PHRASE, out,
+                    obj_len) != ECODE_NVM3_OK) {
+    out[0] = 0;
+    return -1;
+  }
+  out[max - 1] = 0;
+  return 0;
+}
+
 bool elrs_config_is_bound(void)
 {
   if (g_config.bind_storage == ELRS_BIND_STORAGE_VOLATILE) {

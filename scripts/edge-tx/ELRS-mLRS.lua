@@ -8,8 +8,9 @@
 ---- # ExpressLRS portion: OpenTX / ExpressLRS, GPLv2                        #
 ---- # mLRS MBridge portion: MLRS project, GPL3                              #
 ---- #########################################################################
-local EXITVER = "-- EXIT (Lua r17) --"
+local EXITVER = "-- EXIT (Lua r18) --"
 local MB = {}
+local BP = {}
 local tlmRedrawTimeout = 0
 local titleH = 0
 local tlmH = 0
@@ -55,6 +56,7 @@ local function allocateFields()
     fields[i] = { }
   end
   fields[#fields+1] = {id=fields_count+1, name="Other Devices", parent=255, type=16}
+  fields[#fields+1] = {name="Bind Phrase", type=19}
   fields[#fields+1] = {name="mLRS Setup", type=18}
   fields[#fields+1] = {name=EXITVER, type=14}
 end
@@ -62,16 +64,19 @@ end
 local function createDeviceFields() -- put other devices in the field list
   local exitFld = {name=EXITVER, type=14}
   local mlrsFld = {name="mLRS Setup", type=18}
+  local bindFld = {name="Bind Phrase", type=19}
   for i = 1, #fields do
     if fields[i].type == 14 then exitFld = fields[i] end
     if fields[i].type == 18 then mlrsFld = fields[i] end
+    if fields[i].type == 19 then bindFld = fields[i] end
   end
   for i=1, #devices do
     local parent = (devices[i].id == deviceId) and 255 or (fields_count+1)
     fields[fields_count + 1 + i] = {id=devices[i].id, name=devices[i].name, parent=parent, type=15}
   end
-  fields[fields_count + #devices + 2] = mlrsFld
-  fields[fields_count + #devices + 3] = exitFld
+  fields[fields_count + #devices + 2] = bindFld
+  fields[fields_count + #devices + 3] = mlrsFld
+  fields[fields_count + #devices + 4] = exitFld
 end
 
 local function reloadAllField()
@@ -455,6 +460,7 @@ local functions = {
   { load=nil, save=fieldFolderDeviceOpen, display=fieldFolderDisplay }, --17 deviceFOLDER(16)
   nil, --18 unused type 17
   { load=nil, save=nil, display=fieldCommandDisplay }, --19 [mLRS Setup](18)
+  { load=nil, save=nil, display=fieldCommandDisplay }, --20 [Bind Phrase](19)
 }
 
 local function parseParameterInfoMessage(data)
@@ -882,6 +888,10 @@ local function handleDevicePageEvent(event)
         if not field.grey and field.type < 10 then
           edit = not edit
         end
+        if field.type == 19 then
+          BP.open()
+          return
+        end
         if field.type == 18 then
           MB.open()
           return
@@ -1104,6 +1114,97 @@ local function checkCrsfModule()
     end
   end
 
+  return 0
+end
+
+----------------------------------------------------------------------
+-- ELRS bind phrase (stock 4.1 MSP 0x2D / BIND_PHRASE). ELRS page item.
+----------------------------------------------------------------------
+BP.active = false
+BP.value = ""
+BP.sidx = 0
+BP.edit = false
+BP.status = ""
+local BP_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_#-. "
+local BP_MAX = 20
+
+function BP.open()
+  BP.active = true
+  BP.edit = false
+  BP.sidx = 0
+  BP.status = "ENTER=apply to TX+RX"
+  if BP.value == "" then BP.value = "expresslrs" end
+end
+
+local function bpSend(dest, phrase)
+  local payload = { dest, 0xEA, 0x30, 1 + #phrase, 0x2D, 0x01 }
+  for i = 1, #phrase do payload[#payload + 1] = string.byte(phrase, i) end
+  crossfireTelemetryPush(0x7C, payload)
+end
+
+function BP.run(event)
+  lcd.clear()
+  lcd.drawFilledRectangle(0, 0, LCD_W, titleH, GREY_DEFAULT)
+  lcd.drawText(COL1, barTextSpacing, "ELRS Bind Phrase", INVERS)
+  lcd.drawText(COL1, titleH + 4, "Same as ELRS 4.1 Bind Manager", 0)
+  local y = titleH + 4 + textSize
+  local shown = BP.value
+  if shown == "" then shown = "(empty)" end
+  lcd.drawText(COL1, y, shown, BP.edit and INVERS or 0)
+  if BP.edit then
+    local pre = string.sub(BP.value, 1, BP.sidx)
+    local cur = string.sub(BP.value .. " ", BP.sidx + 1, BP.sidx + 1)
+    lcd.drawText(COL1, y + textSize, string.rep(" ", #pre) .. "^" .. cur, 0)
+  end
+  lcd.drawText(COL1, LCD_H - textSize * 2, BP.status or "", 0)
+  lcd.drawText(COL1, LCD_H - textSize, "RTN=back  +/- char  ENTER=set", 0)
+
+  if event == EVT_VIRTUAL_EXIT then
+    if BP.edit then BP.edit = false else BP.active = false end
+    return 0
+  end
+  if event == EVT_VIRTUAL_ENTER then
+    if not BP.edit then
+      BP.edit = true
+      if #BP.value < 1 then BP.value = "a" end
+      BP.sidx = math.min(BP.sidx, math.max(0, #BP.value - 1))
+    else
+      BP.edit = false
+      local phrase = BP.value
+      bpSend(0xEE, phrase)
+      bpSend(0xEC, phrase)
+      BP.status = "sent to TX + RX"
+    end
+    return 0
+  end
+  if BP.edit then
+    if event == EVT_VIRTUAL_INC or event == EVT_VIRTUAL_INC_REPT then
+      local i = BP.sidx + 1
+      local c = string.sub(BP.value .. " ", i, i)
+      local p = string.find(BP_CHARS, c, 1, true) or 1
+      p = p + 1
+      if p > #BP_CHARS then p = 1 end
+      local left = string.sub(BP.value, 1, i - 1)
+      local right = string.sub(BP.value, i + 1)
+      BP.value = left .. string.sub(BP_CHARS, p, p) .. right
+    elseif event == EVT_VIRTUAL_DEC or event == EVT_VIRTUAL_DEC_REPT then
+      local i = BP.sidx + 1
+      local c = string.sub(BP.value .. " ", i, i)
+      local p = string.find(BP_CHARS, c, 1, true) or 1
+      p = p - 1
+      if p < 1 then p = #BP_CHARS end
+      local left = string.sub(BP.value, 1, i - 1)
+      local right = string.sub(BP.value, i + 1)
+      BP.value = left .. string.sub(BP_CHARS, p, p) .. right
+    elseif event == EVT_VIRTUAL_NEXT then
+      if BP.sidx < BP_MAX - 1 then
+        BP.sidx = BP.sidx + 1
+        if BP.sidx >= #BP.value then BP.value = BP.value .. "a" end
+      end
+    elseif event == EVT_VIRTUAL_PREV then
+      if BP.sidx > 0 then BP.sidx = BP.sidx - 1 end
+    end
+  end
   return 0
 end
 
@@ -1687,6 +1788,9 @@ local function run(event, touchState)
   if checkCrsfModule then return checkCrsfModule() end
 
   event = (touch2evt and touch2evt(event, touchState)) or event
+  if BP.active then
+    return BP.run(event)
+  end
   if MB.active then
     return MB.run(event)
   end

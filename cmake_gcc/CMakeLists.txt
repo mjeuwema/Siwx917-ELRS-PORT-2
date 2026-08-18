@@ -712,6 +712,35 @@ function(siw917_generate_lr1121_config_source input_file output_var)
     set(${output_var} "${output_file}" PARENT_SCOPE)
 endfunction()
 
+function(siw917_generate_bindphrase_config_source input_file output_var)
+    set(old_bind
+"void BindphraseConfigurable::SetBindPhrase(uint8_t *phrase, size_t phraseLen)
+{
+    constexpr uint8_t BIND_KEY[] = \"-DMY_BINDING_PHRASE=\\\"\";")
+    set(new_bind
+"#include \"mlrs_bind.h\"
+void BindphraseConfigurable::SetBindPhrase(uint8_t *phrase, size_t phraseLen)
+{
+    (void)mlrs_bind_apply(reinterpret_cast<const char *>(phrase),
+                          (uint8_t)((phraseLen > 255) ? 255 : phraseLen));
+    return;
+    constexpr uint8_t BIND_KEY[] = \"-DMY_BINDING_PHRASE=\\\"\";")
+    file(READ "${input_file}" source_text)
+    string(FIND "${source_text}" "${old_bind}" patch_offset)
+    if(patch_offset EQUAL -1)
+        message(FATAL_ERROR
+            "SiW917 bind-phrase patch no longer matches ${input_file}"
+        )
+    endif()
+    string(REPLACE "${old_bind}" "${new_bind}" source_text "${source_text}")
+    set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/siw917_upstream_transport")
+    set(output_file "${output_dir}/config.cpp")
+    file(MAKE_DIRECTORY "${output_dir}")
+    file(WRITE "${output_file}" "${source_text}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input_file}")
+    set(${output_var} "${output_file}" PARENT_SCOPE)
+endfunction()
+
 # SiW917 platform abstraction files (Arduino compatibility layer)
 # Prefer the SiW917 adapter until the upstream tx_main canary compiles cleanly.
 if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
@@ -812,6 +841,8 @@ set(ELRS_PLATFORM_SOURCES
 
 if(SIW917_ELRS_TARGET_TX)
     list(APPEND ELRS_PLATFORM_SOURCES "../src/mlrs_ota/mlrs_mbridge.cpp")
+    list(APPEND ELRS_PLATFORM_SOURCES "../src/mlrs_ota/mlrs_tx_mav_component.cpp")
+    list(APPEND ELRS_PLATFORM_SOURCES "../src/mlrs_ota/mlrs_bind.cpp")
 endif()
 
 # ELRS C++ library sources from our elrs_cpp folder.
@@ -821,6 +852,10 @@ set(ELRS_CPP_LIB_DIR "../src/elrs_cpp/lib")
 if(SIW917_ELRS_TARGET_TX AND SIW917_ELRS_USE_UPSTREAM_TX_MAIN)
     set(ELRS_PROTOCOL_LIB_DIR "${ELRS_UPSTREAM_DIR}/lib")
     set(ELRS_CONFIG_SOURCE "${ELRS_UPSTREAM_DIR}/lib/CONFIG/config.cpp")
+    siw917_generate_bindphrase_config_source(
+        "${ELRS_CONFIG_SOURCE}"
+        ELRS_CONFIG_SOURCE
+    )
     set(ELRS_OPTIONS_SOURCE "${ELRS_CPP_LIB_DIR}/OPTIONS/options.cpp")
     set(ELRS_CRSF_RXTX_ENDPOINT_SOURCE "${ELRS_UPSTREAM_DIR}/lib/CrsfProtocol/RxTxEndpoint.cpp")
 else()
